@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipper"
+version = "0.1.0"
+description = "Automated Twitch/Kick/YouTube → YouTube Shorts pipeline"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["clipper*"]
+
+[project.scripts]
+clipper = "clipper.cli:main"

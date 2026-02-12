@@ -1,0 +1,31 @@
+# Env and secrets
+.env
+client_secrets.json
+.clipper_token.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Queue data (local only)
+queue/pending/*.json
+queue/approved/*.json
+queue/skipped/*.json
+
+# Downloaded/processed media
+queue/**/*.mp4
+queue/**/*.mkv
+queue/**/*.webm
+output/*.mp4
+output/*.mkv
+output/*.json
+output/*.srt
+output/*.ass
+output/*.jpg
+
+# OS
+.DS_Store

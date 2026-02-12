@@ -1,0 +1,54 @@
+targets:
+  twitch:
+    streamers: [EIDO, summit1g, theburntpeanut, prod]
+    games: [Deadlock, ARC Raiders, Valorant]
+    clips_per_source: 100
+    period: 24h
+  kick:
+    streamers: [adin, n3on]
+    clips_per_source: 100
+  youtube:
+    channels: []
+
+settings:
+  min_views: 100
+  max_duration: 300
+  shorts_threshold: 60
+  language: en  # filters by broadcaster language (reliable, unlike clip language field)
+
+upload:
+  title_template: "{title} | {streamer} {game}"
+  description_template: |
+    {streamer} {game} clip
+
+    Watch {streamer} live:
+    {url}
+
+    {tags_as_hashtags}
+
+    #shorts #{game_tag} #{streamer_tag} #clips #twitch #gaming #funny #viral
+  default_privacy: unlisted
+  max_uploads_per_day: 50    # API costs 100 units per upload now (changed Dec 2025), 10k quota = 100 max
+
+  # Extra tags appended to every upload (high-volume search terms)
+  global_tags:
+    - gaming
+    - funny moments
+    - best clips
+    - twitch clips
+    - stream highlights
+    - viral clips
+
+  # Set a custom thumbnail from the clip (scene detection + saturation boost)
+  extract_thumbnail: true
+
+subtitles:
+  whisper_model: medium      # ~3x faster than large-v3 on CPU, good enough for short gaming clips
+  font_size: 52              # large Impact text — fills screen width, readable on mobile
+  outline_width: 5           # thick outline for contrast on any background
+  words_per_phrase: 3        # 2-3 words per subtitle line
+
+shorts:
+  width: 1080
+  height: 1920
+  subtitle_margin_v: 450    # bumped from 80 — places text in lower-center safe zone
