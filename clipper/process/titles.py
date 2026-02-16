@@ -1,53 +1,54 @@
 """Smart title generation for YouTube clips."""
 
+import html
 import hashlib
 import re
 import unicodedata
 
-# Viral keywords → (expanded action phrase, hook text)
+# Viral keywords → (expanded action phrase in Title Case, hook text for overlay)
 _KEYWORD_MAP = {
-    "ace": ("INSANE ACE", "INSANE ACE"),
-    "clutch": ("INSANE CLUTCH", "CLUTCH MOMENT"),
-    "1v5": ("1V5 CLUTCH", "1V5 CLUTCH"),
-    "1v4": ("1V4 CLUTCH", "1V4 CLUTCH"),
-    "1v3": ("1V3 CLUTCH", "1V3 CLUTCH"),
-    "rage": ("TILTED MOMENT", "TILTED"),
-    "banned": ("SUSPENDED LIVE", "SUSPENDED"),
-    "ban": ("SUSPENDED LIVE", "SUSPENDED"),
-    "caught": ("GETS CAUGHT LIVE", "CAUGHT LIVE"),
-    "exposed": ("GETS EXPOSED", "EXPOSED"),
-    "hack": ("SUSPICIOUS PLAY", "SUS PLAY"),
-    "cheat": ("SUSPICIOUS PLAY", "SUS PLAY"),
-    "fail": ("EPIC FAIL", "EPIC FAIL"),
+    "ace": ("Insane Ace", "INSANE ACE"),
+    "clutch": ("Insane Clutch", "CLUTCH MOMENT"),
+    "1v5": ("1v5 Clutch", "1V5 CLUTCH"),
+    "1v4": ("1v4 Clutch", "1V4 CLUTCH"),
+    "1v3": ("1v3 Clutch", "1V3 CLUTCH"),
+    "rage": ("Tilted Moment", "TILTED"),
+    "banned": ("Suspended Live", "SUSPENDED"),
+    "ban": ("Suspended Live", "SUSPENDED"),
+    "caught": ("Gets Caught Live", "CAUGHT LIVE"),
+    "exposed": ("Gets Exposed", "EXPOSED"),
+    "hack": ("Suspicious Play", "SUS PLAY"),
+    "cheat": ("Suspicious Play", "SUS PLAY"),
+    "fail": ("Epic Fail", "EPIC FAIL"),
     "rip": ("RIP", "RIP"),
-    "insane": ("INSANE PLAY", "INSANE"),
-    "crazy": ("CRAZY PLAY", "CRAZY"),
-    "godlike": ("GODLIKE PLAY", "GODLIKE"),
-    "flick": ("INSANE FLICK", "INSANE FLICK"),
-    "collat": ("INSANE COLLATERAL", "COLLATERAL"),
-    "wallbang": ("WALLBANG", "WALLBANG"),
-    "ninja": ("NINJA DEFUSE", "NINJA DEFUSE"),
-    "toxic": ("UNHINGED MOMENT", "UNHINGED"),
-    "troll": ("TROLLING", "TROLLING"),
-    "donate": ("DONATION REACTION", "DONATION"),
-    "jumpscare": ("JUMPSCARE", "JUMPSCARE"),
-    "scream": ("SCREAMS", "SCREAMS"),
-    "cry": ("EMOTIONAL MOMENT", "EMOTIONAL"),
-    "win": ("HUGE WIN", "HUGE WIN"),
-    "world record": ("WORLD RECORD", "WORLD RECORD"),
-    "wr": ("WORLD RECORD", "WORLD RECORD"),
-    "wipe": ("TEAM WIPE", "TEAM WIPE"),
-    "snipe": ("INSANE SNIPE", "INSANE SNIPE"),
-    "oneshot": ("ONE SHOT", "ONE SHOT"),
-    "1 shot": ("ONE SHOT", "ONE SHOT"),
-    "combo": ("INSANE COMBO", "INSANE COMBO"),
-    "outplay": ("INSANE OUTPLAY", "OUTPLAY"),
-    "solo": ("SOLO CARRY", "SOLO CARRY"),
-    "carry": ("HARD CARRY", "HARD CARRY"),
-    "broken": ("THIS IS BROKEN", "BROKEN"),
-    "op": ("THIS IS OP", "THIS IS OP"),
-    "nerf": ("NEEDS A NERF", "NEEDS A NERF"),
-    "buff": ("BUFFED", "BUFFED"),
+    "insane": ("Insane Play", "INSANE"),
+    "crazy": ("Crazy Play", "CRAZY"),
+    "godlike": ("Godlike Play", "GODLIKE"),
+    "flick": ("Insane Flick", "INSANE FLICK"),
+    "collat": ("Insane Collateral", "COLLATERAL"),
+    "wallbang": ("Wallbang", "WALLBANG"),
+    "ninja": ("Ninja Defuse", "NINJA DEFUSE"),
+    "toxic": ("Unhinged Moment", "UNHINGED"),
+    "troll": ("Trolling", "TROLLING"),
+    "donate": ("Donation Reaction", "DONATION"),
+    "jumpscare": ("Jumpscare", "JUMPSCARE"),
+    "scream": ("Screams", "SCREAMS"),
+    "cry": ("Emotional Moment", "EMOTIONAL"),
+    "win": ("Huge Win", "HUGE WIN"),
+    "world record": ("World Record", "WORLD RECORD"),
+    "wr": ("World Record", "WORLD RECORD"),
+    "wipe": ("Team Wipe", "TEAM WIPE"),
+    "snipe": ("Insane Snipe", "INSANE SNIPE"),
+    "oneshot": ("One Shot", "ONE SHOT"),
+    "1 shot": ("One Shot", "ONE SHOT"),
+    "combo": ("Insane Combo", "INSANE COMBO"),
+    "outplay": ("Insane Outplay", "OUTPLAY"),
+    "solo": ("Solo Carry", "SOLO CARRY"),
+    "carry": ("Hard Carry", "HARD CARRY"),
+    "broken": ("This Is Broken", "BROKEN"),
+    "op": ("This Is OP", "THIS IS OP"),
+    "nerf": ("Needs a Nerf", "NEEDS A NERF"),
+    "buff": ("Buffed", "BUFFED"),
 }
 
 # --- Title Sanitization ---
@@ -143,31 +144,32 @@ def sanitize_title(title: str) -> str | None:
     return result
 
 # Game-specific title templates: {streamer}, {action}, {game} available
+# Action-first format — puts the hook before the streamer name (matches organic viral titles)
 _GAME_TEMPLATES = [
-    "{streamer} {action} IN {game}",
+    "{action} | {streamer} {game}",
+    "{action} in {game} | {streamer}",
     "{streamer} {action} | {game}",
-    "{streamer}: {action} IN {game}",
 ]
 
 # Generic templates when no game context
 _GENERIC_TEMPLATES = [
+    "{action} | {streamer}",
     "{streamer} {action}",
-    "{streamer}: {action}",
 ]
 
-# Fallback action words per game category
+# Fallback action words per game category (Title Case)
 _GAME_ACTIONS = {
-    "deadlock": "DEADLOCK MOMENT",
-    "valorant": "VALORANT MOMENT",
-    "counter-strike": "CS2 MOMENT",
-    "league of legends": "LEAGUE MOMENT",
-    "fortnite": "FORTNITE MOMENT",
-    "overwatch 2": "OVERWATCH MOMENT",
-    "apex legends": "APEX MOMENT",
-    "minecraft": "MINECRAFT MOMENT",
-    "gta v": "GTA MOMENT",
-    "arc raiders": "ARC RAIDERS MOMENT",
-    "just chatting": "LIVE MOMENT",
+    "deadlock": "Deadlock Moment",
+    "valorant": "Valorant Moment",
+    "counter-strike": "CS2 Moment",
+    "league of legends": "League Moment",
+    "fortnite": "Fortnite Moment",
+    "overwatch 2": "Overwatch Moment",
+    "apex legends": "Apex Moment",
+    "minecraft": "Minecraft Moment",
+    "gta v": "GTA Moment",
+    "arc raiders": "Arc Raiders Moment",
+    "just chatting": "Live Moment",
 }
 
 
@@ -235,21 +237,78 @@ def _find_keyword(title: str) -> tuple[str, str] | None:
 
 def _clean_title(title: str) -> str:
     """Strip excessive punctuation, normalize whitespace."""
+    title = html.unescape(str(title or ""))
+    # Drop URLs and trailing hashtags (e.g. #shorts #viral) from source titles.
+    title = re.sub(r"https?://\S+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"(?:^|\s)#[A-Za-z0-9_]+", " ", title)
+
     # Collapse repeated punctuation (!!!!! → !)
     title = re.sub(r"([!?.])\1{2,}", r"\1\1", title)
+    # Normalize long dash separators into a stable token.
+    title = re.sub(r"\s*[|/]+\s*", " | ", title)
     # Normalize whitespace
     title = " ".join(title.split())
-    return title.strip()
+    cleaned = title.strip(" \"'|:-")
+
+    # If source is mostly all-caps, convert to title case for readability.
+    letters = [c for c in cleaned if c.isalpha()]
+    if letters:
+        upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if upper_ratio > 0.85:
+            cleaned = cleaned.title()
+
+    return cleaned.strip()
 
 
 def generate_title(clip: dict) -> str:
     """Produce a click-worthy YouTube title (under 90 chars, no #Shorts).
 
-    Uses clip keys: title, streamer, game, id.
+    Prefers LLM-generated title_variants when available. Falls back to
+    keyword-based generation.
+
+    Uses clip keys: title, streamer, game, id, _analysis.
     """
-    raw_title = clip.get("title", "")
-    streamer = clip.get("streamer", "Unknown").upper()
+    streamer = clip.get("streamer", "Unknown")
     game = clip.get("game", "")
+
+    def _add_context(base: str) -> str:
+        """Append streamer/game context when it fits and isn't redundant."""
+        base = _clean_title(base)
+        parts: list[str] = []
+        if streamer and streamer.lower() not in base.lower():
+            parts.append(streamer)
+        if game and game.lower() not in base.lower() and game.lower() != "just chatting":
+            parts.append(game)
+        if not parts:
+            return base
+
+        with_both = f"{base} | {' '.join(parts)}"
+        if len(with_both) <= 90:
+            return with_both
+
+        if streamer and streamer.lower() not in base.lower():
+            with_streamer = f"{base} | {streamer}"
+            if len(with_streamer) <= 90:
+                return with_streamer
+
+        return base
+
+    # Try LLM title variants first
+    analysis = clip.get("_analysis", {})
+    variants = analysis.get("title_variants", [])
+    if variants:
+        # Prefer variant containing a viral keyword (higher click-through)
+        for v in variants:
+            if _find_keyword(v):
+                candidate = sanitize_title(_add_context(v))
+                if candidate and len(candidate) <= 90:
+                    return candidate
+        # Otherwise use the first valid variant
+        candidate = sanitize_title(_add_context(variants[0]))
+        if candidate and len(candidate) <= 90:
+            return candidate
+
+    raw_title = _clean_title(clip.get("title", ""))
     clip_id = clip.get("id", raw_title)
 
     keyword_match = _find_keyword(raw_title)
@@ -263,16 +322,21 @@ def generate_title(clip: dict) -> str:
             template = _pick_template(_GENERIC_TEMPLATES, clip_id)
             result = template.format(streamer=streamer, action=action)
     elif _is_garbage_title(raw_title):
-        # Title is garbage — generate from game + streamer
-        game_lower = game.lower() if game else ""
-        action = _GAME_ACTIONS.get(game_lower, f"{game} MOMENT" if game else "INSANE MOMENT")
-        if game and game.lower() != "just chatting":
-            result = f"{streamer} {action}"
+        # Title is garbage — prefer LLM quote over generic game action
+        best_quote = clip.get("_analysis", {}).get("best_quote", "")
+        if best_quote and len(best_quote) <= 30:
+            action = best_quote.title()
         else:
-            result = f"{streamer} {action}"
+            game_lower = game.lower() if game else ""
+            action = _GAME_ACTIONS.get(game_lower, f"{game} Moment" if game else "Insane Moment")
+        # Append game to streamer only if not already in the action phrase
+        if game and game.lower() != "just chatting" and game.lower() not in action.lower():
+            result = f"{action} | {streamer} {game}"
+        else:
+            result = f"{action} | {streamer}"
     else:
-        # Title is decent — clean it up and frame it
-        cleaned = _clean_title(raw_title).upper()
+        # Title is decent — clean it up, keep original casing
+        cleaned = _clean_title(raw_title)
         if streamer.lower() not in cleaned.lower():
             cleaned = f"{streamer}: {cleaned}"
         if game and game.lower() not in cleaned.lower() and game.lower() != "just chatting":
@@ -288,8 +352,8 @@ def generate_title(clip: dict) -> str:
     if sanitized is None:
         # Title contained blocklisted word — regenerate from game + streamer
         game_lower = game.lower() if game else ""
-        action = _GAME_ACTIONS.get(game_lower, f"{game} MOMENT" if game else "INSANE MOMENT")
-        result = f"{streamer} {action}"
+        action = _GAME_ACTIONS.get(game_lower, f"{game} Moment" if game else "Insane Moment")
+        result = f"{action} | {streamer}"
         if len(result) > 90:
             result = result[:87] + "..."
     else:
@@ -302,7 +366,20 @@ def generate_hook_text(clip: dict) -> str:
     """Produce 2-4 word hook overlay text for the first 2 seconds.
 
     Returns short, punchy text like "INSANE ACE" or "WATCH THIS".
+    Prefers LLM hook_text, falls back to best_quote, then keyword extraction.
     """
+    analysis = clip.get("_analysis", {})
+
+    # LLM hook_text takes top priority (purpose-built for overlay)
+    hook = analysis.get("hook_text", "")
+    if hook and len(hook) <= 30:
+        return hook.upper()
+
+    # LLM best_quote as fallback if concise enough for overlay
+    best_quote = analysis.get("best_quote", "")
+    if best_quote and len(best_quote) <= 30:
+        return best_quote.upper()
+
     raw_title = clip.get("title", "")
     game = clip.get("game", "")
 

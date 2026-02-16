@@ -429,7 +429,7 @@ def transcribe(
 
     video_path = Path(video_path)
     sub_config = config.get("subtitles", {})
-    model_name = sub_config.get("whisper_model", "turbo")
+    model_name = sub_config.get("whisper_model", "large-v3")
 
     console.print(f"[blue]Transcribing:[/blue] {video_path.name} (model: {model_name})")
 

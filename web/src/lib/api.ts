@@ -8,7 +8,7 @@ export async function fetchConfig(): Promise<ConfigData> {
 }
 
 export async function fetchQueue(
-  status: 'pending' | 'output',
+  status: 'pending' | 'approved' | 'output',
   opts?: {
     game?: string
     streamer?: string
@@ -53,7 +53,7 @@ export function videoUrl(clipId: string): string {
 }
 
 export async function startWorkflow(params: {
-  recipe: 'shorts' | 'compilation' | 'snipe'
+  recipe: 'shorts' | 'compilation'
   game: string
   count: number
   channel: string | null
@@ -275,6 +275,7 @@ export interface LayoutProfile {
   safe_top_ratio?: number
   safe_bottom_ratio?: number
   facecam_band_ratio?: number
+  facecam_x_bias?: number
   gameplay_zoom?: number
   gameplay_zoom_no_facecam?: number
   gameplay_x_bias?: number
@@ -285,6 +286,8 @@ export interface LayoutProfile {
   hud_y_ratio?: number
   title_y_ratio?: number
   subtitle_margin_ratio?: number
+  facecam_y_bias?: number
+  facecam_zoom?: number
 }
 
 export async function fetchLayoutProfiles(): Promise<Record<string, LayoutProfile>> {
@@ -506,6 +509,54 @@ export async function fetchLearnStatus(): Promise<{
   const res = await fetch(`${BASE}/api/learn/status`)
   if (!res.ok) throw new Error(`Learn status failed: ${res.status}`)
   return res.json()
+}
+
+export async function batchReview(
+  clipIds: string[],
+  action: 'approve' | 'skip',
+): Promise<{ updated: number; status: string }> {
+  const res = await fetch(`${BASE}/api/review/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clip_ids: clipIds, action }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Batch review failed: ${res.status}` }))
+    throw new Error(err.detail || `Batch review failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+// -- Subtitle endpoints --
+
+export interface SubtitleLine {
+  index: number
+  start: string    // "0:00:01.50"
+  end: string      // "0:00:03.20"
+  text: string     // plain text (tags stripped)
+  raw: string      // original ASS text with tags (for write-back)
+}
+
+export async function fetchSubtitles(clipId: string): Promise<SubtitleLine[]> {
+  const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}/subtitles`)
+  if (!res.ok) {
+    if (res.status === 404) return []
+    throw new Error(`Fetch subtitles failed: ${res.status}`)
+  }
+  const data = await res.json()
+  return data.lines
+}
+
+export async function updateSubtitles(clipId: string, lines: SubtitleLine[]): Promise<void> {
+  const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}/subtitles`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lines }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Save subtitles failed: ${res.status}` }))
+    throw new Error(err.detail || `Save subtitles failed: ${res.status}`)
+  }
 }
 
 export async function fetchStudioClips(opts?: {

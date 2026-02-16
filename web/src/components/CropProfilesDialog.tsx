@@ -43,6 +43,9 @@ type LayoutTuning = {
   safeTopRatio: number
   safeBottomRatio: number
   facecamBandRatio: number
+  facecamXBias: number
+  facecamYBias: number
+  facecamZoom: number
   gameplayZoom: number
   gameplayZoomNoFacecam: number
   gameplayXBias: number
@@ -64,6 +67,9 @@ function tuningEquals(a: LayoutTuning, b: LayoutTuning): boolean {
     a.safeTopRatio === b.safeTopRatio &&
     a.safeBottomRatio === b.safeBottomRatio &&
     a.facecamBandRatio === b.facecamBandRatio &&
+    a.facecamXBias === b.facecamXBias &&
+    a.facecamYBias === b.facecamYBias &&
+    a.facecamZoom === b.facecamZoom &&
     a.gameplayZoom === b.gameplayZoom &&
     a.gameplayZoomNoFacecam === b.gameplayZoomNoFacecam &&
     a.gameplayXBias === b.gameplayXBias &&
@@ -105,6 +111,9 @@ function layoutProfileEquals(a?: LayoutProfile, b?: LayoutProfile): boolean {
     a.safe_top_ratio === b.safe_top_ratio &&
     a.safe_bottom_ratio === b.safe_bottom_ratio &&
     a.facecam_band_ratio === b.facecam_band_ratio &&
+    a.facecam_x_bias === b.facecam_x_bias &&
+    a.facecam_y_bias === b.facecam_y_bias &&
+    a.facecam_zoom === b.facecam_zoom &&
     a.gameplay_zoom === b.gameplay_zoom &&
     a.gameplay_zoom_no_facecam === b.gameplay_zoom_no_facecam &&
     a.gameplay_x_bias === b.gameplay_x_bias &&
@@ -142,10 +151,13 @@ const TUNING_BOUNDS = {
   safeTopRatio: [0, 0.2],
   safeBottomRatio: [0, 0.25],
   facecamBandRatio: [0.16, 0.5],
+  facecamXBias: [-1, 1],
+  facecamYBias: [0, 0.5],
+  facecamZoom: [0.5, 2],
   gameplayZoom: [0.75, 1.6],
   gameplayZoomNoFacecam: [0.75, 1.7],
   gameplayXBias: [-1, 1],
-  gameplayYBias: [-1, 1],
+  gameplayYBias: [-2, 2],
   hudHeightRatio: [0.05, 0.22],
   hudScale: [0.5, 2],
   hudXRatio: [0, 1],
@@ -158,6 +170,9 @@ const DEFAULT_TUNING: LayoutTuning = {
   safeTopRatio: 0.08,
   safeBottomRatio: 0.13,
   facecamBandRatio: 0.2,
+  facecamXBias: 0,
+  facecamYBias: 0,
+  facecamZoom: 1,
   gameplayZoom: 1.02,
   gameplayZoomNoFacecam: 1.12,
   gameplayXBias: 0,
@@ -181,6 +196,9 @@ function normalizeTuning(tuning: Partial<LayoutTuning> | null | undefined): Layo
     safeTopRatio: Math.round(clampTuningValue('safeTopRatio', merged.safeTopRatio) * 10000) / 10000,
     safeBottomRatio: Math.round(clampTuningValue('safeBottomRatio', merged.safeBottomRatio) * 10000) / 10000,
     facecamBandRatio: Math.round(clampTuningValue('facecamBandRatio', merged.facecamBandRatio) * 10000) / 10000,
+    facecamXBias: Math.round(clampTuningValue('facecamXBias', merged.facecamXBias) * 10000) / 10000,
+    facecamYBias: Math.round(clampTuningValue('facecamYBias', merged.facecamYBias) * 10000) / 10000,
+    facecamZoom: Math.round(clampTuningValue('facecamZoom', merged.facecamZoom) * 10000) / 10000,
     gameplayZoom: Math.round(clampTuningValue('gameplayZoom', merged.gameplayZoom) * 10000) / 10000,
     gameplayZoomNoFacecam: Math.round(clampTuningValue('gameplayZoomNoFacecam', merged.gameplayZoomNoFacecam) * 10000) / 10000,
     gameplayXBias: Math.round(clampTuningValue('gameplayXBias', merged.gameplayXBias) * 10000) / 10000,
@@ -272,112 +290,57 @@ function VerticalPreview({
     ctx.fillStyle = 'rgba(0,0,0,0.24)'
     ctx.fillRect(0, 0, outW, outH)
 
-    // Safe regions: leave blurred background visible so platform UI doesn't cover content.
-    const safeTop = Math.round(outH * tuning.safeTopRatio)
+    // Layout: facecam band at top, gameplay below, safe bottom for HUD.
     const safeBottom = Math.round(outH * tuning.safeBottomRatio)
-    const contentH = Math.max(1, outH - safeTop - safeBottom)
+    const faceH = facecamEnabled ? Math.round(outH * tuning.facecamBandRatio) : 0
+    const gameH = Math.max(1, outH - faceH - safeBottom)
 
-    const faceH = facecamEnabled ? Math.round(contentH * tuning.facecamBandRatio) : 0
-    const gameH = contentH - faceH
+    // Facecam Y positions the band on the output frame (0 = top of screen).
+    const bandY = Math.round(outH * tuning.facecamYBias)
+    // Gameplay sits directly below the facecam band.
+    const gameTopY = bandY + faceH
 
     if (facecamEnabled) {
-      // Facecam (top band) — crop then cover-fill to full width.
+      // Facecam — crop source rect, scale to fill band, pan with X bias.
       const faceSrc = {
         x: facecam.x * imgW,
         y: facecam.y * imgH,
         w: facecam.w * imgW,
         h: facecam.h * imgH,
       }
-      drawCoverCrop(
-        ctx,
-        img,
-        faceSrc,
-        { x: 0, y: safeTop, w: outW, h: faceH },
-        // Match backend: center-crop inside the facecam tile.
-        { alignX: 'center', alignY: 'center' },
-      )
-    }
+      const fZoom = Math.max(0.5, tuning.facecamZoom)
+      const fBaseScale = Math.max(outW / faceSrc.w, faceH / faceSrc.h)
+      const fScale = fBaseScale * fZoom
+      const fDrawW = faceSrc.w * fScale
+      const fDrawH = faceSrc.h * fScale
+      const fPanXNorm = clamp((tuning.facecamXBias + 1) / 2, 0, 1)
+      const fDrawX = (outW - fDrawW) * fPanXNorm
+      const fDrawY = bandY + (faceH - fDrawH) / 2
 
-    // Gameplay (bottom band) — emulate backend:
-    // 1) Crop off a bit of the top (facecam cutout) when stacking facecam + gameplay
-    // 2) Crop off a bit of the bottom (HUD slice)
-    // 2) Cover-scale into the gameplay band with a mild zoom
-    // 3) Anchor bottom-center (keep center plane visible)
-    const hudCropPad = 0.01
-    const hudBarMinY = 0.75
-    const hudBarMinW = 0.18
-    const hudBarMinAspect = 1.35
-    const hudCutoutMinW = 0.3
-    const derivedBottomCrop = 1 - Math.min(1, hud.y + hudCropPad)
-    const hudAspect = hud.h > 1e-6 ? hud.w / hud.h : 0
-    const hudLooksLikeBar =
-      hudEnabled && hud.y >= hudBarMinY && hud.w >= hudBarMinW && hudAspect >= hudBarMinAspect && hud.x <= 0.7
-    const hudCutoutEnabled = hudLooksLikeBar && hud.w >= hudCutoutMinW
-    const effectiveBottomCrop =
-      hudCutoutEnabled ? Math.max(0, Math.min(0.14, derivedBottomCrop)) : 0
-
-    // Facecam cutout (remove original facecam from gameplay so it doesn't appear twice).
-    // Only apply when the facecam is near the center; corner facecams are usually
-    // removed by the center crop anyway, and a top cut would remove the top HUD row.
-    let topCrop = 0
-    if (facecamEnabled) {
-      const pad = 0.02
-      const maxStart = 0.45
-      const maxEnd = 0.75
-      const maxCrop = 0.36
-      const minCenterX = 0.33
-      const maxCenterX = 0.67
-      const y2 = facecam.y + facecam.h
-      const cx = facecam.x + facecam.w / 2
-      if (facecam.y <= maxStart && y2 <= maxEnd && cx >= minCenterX && cx <= maxCenterX) {
-        topCrop = Math.min(maxCrop, Math.max(0, y2 + pad))
-      }
-    }
-
-    const gameSrc = {
-      x: 0,
-      y: imgH * topCrop,
-      w: imgW,
-      h: imgH * (1 - topCrop - effectiveBottomCrop),
-    }
-    const zoom = Math.max(0.1, facecamEnabled ? tuning.gameplayZoom : tuning.gameplayZoomNoFacecam)
-    const panXNorm = (tuning.gameplayXBias + 1) / 2
-    const defaultYBias = hudEnabled ? 0 : 1
-    const panYBias = Number.isFinite(tuning.gameplayYBias) ? tuning.gameplayYBias : defaultYBias
-    const panYNorm = (panYBias + 1) / 2
-    const yOverscan = 1 + 0.18 * Math.min(1, Math.abs(panYBias))
-    const baseZoom = Math.max(1, zoom)
-    const targetW = outW * baseZoom
-    const targetH = gameH * baseZoom * yOverscan
-    const scale = Math.max(targetW / gameSrc.w, targetH / gameSrc.h)
-    const drawW = Math.max(1, gameSrc.w * scale)
-    const drawH = Math.max(1, gameSrc.h * scale)
-    const drawX = (outW - drawW) * panXNorm
-    const drawYInBand = (gameH - drawH) * panYNorm
-    const drawY = safeTop + faceH + drawYInBand
-
-    if (zoom >= 1) {
       ctx.save()
       ctx.beginPath()
-      ctx.rect(0, safeTop + faceH, outW, gameH)
+      ctx.rect(0, bandY, outW, faceH)
       ctx.clip()
-      ctx.drawImage(img, gameSrc.x, gameSrc.y, gameSrc.w, gameSrc.h, drawX, drawY, drawW, drawH)
+      ctx.drawImage(img, faceSrc.x, faceSrc.y, faceSrc.w, faceSrc.h, fDrawX, fDrawY, fDrawW, fDrawH)
       ctx.restore()
-    } else {
-      const plane = document.createElement('canvas')
-      plane.width = outW
-      plane.height = gameH
-      const pctx = plane.getContext('2d')
-      if (pctx) {
-        pctx.clearRect(0, 0, outW, gameH)
-        pctx.drawImage(img, gameSrc.x, gameSrc.y, gameSrc.w, gameSrc.h, drawX, drawYInBand, drawW, drawH)
-        const shrinkW = outW * zoom
-        const shrinkH = gameH * zoom
-        const shrinkX = (outW - shrinkW) * panXNorm
-        const shrinkY = safeTop + faceH + (gameH - shrinkH) * panYNorm
-        ctx.drawImage(plane, 0, 0, outW, gameH, shrinkX, shrinkY, shrinkW, shrinkH)
-      }
     }
+
+    // Gameplay — full source frame, zoom + pan. Pan just shifts visible area.
+    const zoom = Math.max(0.1, facecamEnabled ? tuning.gameplayZoom : tuning.gameplayZoomNoFacecam)
+    const panXNorm = clamp((tuning.gameplayXBias + 1) / 2, 0, 1)
+    const panYNorm = clamp((tuning.gameplayYBias + 1) / 2, 0, 1)
+    const gBaseScale = Math.max(outW / imgW, gameH / imgH) * zoom
+    const gDrawW = imgW * gBaseScale
+    const gDrawH = imgH * gBaseScale
+    const gDrawX = (outW - gDrawW) * panXNorm
+    const gDrawY = gameTopY + (gameH - gDrawH) * panYNorm
+
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(0, gameTopY, outW, gameH)
+    ctx.clip()
+    ctx.drawImage(img, 0, 0, imgW, imgH, gDrawX, gDrawY, gDrawW, gDrawH)
+    ctx.restore()
 
     if (hudEnabled) {
       // HUD overlay — crop, contain-scale into the hud box, overlay near bottom (centered).
@@ -502,79 +465,26 @@ function GameplayPlanePreview({
     const imgW = img.naturalWidth || img.width
     const imgH = img.naturalHeight || img.height
 
-    const hudCropPad = 0.01
-    const hudBarMinY = 0.75
-    const hudBarMinW = 0.18
-    const hudBarMinAspect = 1.35
-    const hudCutoutMinW = 0.3
-    const derivedBottomCrop = 1 - Math.min(1, hud.y + hudCropPad)
-    const hudAspect = hud.h > 1e-6 ? hud.w / hud.h : 0
-    const hudLooksLikeBar =
-      hudEnabled && hud.y >= hudBarMinY && hud.w >= hudBarMinW && hudAspect >= hudBarMinAspect && hud.x <= 0.7
-    const hudCutoutEnabled = hudLooksLikeBar && hud.w >= hudCutoutMinW
-    const effectiveBottomCrop = hudCutoutEnabled ? Math.max(0, Math.min(0.14, derivedBottomCrop)) : 0
-
-    let topCrop = 0
-    if (facecamEnabled) {
-      const pad = 0.02
-      const maxStart = 0.45
-      const maxEnd = 0.75
-      const maxCrop = 0.36
-      const minCenterX = 0.33
-      const maxCenterX = 0.67
-      const y2 = facecam.y + facecam.h
-      const cx = facecam.x + facecam.w / 2
-      if (facecam.y <= maxStart && y2 <= maxEnd && cx >= minCenterX && cx <= maxCenterX) {
-        topCrop = Math.min(maxCrop, Math.max(0, y2 + pad))
-      }
-    }
-
-    const gameSrc = {
-      x: 0,
-      y: imgH * topCrop,
-      w: imgW,
-      h: imgH * Math.max(0.05, 1 - topCrop - effectiveBottomCrop),
-    }
+    // Simplified gameplay preview — full source frame, zoom + pan.
     const zoom = Math.max(0.1, facecamEnabled ? tuning.gameplayZoom : tuning.gameplayZoomNoFacecam)
     const panXNorm = (tuning.gameplayXBias + 1) / 2
-    const defaultYBias = hudEnabled ? 0 : 1
-    const panYBias = Number.isFinite(tuning.gameplayYBias) ? tuning.gameplayYBias : defaultYBias
-    const panYNorm = (panYBias + 1) / 2
-    const yOverscan = 1 + 0.18 * Math.min(1, Math.abs(panYBias))
-    const baseZoom = Math.max(1, zoom)
-    const targetW = outW * baseZoom
-    const targetH = outH * baseZoom * yOverscan
-    const scale = Math.max(targetW / gameSrc.w, targetH / gameSrc.h)
-    const drawW = Math.max(1, gameSrc.w * scale)
-    const drawH = Math.max(1, gameSrc.h * scale)
-    const drawX = (outW - drawW) * panXNorm
-    const drawY = (outH - drawH) * panYNorm
+    const panYNorm = (tuning.gameplayYBias + 1) / 2
+    const gBase = Math.max(outW / imgW, outH / imgH)
+    const gScale = gBase * zoom
+    const gW = imgW * gScale
+    const gH = imgH * gScale
+    const gX = (outW - gW) * panXNorm
+    const gY = (outH - gH) * panYNorm
 
     ctx.clearRect(0, 0, outW, outH)
     ctx.fillStyle = '#05070b'
     ctx.fillRect(0, 0, outW, outH)
-    if (zoom >= 1) {
-      ctx.save()
-      ctx.beginPath()
-      ctx.rect(0, 0, outW, outH)
-      ctx.clip()
-      ctx.drawImage(img, gameSrc.x, gameSrc.y, gameSrc.w, gameSrc.h, drawX, drawY, drawW, drawH)
-      ctx.restore()
-    } else {
-      const plane = document.createElement('canvas')
-      plane.width = outW
-      plane.height = outH
-      const pctx = plane.getContext('2d')
-      if (pctx) {
-        pctx.clearRect(0, 0, outW, outH)
-        pctx.drawImage(img, gameSrc.x, gameSrc.y, gameSrc.w, gameSrc.h, drawX, drawY, drawW, drawH)
-        const shrinkW = outW * zoom
-        const shrinkH = outH * zoom
-        const shrinkX = (outW - shrinkW) * panXNorm
-        const shrinkY = (outH - shrinkH) * panYNorm
-        ctx.drawImage(plane, 0, 0, outW, outH, shrinkX, shrinkY, shrinkW, shrinkH)
-      }
-    }
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(0, 0, outW, outH)
+    ctx.clip()
+    ctx.drawImage(img, 0, 0, imgW, imgH, gX, gY, gW, gH)
+    ctx.restore()
 
     ctx.fillStyle = 'rgba(0,0,0,0.2)'
     ctx.fillRect(0, 0, outW, 30)
@@ -730,7 +640,7 @@ function MultiRectEditor({
       </div>
 
       <div
-        className="relative w-full select-none"
+        className="relative w-full select-none min-h-[200px]"
         onPointerMove={onPointerMove}
         onPointerUp={stopDrag}
         onPointerCancel={stopDrag}
@@ -869,6 +779,7 @@ export function CropProfilesDialog({
   const [reviewIndex, setReviewIndex] = useState(0)
   const [localConfirmedClipIds, setLocalConfirmedClipIds] = useState<string[]>([])
   const [localClipOverrides, setLocalClipOverrides] = useState<Record<string, LayoutProfile>>({})
+  const localClipOverridesRef = useRef<Record<string, LayoutProfile>>({})
   const carryForwardRef = useRef<CropCarryForward | null>(null)
 
   const reviewClips = useMemo(() => {
@@ -947,6 +858,7 @@ export function CropProfilesDialog({
       next[clipId] = value
     }
     setLocalClipOverrides(next)
+    localClipOverridesRef.current = next
   }, [open])
 
   useEffect(() => {
@@ -959,6 +871,10 @@ export function CropProfilesDialog({
       return next
     })
   }, [open, clips.map((c) => c.id).join('|')])
+
+  useEffect(() => {
+    localClipOverridesRef.current = localClipOverrides
+  }, [localClipOverrides])
 
   useEffect(() => {
     if (!onClipOverridesChange) return
@@ -1028,7 +944,7 @@ export function CropProfilesDialog({
     setView('edit')
     const key = selectedStreamer.trim().toLowerCase()
     const existing = profiles?.[key] ?? null
-    const clipOverride = activeClipId ? localClipOverrides[activeClipId] : undefined
+    const clipOverride = activeClipId ? localClipOverridesRef.current[activeClipId] : undefined
 
     const carry = carryForwardRef.current
     const fallbackFace = carry?.facecam ? normalizeRect(carry.facecam) : DEFAULT_FACE
@@ -1058,6 +974,9 @@ export function CropProfilesDialog({
       safeTopRatio: clipOverride?.safe_top_ratio ?? existing?.safe_top_ratio ?? carry?.tuning.safeTopRatio,
       safeBottomRatio: clipOverride?.safe_bottom_ratio ?? existing?.safe_bottom_ratio ?? carry?.tuning.safeBottomRatio,
       facecamBandRatio: clipOverride?.facecam_band_ratio ?? existing?.facecam_band_ratio ?? carry?.tuning.facecamBandRatio,
+      facecamXBias: clipOverride?.facecam_x_bias ?? existing?.facecam_x_bias ?? carry?.tuning.facecamXBias,
+      facecamYBias: clipOverride?.facecam_y_bias ?? existing?.facecam_y_bias ?? carry?.tuning.facecamYBias,
+      facecamZoom: clipOverride?.facecam_zoom ?? existing?.facecam_zoom ?? carry?.tuning.facecamZoom,
       gameplayZoom: clipOverride?.gameplay_zoom ?? existing?.gameplay_zoom ?? carry?.tuning.gameplayZoom,
       gameplayZoomNoFacecam: clipOverride?.gameplay_zoom_no_facecam ?? existing?.gameplay_zoom_no_facecam ?? carry?.tuning.gameplayZoomNoFacecam,
       gameplayXBias: clipOverride?.gameplay_x_bias ?? existing?.gameplay_x_bias ?? carry?.tuning.gameplayXBias,
@@ -1075,7 +994,7 @@ export function CropProfilesDialog({
     setFacecamEnabled((prev) => (prev === faceOn ? prev : faceOn))
     setHudEnabled((prev) => (prev === hudOn ? prev : hudOn))
     setTuning((prev) => (tuningEquals(prev, tuned) ? prev : tuned))
-  }, [open, selectedStreamer, profiles, streamersKey, initialStreamer, currentReviewClip?.id, activeClipId, localClipOverrides])
+  }, [open, selectedStreamer, profiles, streamersKey, initialStreamer, currentReviewClip?.id, activeClipId])
 
   useEffect(() => {
     if (!open) return
@@ -1105,6 +1024,7 @@ export function CropProfilesDialog({
       p.safe_top_ratio != null ||
       p.safe_bottom_ratio != null ||
       p.facecam_band_ratio != null ||
+      p.facecam_x_bias != null ||
       p.gameplay_zoom != null ||
       p.gameplay_zoom_no_facecam != null ||
       p.gameplay_x_bias != null ||
@@ -1118,34 +1038,8 @@ export function CropProfilesDialog({
     ))
   }, [profiles, selectedStreamer])
 
-  const facecamCropZoom = useMemo(() => {
-    const w = facecamRect.w > 1e-6 ? facecamRect.w : DEFAULT_FACE.w
-    return Math.max(0.5, Math.min(2.5, DEFAULT_FACE.w / w))
-  }, [facecamRect.w])
-
   function updateTuningField(key: keyof LayoutTuning, value: number) {
     setTuning((prev) => normalizeTuning({ ...prev, [key]: value }))
-  }
-
-  function updateFacecamField(field: keyof FacecamRect, value: number) {
-    setFacecamRect((prev) => normalizeRect({ ...prev, [field]: value }))
-  }
-
-  function updateFacecamCropZoom(zoom: number) {
-    const z = clamp(zoom, 0.5, 2.5)
-    setFacecamRect((prev) => {
-      const aspect = prev.h > 1e-6 ? prev.w / prev.h : (DEFAULT_FACE.w / DEFAULT_FACE.h)
-      const targetW = clamp(DEFAULT_FACE.w / z, 0.08, 0.95)
-      const targetH = clamp(targetW / aspect, 0.08, 0.95)
-      const cx = prev.x + prev.w / 2
-      const cy = prev.y + prev.h / 2
-      return normalizeRect({
-        x: cx - targetW / 2,
-        y: cy - targetH / 2,
-        w: targetW,
-        h: targetH,
-      })
-    })
   }
 
   function buildCurrentLayoutProfile(): LayoutProfile {
@@ -1157,6 +1051,9 @@ export function CropProfilesDialog({
       safe_top_ratio: tuning.safeTopRatio,
       safe_bottom_ratio: tuning.safeBottomRatio,
       facecam_band_ratio: tuning.facecamBandRatio,
+      facecam_x_bias: tuning.facecamXBias,
+      facecam_y_bias: tuning.facecamYBias,
+      facecam_zoom: tuning.facecamZoom,
       gameplay_zoom: tuning.gameplayZoom,
       gameplay_zoom_no_facecam: tuning.gameplayZoomNoFacecam,
       gameplay_x_bias: tuning.gameplayXBias,
@@ -1199,14 +1096,13 @@ export function CropProfilesDialog({
     setLocalConfirmedClipIds((prev) => (prev.includes(currentReviewClip.id) ? prev : [...prev, currentReviewClip.id]))
   }
 
-  async function handleSaveAndConfirm(next = false) {
-    const ok = await handleSave()
-    if (!ok) return
+  function confirmAndNext() {
     markCurrentClipConfirmed()
-    if (next && reviewClips.length > 0) {
+    if (reviewClips.length > 0 && reviewIndex < reviewClips.length - 1) {
       setReviewIndex((prev) => Math.min(prev + 1, reviewClips.length - 1))
     }
   }
+
 
   async function handleDelete() {
     if (!selectedStreamer) return
@@ -1225,7 +1121,7 @@ export function CropProfilesDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="relative !p-0 !gap-0 !fixed !inset-3 !top-3 !left-3 !right-3 !bottom-3 !w-auto !h-auto !max-w-none sm:!max-w-none !translate-x-0 !translate-y-0 overflow-hidden rounded-xl lg:rounded-2xl">
+      <DialogContent aria-describedby={undefined} className="relative !p-0 !gap-0 !fixed !inset-3 !top-3 !left-3 !right-3 !bottom-3 !max-w-none sm:!max-w-none !translate-x-0 !translate-y-0 overflow-hidden rounded-xl lg:rounded-2xl">
         <div className="h-full grid grid-rows-[auto_minmax(0,1fr)]">
           <div className="border-b bg-gradient-to-b from-muted/20 to-transparent px-5 py-4 pr-14">
             <div className="flex items-center gap-4">
@@ -1373,77 +1269,33 @@ export function CropProfilesDialog({
             </div>
 
             <div className="rounded-lg border p-3 space-y-3">
-              <div className="text-xs uppercase tracking-wider text-muted-foreground">Facecam, HUD & Text Position</div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <RangeField
-                  label="Facecam X position"
-                  value={facecamRect.x}
-                  min={0}
-                  max={1}
-                  step={0.005}
-                  onChange={(v) => updateFacecamField('x', v)}
-                />
-                <RangeField
-                  label="Facecam Y position"
-                  value={facecamRect.y}
-                  min={0}
-                  max={1}
-                  step={0.005}
-                  onChange={(v) => updateFacecamField('y', v)}
-                />
-                <RangeField
-                  label="Facecam zoom"
-                  value={facecamCropZoom}
-                  min={0.5}
-                  max={2.5}
-                  step={0.01}
-                  onChange={updateFacecamCropZoom}
-                />
-                <RangeField
-                  label="Facecam band height"
-                  value={tuning.facecamBandRatio}
-                  min={0.16}
-                  max={0.5}
-                  step={0.01}
-                  onChange={(v) => updateTuningField('facecamBandRatio', v)}
-                  format={(v) => `${Math.round(v * 100)}%`}
-                />
-                <RangeField
-                  label="HUD X position"
-                  value={tuning.hudXRatio}
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  onChange={(v) => updateTuningField('hudXRatio', v)}
-                />
-                <RangeField
-                  label="HUD Y position"
-                  value={tuning.hudYRatio}
-                  min={0}
-                  max={1}
-                  step={0.01}
-                  onChange={(v) => updateTuningField('hudYRatio', v)}
-                />
-                <RangeField
-                  label="Title Y position"
-                  value={tuning.titleYRatio}
-                  min={0}
-                  max={0.6}
-                  step={0.005}
-                  onChange={(v) => updateTuningField('titleYRatio', v)}
-                  format={(v) => `${Math.round(v * 100)}%`}
-                />
-                <RangeField
-                  label="Subtitle bottom margin"
-                  value={tuning.subtitleMarginRatio}
-                  min={0.05}
-                  max={0.45}
-                  step={0.005}
-                  onChange={(v) => updateTuningField('subtitleMarginRatio', v)}
-                  format={(v) => `${Math.round(v * 100)}%`}
-                />
+              <div className="text-xs uppercase tracking-wider text-muted-foreground">Facecam</div>
+              <div className="space-y-3">
+                <RangeField label="X" value={tuning.facecamXBias} min={-1} max={1} step={0.01} onChange={(v) => updateTuningField('facecamXBias', v)} />
+                <RangeField label="Y" value={tuning.facecamYBias} min={0} max={0.5} step={0.005} onChange={(v) => updateTuningField('facecamYBias', v)} format={(v) => `${Math.round(v * 100)}%`} />
+                <RangeField label="Zoom" value={tuning.facecamZoom} min={0.5} max={2} step={0.01} onChange={(v) => updateTuningField('facecamZoom', v)} />
+                <RangeField label="Band height" value={tuning.facecamBandRatio} min={0.16} max={0.5} step={0.01} onChange={(v) => updateTuningField('facecamBandRatio', v)} format={(v) => `${Math.round(v * 100)}%`} />
               </div>
             </div>
+
+            <div className="rounded-lg border p-3 space-y-3">
+              <div className="text-xs uppercase tracking-wider text-muted-foreground">Gameplay</div>
+              <div className="space-y-3">
+                <RangeField label="Zoom (with facecam)" value={tuning.gameplayZoom} min={0.75} max={1.6} step={0.01} onChange={(v) => updateTuningField('gameplayZoom', v)} />
+                <RangeField label="Zoom (no facecam)" value={tuning.gameplayZoomNoFacecam} min={0.75} max={1.7} step={0.01} onChange={(v) => updateTuningField('gameplayZoomNoFacecam', v)} />
+                <RangeField label="X" value={tuning.gameplayXBias} min={-1} max={1} step={0.01} onChange={(v) => updateTuningField('gameplayXBias', v)} />
+                <RangeField label="Y" value={tuning.gameplayYBias} min={-2} max={2} step={0.01} onChange={(v) => updateTuningField('gameplayYBias', v)} />
+              </div>
+            </div>
+
+            <div className="rounded-lg border p-3 space-y-3">
+              <div className="text-xs uppercase tracking-wider text-muted-foreground">Text</div>
+              <div className="space-y-3">
+                <RangeField label="Title Y" value={tuning.titleYRatio} min={0} max={0.6} step={0.005} onChange={(v) => updateTuningField('titleYRatio', v)} format={(v) => `${Math.round(v * 100)}%`} />
+                <RangeField label="Subtitle margin" value={tuning.subtitleMarginRatio} min={0.05} max={0.45} step={0.005} onChange={(v) => updateTuningField('subtitleMarginRatio', v)} format={(v) => `${Math.round(v * 100)}%`} />
+              </div>
+            </div>
+
               </div>
             </div>
 
@@ -1472,7 +1324,7 @@ export function CropProfilesDialog({
                       <div className="mt-1 text-sm font-medium truncate">
                         {currentReviewClip.streamer || 'Unknown'} · {currentReviewClip.title || currentReviewClip.id}
                       </div>
-                      <div className="mt-2 flex flex-wrap gap-2">
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
                         <Button
                           size="sm"
                           variant="outline"
@@ -1491,17 +1343,11 @@ export function CropProfilesDialog({
                         </Button>
                         <Button
                           size="sm"
-                          variant={confirmedSet.has(currentReviewClip.id) ? 'secondary' : 'outline'}
-                          onClick={markCurrentClipConfirmed}
+                          onClick={confirmAndNext}
                         >
-                          {confirmedSet.has(currentReviewClip.id) ? 'Confirmed' : 'Confirm clip'}
-                        </Button>
-                        <Button
-                          size="sm"
-                          onClick={() => { void handleSaveAndConfirm(reviewIndex < reviewClips.length - 1) }}
-                          disabled={saving}
-                        >
-                          {reviewIndex < reviewClips.length - 1 ? 'Save + Confirm + Next' : 'Save + Confirm'}
+                          {reviewIndex < reviewClips.length - 1
+                            ? (confirmedSet.has(currentReviewClip.id) ? 'Confirmed — Next' : 'Confirm + Next')
+                            : (confirmedSet.has(currentReviewClip.id) ? 'Confirmed' : 'Confirm')}
                         </Button>
                       </div>
                     </div>
@@ -1569,49 +1415,12 @@ export function CropProfilesDialog({
                             onActiveChange={setActive}
                             onChange={(k, r) => (k === 'facecam' ? setFacecamRect(r) : setHudRect(r))}
                           />
-                          <div className="rounded-xl border bg-muted/10 p-3 space-y-3">
-                            <div className="text-xs uppercase tracking-wider text-muted-foreground">Placement & Zoom</div>
-                            <div className="grid gap-3 md:grid-cols-2">
-                              <RangeField
-                                label="Main zoom (facecam)"
-                                value={tuning.gameplayZoom}
-                                min={0.75}
-                                max={1.6}
-                                step={0.01}
-                                onChange={(v) => updateTuningField('gameplayZoom', v)}
-                              />
-                              <RangeField
-                                label="Main zoom (no facecam)"
-                                value={tuning.gameplayZoomNoFacecam}
-                                min={0.75}
-                                max={1.7}
-                                step={0.01}
-                                onChange={(v) => updateTuningField('gameplayZoomNoFacecam', v)}
-                              />
-                              <RangeField
-                                label="Main X position"
-                                value={tuning.gameplayXBias}
-                                min={-1}
-                                max={1}
-                                step={0.01}
-                                onChange={(v) => updateTuningField('gameplayXBias', v)}
-                              />
-                              <RangeField
-                                label="Main Y position"
-                                value={tuning.gameplayYBias}
-                                min={-1}
-                                max={1}
-                                step={0.01}
-                                onChange={(v) => updateTuningField('gameplayYBias', v)}
-                              />
-                              <RangeField
-                                label="HUD zoom"
-                                value={tuning.hudScale}
-                                min={0.5}
-                                max={2}
-                                step={0.01}
-                                onChange={(v) => updateTuningField('hudScale', v)}
-                              />
+                          <div className="rounded-lg border p-3 space-y-3">
+                            <div className="text-xs uppercase tracking-wider text-muted-foreground">HUD Overlay</div>
+                            <div className="grid gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
+                              <RangeField label="HUD X" value={tuning.hudXRatio} min={0} max={1} step={0.01} onChange={(v) => updateTuningField('hudXRatio', v)} />
+                              <RangeField label="HUD Y" value={tuning.hudYRatio} min={0} max={1} step={0.01} onChange={(v) => updateTuningField('hudYRatio', v)} />
+                              <RangeField label="HUD zoom" value={tuning.hudScale} min={0.5} max={2} step={0.01} onChange={(v) => updateTuningField('hudScale', v)} />
                             </div>
                           </div>
                         </div>

@@ -57,6 +57,137 @@ def _get_duration(video_path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def find_peak_moment(video_path: Path, analysis: dict | None = None, verbose: bool = False) -> float | None:
+    """Find the peak entertainment moment in a clip using audio + LLM signals.
+
+    Returns timestamp in seconds, or None if no clear signal.
+    Audio RMS peak (weight 0.6) + LLM moment_timestamp (weight 0.4).
+    """
+    video_path = Path(video_path)
+    try:
+        duration = _get_duration(video_path)
+    except (ValueError, OSError):
+        return None
+    signals = []
+
+    # Audio peak detection via volumedetect with windowed analysis
+    ffmpeg_bin = get_ffmpeg()
+    # Use astats to get per-second RMS levels
+    cmd = [
+        ffmpeg_bin,
+        "-i", str(video_path),
+        "-af", "astats=metadata=1:reset=1",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        # Parse RMS levels from stderr — look for peak timestamps
+        max_rms = -999.0
+        max_rms_time = None
+        current_time = 0.0
+
+        for line in result.stderr.splitlines():
+            if "lavfi.astats.Overall.RMS_level" in line:
+                match = re.search(r"RMS_level=([-\d.]+)", line)
+                if match:
+                    rms = float(match.group(1))
+                    if rms > max_rms:
+                        max_rms = rms
+                        max_rms_time = current_time
+                current_time += 1.0  # reset=1 gives per-second stats
+
+        if max_rms_time is not None and max_rms > -50:
+            signals.append(("audio", max_rms_time, 0.6))
+            if verbose:
+                console.print(f"  [dim]Audio peak at {max_rms_time:.1f}s (RMS: {max_rms:.1f}dB)[/dim]")
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    # LLM moment timestamp
+    if analysis and isinstance(analysis.get("moment_timestamp"), (int, float)):
+        llm_ts = float(analysis["moment_timestamp"])
+        if 0 <= llm_ts <= duration:
+            signals.append(("llm", llm_ts, 0.4))
+            if verbose:
+                console.print(f"  [dim]LLM peak at {llm_ts:.1f}s[/dim]")
+
+    if not signals:
+        return None
+
+    # Weighted average
+    total_weight = sum(w for _, _, w in signals)
+    peak = sum(ts * w for _, ts, w in signals) / total_weight
+    return max(0, min(duration, peak))
+
+
+def smart_trim(video_path: Path, peak_timestamp: float, target_duration: float = 30.0, verbose: bool = False) -> Path:
+    """Trim clip around peak moment using stream copy (instant, no re-encode).
+
+    Centers window around peak: 5s before, 3s after, expands to target_duration.
+    Only trims if saving >=5s. Returns original path if not worthwhile.
+    """
+    video_path = Path(video_path)
+    try:
+        duration = _get_duration(video_path)
+    except (ValueError, OSError):
+        return video_path
+
+    # Not worth trimming if already near target
+    if duration <= target_duration + 5:
+        if verbose:
+            console.print(f"  [dim]Clip is {duration:.1f}s — no smart trim needed[/dim]")
+        return video_path
+
+    # Build window around peak
+    # Asymmetric: more time before peak (buildup) than after (payoff)
+    before_peak = target_duration * 0.6
+    after_peak = target_duration * 0.4
+
+    start = peak_timestamp - before_peak
+    end = peak_timestamp + after_peak
+
+    # Clamp to video bounds
+    if start < 0:
+        end -= start  # shift right
+        start = 0
+    if end > duration:
+        start -= (end - duration)  # shift left
+        end = duration
+    start = max(0, start)
+
+    trimmed_duration = end - start
+    savings = duration - trimmed_duration
+
+    if savings < 5:
+        if verbose:
+            console.print(f"  [dim]Smart trim would only save {savings:.1f}s — skipping[/dim]")
+        return video_path
+
+    if verbose:
+        console.print(f"  [blue]Smart trim:[/blue] {duration:.1f}s → {trimmed_duration:.1f}s (peak at {peak_timestamp:.1f}s)")
+
+    ffmpeg_bin = get_ffmpeg()
+    output_path = video_path.with_name(f"{video_path.stem}_smarttrim.mp4")
+
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-ss", str(start),
+        "-i", str(video_path),
+        "-t", str(trimmed_duration),
+        "-c", "copy",
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        console.print(f"  [green]Smart trimmed:[/green] {duration:.1f}s → {trimmed_duration:.1f}s (saved {savings:.1f}s)")
+        return output_path
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if verbose:
+            console.print(f"  [yellow]Smart trim failed, using original: {e}[/yellow]")
+        return video_path
+
+
 def trim_dead_air(video_path: Path, verbose: bool = False) -> Path:
     """Trim leading/trailing silence and long interior pauses from a clip.
 
@@ -139,6 +270,7 @@ def trim_dead_air(video_path: Path, verbose: bool = False) -> Path:
         "-crf", "18",
         "-c:a", "aac",
         "-b:a", "256k",
+        "-movflags", "+faststart",
         str(output_path),
     ]
 

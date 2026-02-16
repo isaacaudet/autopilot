@@ -1,0 +1,375 @@
+/* Clipper Dashboard — Textual CSS */
+
+/* ── App Layout ─────────────────────────────────────────── */
+
+Screen {
+    layout: vertical;
+    overflow: hidden;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
+    height: 1fr;
+    overflow: hidden;
+}
+
+/* ── Status Bar ─────────────────────────────────────────── */
+
+StatusBar {
+    height: 1;
+    dock: bottom;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* ── Common: Metric Cards ───────────────────────────────── */
+
+.metrics-row {
+    layout: horizontal;
+    height: 5;
+    margin: 1 0;
+}
+
+MetricCard {
+    width: 1fr;
+    min-width: 15;
+    height: 100%;
+    border: round $surface-lighten-2;
+    content-align: center middle;
+    text-align: center;
+    background: $surface;
+    padding: 0 1;
+    margin: 0 1;
+}
+
+MetricCard .label {
+    color: $text-muted;
+}
+
+MetricCard .value {
+    text-style: bold;
+}
+
+MetricCard .value.success {
+    color: $success;
+}
+
+MetricCard .value.warning {
+    color: $warning;
+}
+
+MetricCard .value.error {
+    color: $error;
+}
+
+/* ── Pipeline Tab ───────────────────────────────────────── */
+
+#pipeline {
+    layout: vertical;
+}
+
+#pipeline .metrics-row {
+    height: 5;
+}
+
+#pipeline-content {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#worker-table {
+    width: 60%;
+    height: 100%;
+    border: round $surface-lighten-2;
+    margin: 0 1 0 0;
+}
+
+#log-panel {
+    width: 40%;
+    height: 100%;
+    border: round $surface-lighten-2;
+}
+
+#log-panel RichLog {
+    height: 100%;
+    scrollbar-size: 1 1;
+}
+
+#pipeline-progress {
+    height: 3;
+    margin: 1 0 0 0;
+    padding: 0 1;
+}
+
+ProgressBar {
+    height: 1;
+}
+
+ProgressBar Bar {
+    color: $primary;
+}
+
+WorkerRow {
+    height: 1;
+    layout: horizontal;
+}
+
+WorkerRow .step {
+    color: $primary;
+    text-style: bold;
+}
+
+WorkerRow .idle {
+    color: $text-muted;
+    text-style: italic;
+}
+
+/* ── Queue Tab ──────────────────────────────────────────── */
+
+#queue {
+    layout: vertical;
+}
+
+#queue-subtabs {
+    height: 1;
+    dock: top;
+    background: $surface;
+    padding: 0 1;
+}
+
+#queue DataTable {
+    height: 1fr;
+    margin: 1 0;
+}
+
+#queue-detail {
+    height: 30%;
+    border: round $surface-lighten-2;
+    padding: 1 2;
+    overflow-y: auto;
+    background: $surface;
+}
+
+#queue-detail .clip-title {
+    text-style: bold;
+    color: $text;
+}
+
+#queue-detail .clip-meta {
+    color: $text-muted;
+}
+
+/* ── Analytics Tab ──────────────────────────────────────── */
+
+#analytics {
+    layout: vertical;
+}
+
+#analytics .metrics-row {
+    height: 5;
+}
+
+#analytics DataTable {
+    height: 1fr;
+    margin: 1 0;
+}
+
+#learned-weights {
+    height: 8;
+    border: round $surface-lighten-2;
+    padding: 1 2;
+    overflow-y: auto;
+    background: $surface;
+}
+
+#learned-weights .weight-label {
+    color: $text-muted;
+    width: 20;
+}
+
+#learned-weights .weight-value {
+    text-style: bold;
+    color: $primary;
+}
+
+/* ── Calendar Tab ───────────────────────────────────────── */
+
+#calendar {
+    layout: vertical;
+}
+
+#weekly-grid {
+    layout: horizontal;
+    height: 1fr;
+    margin: 1 0;
+}
+
+.day-column {
+    width: 1fr;
+    border: round $surface-lighten-2;
+    margin: 0 1;
+    overflow-y: auto;
+}
+
+.day-column .day-header {
+    height: 1;
+    text-align: center;
+    text-style: bold;
+    background: $surface;
+    color: $primary;
+}
+
+.day-column .release-slot {
+    height: 3;
+    padding: 0 1;
+    border: dashed $surface-lighten-2;
+    margin: 1 0;
+}
+
+.day-column .release-slot.filled {
+    border: solid $primary;
+    background: $surface;
+}
+
+.day-column .release-slot.empty {
+    color: $text-muted;
+    content-align: center middle;
+}
+
+#release-detail {
+    height: 8;
+    border: round $surface-lighten-2;
+    padding: 1 2;
+    overflow-y: auto;
+    background: $surface;
+}
+
+#calendar-summary {
+    height: 3;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+/* ── Workflow Modal ──────────────────────────────────────── */
+
+WorkflowModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+#workflow-modal {
+    width: 56;
+    height: auto;
+    max-height: 80%;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+#workflow-modal #modal-title {
+    text-style: bold;
+    text-align: center;
+    color: $primary;
+    height: 1;
+    margin: 0 0 1 0;
+}
+
+#workflow-modal OptionList {
+    height: auto;
+    max-height: 12;
+}
+
+#workflow-modal #config-display {
+    height: auto;
+    margin: 1 0 0 0;
+    color: $text-muted;
+}
+
+/* ── Cron Modal ────────────────────────────────────────────── */
+
+CronModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+#cron-modal {
+    width: 50;
+    height: auto;
+    max-height: 60%;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+/* ── DataTable Shared Styles ────────────────────────────── */
+
+DataTable {
+    scrollbar-size: 1 1;
+}
+
+DataTable > .datatable--header {
+    text-style: bold;
+    background: $surface;
+    color: $primary;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary 20%;
+}
+
+/* ── Tabs ───────────────────────────────────────────────── */
+
+Tabs {
+    background: $surface;
+}
+
+Tab.-active {
+    text-style: bold reverse;
+    color: $primary;
+}
+
+/* ── Utility Classes ────────────────────────────────────── */
+
+.text-success {
+    color: $success;
+}
+
+.text-warning {
+    color: $warning;
+}
+
+.text-error {
+    color: $error;
+}
+
+.text-primary {
+    color: $primary;
+}
+
+.text-dim {
+    color: $text-muted;
+}
+
+.text-bold {
+    text-style: bold;
+}
+
+.bordered {
+    border: round $surface-lighten-2;
+}
+
+.padded {
+    padding: 1 2;
+}
+
+.hidden {
+    display: none;
+}

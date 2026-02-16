@@ -18,6 +18,9 @@ _TUNING_KEYS = (
     "safe_top_ratio",
     "safe_bottom_ratio",
     "facecam_band_ratio",
+    "facecam_x_bias",
+    "facecam_y_bias",
+    "facecam_zoom",
     "gameplay_zoom",
     "gameplay_zoom_no_facecam",
     "gameplay_x_bias",
@@ -372,23 +375,26 @@ def _build_fill_filter(
     pan_y = float(tuning.get("gameplay_y_bias", default_pan_y))
     pan_x_n = max(0.0, min(1.0, (pan_x + 1.0) / 2.0))
     pan_y_n = max(0.0, min(1.0, (pan_y + 1.0) / 2.0))
-    # Add vertical overscan when Y bias is non-zero so Y actually moves visible
-    # content even on wide gameplay sources where plain center-crop has no Y room.
-    y_overscan = 1.0 + (0.18 * min(1.0, abs(pan_y)))
     scaled_w = int(round(w * zoom))
-    scaled_h = int(round(game_h * zoom * y_overscan))
+    scaled_h = int(round(game_h * zoom))
     crop_x_expr = f"max(0,min(iw-ow,(iw-ow)*{pan_x_n:.4f}))"
     crop_y_expr = f"max(0,min(ih-oh,(ih-oh)*{pan_y_n:.4f}))"
 
-    # Facecam crop -> scale/crop to top band
+    # Facecam crop -> scale/crop to top band, with optional pan + zoom.
+    facecam_x_bias = float(tuning.get("facecam_x_bias", 0.0))
+    facecam_zoom = float(tuning.get("facecam_zoom", 1.0))
+    facecam_zoom = max(0.5, min(2.0, facecam_zoom))
+    facecam_x_n = max(0.0, min(1.0, (facecam_x_bias + 1.0) / 2.0))
     if facecam_enabled:
+        face_scale_w = max(1, int(round(w * facecam_zoom)))
+        face_scale_h = max(1, int(round(facecam_h * facecam_zoom)))
+        face_crop_x = f"max(0,min(iw-ow,(iw-ow)*{facecam_x_n:.4f}))"
         face = (
             f"[face_src]crop="
             f"w=iw*{face_rect['w']}:h=ih*{face_rect['h']}:"
             f"x=iw*{face_rect['x']}:y=ih*{face_rect['y']},"
-            f"scale={w}:{facecam_h}:force_original_aspect_ratio=increase,setsar=1,"
-            # Center crop so the facecam isn't biased left/right.
-            f"crop={w}:{facecam_h}:x=(iw-ow)/2:y=(ih-oh)/2"
+            f"scale={face_scale_w}:{face_scale_h}:force_original_aspect_ratio=increase,setsar=1,"
+            f"crop={w}:{facecam_h}:x='{face_crop_x}':y=(ih-oh)/2"
             f"[face]"
         )
 
@@ -414,7 +420,7 @@ def _build_fill_filter(
         # Keep zoom-out smooth around 1.0 by first building the same filled crop,
         # then shrinking that composed gameplay plane into the band.
         base_scaled_w = max(1, int(round(w)))
-        base_scaled_h = max(1, int(round(game_h * y_overscan)))
+        base_scaled_h = max(1, int(round(game_h)))
         fit_w = max(1, int(round(w * zoom)))
         fit_h = max(1, int(round(game_h * zoom)))
         pad_x_expr = f"max(0,min(ow-iw,(ow-iw)*{pan_x_n:.4f}))"
@@ -460,7 +466,8 @@ def _build_fill_filter(
     else:
         stack = "[game]null[stack]"
 
-    stack_y = max(0, safe_top)
+    facecam_y_bias = float(tuning.get("facecam_y_bias", 0.0))
+    stack_y = max(0, int(round(h * facecam_y_bias))) if facecam_enabled else max(0, safe_top)
 
     # Place HUD in user-controlled location (defaults near safe-bottom center).
     hud_overlay_x_expr = f"max(0,min(W-w,(W-w)*{hud_x_ratio:.4f}))"

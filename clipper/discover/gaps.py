@@ -23,7 +23,6 @@ def _get_youtube_competition(game_name: str, youtube) -> tuple[int, int]:
     items = response.get("items", [])
     video_count = len(items)
 
-    # Get view counts for these videos
     if not items:
         return 0, 0
 
@@ -44,66 +43,106 @@ def _get_youtube_competition(game_name: str, youtube) -> tuple[int, int]:
     return video_count, total_views
 
 
-def show_gaps(config: dict) -> None:
-    """Display niche gap analysis: Twitch engagement vs YouTube competition."""
-    console.print("[bold]Analyzing content gaps...[/bold]\n")
+def _opportunity_tier(score: float) -> str:
+    """Map gap score to a readable opportunity tier."""
+    if score >= 0.4:
+        return "high"
+    if score >= 0.2:
+        return "medium"
+    return "low"
 
-    # Fetch Twitch trending data
+
+def analyze_gaps(config: dict, limit: int = 20) -> dict:
+    """Return structured gap analysis for web/CLI consumption."""
     try:
         _, headers = _get_twitch_auth()
         twitch_data = fetch_twitch_trending(headers)
     except Exception as e:
-        console.print(f"[red]Twitch API error: {e}[/red]")
-        return
+        return {
+            "gaps": [],
+            "degraded": True,
+            "youtube_available": False,
+            "detail": f"Twitch API error: {e}",
+        }
 
     if not twitch_data:
-        console.print("[yellow]No Twitch trending data to analyze.[/yellow]")
-        return
+        return {
+            "gaps": [],
+            "degraded": False,
+            "youtube_available": False,
+            "detail": "No Twitch trending data to analyze.",
+        }
 
-    # Try to get YouTube service for competition analysis
     youtube = None
+    youtube_error: str | None = None
     try:
         from clipper.upload.auth import get_youtube_service
 
         youtube = get_youtube_service()
     except Exception as e:
-        console.print(
-            f"[yellow]YouTube API not available ({e}). "
-            "Showing Twitch data only.[/yellow]\n"
-        )
+        youtube_error = str(e)
 
     results = []
-    for entry in twitch_data:
+    for entry in twitch_data[:limit]:
         game_name = entry["game_name"]
-        twitch_clips = entry["clip_count"]
-        twitch_views = entry["total_views"]
+        twitch_clips = int(entry["clip_count"])
+        twitch_views = int(entry["total_views"])
 
         yt_videos = 0
         yt_views = 0
-
         if youtube:
             try:
                 yt_videos, yt_views = _get_youtube_competition(game_name, youtube)
             except Exception:
-                pass  # Skip YouTube data for this game on error
+                yt_videos, yt_views = 0, 0
 
-        # Gap score: Twitch engagement / YouTube competition
-        # Higher = more underserved niche
-        gap_score = twitch_views / (yt_views + 1)
+        # Weighted competition model:
+        # - yt_views captures demand saturation
+        # - yt_videos captures content density
+        # Normalize to [0..1+] for easier sorting/UX.
+        competition = yt_views + (yt_videos * 500)
+        supply = twitch_views + (twitch_clips * 250)
+        gap_score = supply / max(competition + supply, 1)
 
         results.append(
             {
                 "game_name": game_name,
                 "twitch_clips": twitch_clips,
                 "twitch_views": twitch_views,
-                "yt_videos": yt_videos,
-                "yt_views": yt_views,
-                "gap_score": gap_score,
+                "yt_videos": int(yt_videos),
+                "yt_views": int(yt_views),
+                "gap_score": round(gap_score, 4),
+                "opportunity": _opportunity_tier(gap_score),
             }
         )
 
-    # Sort by gap score descending
     results.sort(key=lambda x: x["gap_score"], reverse=True)
+    return {
+        "gaps": results,
+        "degraded": False,
+        "youtube_available": youtube is not None,
+        "detail": (
+            f"YouTube competition unavailable: {youtube_error}"
+            if youtube is None and youtube_error
+            else None
+        ),
+    }
+
+
+def show_gaps(config: dict) -> None:
+    """Display niche gap analysis: Twitch engagement vs YouTube competition."""
+    console.print("[bold]Analyzing content gaps...[/bold]\n")
+
+    payload = analyze_gaps(config)
+    rows = payload.get("gaps", [])
+    if not rows:
+        msg = payload.get("detail", "No content gaps found.")
+        style = "red" if payload.get("degraded") else "yellow"
+        console.print(f"[{style}]{msg}[/{style}]")
+        return
+
+    if payload.get("detail"):
+        console.print(f"[yellow]{payload['detail']}[/yellow]\n")
 
     table = Table(title="Content Gap Analysis")
     table.add_column("Rank", justify="right", style="dim")
@@ -112,9 +151,11 @@ def show_gaps(config: dict) -> None:
     table.add_column("Twitch Views", justify="right", style="bold green")
     table.add_column("YT Competition", justify="right", style="red")
     table.add_column("Gap Score", justify="right", style="bold yellow")
+    table.add_column("Opportunity", justify="right")
 
-    for rank, entry in enumerate(results, 1):
-        yt_label = f"{entry['yt_videos']} videos" if youtube else "-"
+    youtube_available = payload.get("youtube_available", False)
+    for rank, entry in enumerate(rows, 1):
+        yt_label = f"{entry['yt_videos']} videos" if youtube_available else "-"
         table.add_row(
             str(rank),
             entry["game_name"],
@@ -122,6 +163,7 @@ def show_gaps(config: dict) -> None:
             f"{entry['twitch_views']:,}",
             yt_label,
             f"{entry['gap_score']:.2f}",
+            entry.get("opportunity", "low"),
         )
 
     console.print(table)

@@ -91,6 +91,17 @@ def auto_approve_top(config: dict, top_n: int = 5, min_score: int = 30) -> int:
     approved_dir.mkdir(parents=True, exist_ok=True)
     skipped_dir.mkdir(parents=True, exist_ok=True)
 
+    # Reset approved queue before every new batch.
+    for stale in approved_dir.glob("*.json"):
+        try:
+            target = skipped_dir / stale.name
+            if target.exists():
+                stale.unlink(missing_ok=True)
+            else:
+                shutil.move(str(stale), str(target))
+        except OSError:
+            stale.unlink(missing_ok=True)
+
     clips = _load_pending_clips(pending_dir)
     if not clips:
         console.print("[yellow]No pending clips to auto-approve.[/yellow]")
@@ -146,6 +157,17 @@ def run_review(config: dict) -> None:
     # Ensure target directories exist
     approved_dir.mkdir(parents=True, exist_ok=True)
     skipped_dir.mkdir(parents=True, exist_ok=True)
+
+    # Reset approved queue before every new review batch.
+    for stale in approved_dir.glob("*.json"):
+        try:
+            target = skipped_dir / stale.name
+            if target.exists():
+                stale.unlink(missing_ok=True)
+            else:
+                shutil.move(str(stale), str(target))
+        except OSError:
+            stale.unlink(missing_ok=True)
 
     clips = _load_pending_clips(pending_dir)
 

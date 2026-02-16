@@ -43,7 +43,7 @@ upload:
   extract_thumbnail: true
 
 subtitles:
-  whisper_model: medium      # ~3x faster than large-v3 on CPU, good enough for short gaming clips
+  whisper_model: large-v3    # better accuracy for gaming audio with loud SFX
   font_size: 52              # large Impact text — fills screen width, readable on mobile
   outline_width: 5           # thick outline for contrast on any background
   words_per_phrase: 3        # 2-3 words per subtitle line
@@ -52,3 +52,19 @@ shorts:
   width: 1080
   height: 1920
   subtitle_margin_v: 450    # bumped from 80 — places text in lower-center safe zone
+
+channels:
+  default:
+    name: "Main Channel"
+    token_file: ".clipper_token.json"
+    default_privacy: unlisted
+    schedule:
+      shorts_per_day: 3
+      release_times: ["10:00", "14:00", "18:00"]
+  class_instantiate:
+    name: "class.instantiate@gmail.com"
+    token_file: ".clipper_token_class_instantiate.json"
+    default_privacy: unlisted
+    schedule:
+      shorts_per_day: 2
+      release_times: ["11:00", "15:00", "19:00"]

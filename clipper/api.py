@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from clipper.config import get_ffprobe, load_config
-from clipper.tui_state import PipelineState
+from clipper.pipeline_state import PipelineState
 
 
 # -- Request/Response models --
@@ -67,6 +67,9 @@ class LayoutProfileRequest(BaseModel):
     safe_top_ratio: float | None = None
     safe_bottom_ratio: float | None = None
     facecam_band_ratio: float | None = None
+    facecam_x_bias: float | None = None
+    facecam_y_bias: float | None = None
+    facecam_zoom: float | None = None
     gameplay_zoom: float | None = None
     gameplay_zoom_no_facecam: float | None = None
     gameplay_x_bias: float | None = None
@@ -191,7 +194,7 @@ def _looks_publishable_video(path: Path) -> bool:
     stem = path.stem.lower()
     if stem.startswith("compilation_"):
         return True
-    return stem.endswith("_final")
+    return stem.endswith("_final") or stem.endswith("_shorts")
 
 
 def _probe_duration_seconds(video_path: Path) -> float:
@@ -247,6 +250,8 @@ def _synthesize_output_meta(video_path: Path) -> dict:
 
 def _build_local_trending_fallback(config: dict) -> list[dict]:
     """Build a local trending list when Twitch credentials/API are unavailable."""
+    from clipper.db import get_db
+
     games_seed = config.get("targets", {}).get("twitch", {}).get("games", []) or []
     by_game: dict[str, dict] = {}
 
@@ -263,50 +268,37 @@ def _build_local_trending_fallback(config: dict) -> list[dict]:
             "avg_views": 0,
         }
 
-    scan_dirs = [
-        config["_queue_dir"] / "pending",
-        config["_queue_dir"] / "approved",
-        config["_output_dir"],
-    ]
+    # Aggregate from DB
+    conn = get_db(config)
+    rows = conn.execute(
+        "SELECT LOWER(game) as game_key, game, COUNT(*) as cnt, SUM(view_count) as total_views "
+        "FROM clips WHERE game IS NOT NULL AND game != '' AND id NOT LIKE 'compilation_%' "
+        "GROUP BY game_key"
+    ).fetchall()
 
-    for scan_dir in scan_dirs:
-        if not scan_dir.exists():
-            continue
-        for meta_path in scan_dir.glob("*.json"):
-            try:
-                clip = json.loads(meta_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
+    for r in rows:
+        key = r["game_key"]
+        row = by_game.setdefault(
+            key,
+            {
+                "game_id": key.replace(" ", "_"),
+                "game_name": r["game"],
+                "platform": "Local",
+                "clip_count": 0,
+                "total_views": 0,
+                "avg_views": 0,
+            },
+        )
+        row["clip_count"] += r["cnt"]
+        row["total_views"] += r["total_views"] or 0
 
-            if clip.get("clip_count"):
-                continue
-
-            game_name = str(clip.get("game", "")).strip()
-            if not game_name:
-                continue
-
-            key = game_name.lower()
-            row = by_game.setdefault(
-                key,
-                {
-                    "game_id": key.replace(" ", "_"),
-                    "game_name": game_name,
-                    "platform": "Local",
-                    "clip_count": 0,
-                    "total_views": 0,
-                    "avg_views": 0,
-                },
-            )
-            row["clip_count"] += 1
-            row["total_views"] += int(clip.get("view_count", 0) or 0)
-
-    rows = list(by_game.values())
-    for row in rows:
+    result = list(by_game.values())
+    for row in result:
         count = int(row["clip_count"])
         row["avg_views"] = int(row["total_views"] / count) if count > 0 else 0
 
-    rows.sort(key=lambda g: (g["total_views"], g["clip_count"], g["game_name"]), reverse=True)
-    return rows[:20]
+    result.sort(key=lambda g: (g["total_views"], g["clip_count"], g["game_name"]), reverse=True)
+    return result[:20]
 
 
 def create_app(config: dict | None = None) -> FastAPI:
@@ -356,6 +348,9 @@ def create_app(config: dict | None = None) -> FastAPI:
             "safe_top_ratio": profile.safe_top_ratio,
             "safe_bottom_ratio": profile.safe_bottom_ratio,
             "facecam_band_ratio": profile.facecam_band_ratio,
+            "facecam_x_bias": profile.facecam_x_bias,
+            "facecam_y_bias": profile.facecam_y_bias,
+            "facecam_zoom": profile.facecam_zoom,
             "gameplay_zoom": profile.gameplay_zoom,
             "gameplay_zoom_no_facecam": profile.gameplay_zoom_no_facecam,
             "gameplay_x_bias": profile.gameplay_x_bias,
@@ -394,6 +389,17 @@ def create_app(config: dict | None = None) -> FastAPI:
         removed = _delete(config, streamer)
         return {"ok": True, "removed": removed}
 
+    @app.post("/api/review/batch")
+    def review_batch(body: dict):
+        from clipper.db import update_clip as db_update_clip
+
+        clip_ids = body.get("clip_ids", [])
+        action = body.get("action", "approve")
+        status = "approved" if action == "approve" else "skipped"
+        for clip_id in clip_ids:
+            db_update_clip(config, clip_id, status=status)
+        return {"updated": len(clip_ids), "status": status}
+
     @app.get("/api/queue")
     def get_queue(
         status: str = Query("pending"),
@@ -405,81 +411,55 @@ def create_app(config: dict | None = None) -> FastAPI:
         include_orphans: bool = Query(True),
         limit: int = Query(250, ge=1, le=2000),
     ):
-        if status == "pending":
-            scan_dir = config["_queue_dir"] / "pending"
-        elif status == "approved":
-            scan_dir = config["_queue_dir"] / "approved"
-        elif status == "output":
-            scan_dir = config["_output_dir"]
-        else:
+        from clipper.db import list_clips
+
+        if status not in ("pending", "approved", "output"):
             raise HTTPException(400, f"Unknown status: {status}")
 
-        if not scan_dir.exists():
-            return {"clips": []}
-
-        clips: list[dict] = []
-        collect_all = status == "output" and sort not in ("", "recent")
         channel_key = str(channel or "").strip()
         if channel_key.lower() in ("", "all", "*"):
             channel_key = ""
 
-        for p in sorted(scan_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
-            try:
-                data = json.loads(p.read_text())
-                # Skip compilations from the regular queue view unless requested
-                if status == "output" and not include_compilations and ("compilation" in p.stem or data.get("clip_count")):
-                    continue
-                data.setdefault("id", p.stem)
-                data["_path"] = str(p)
-                data["_mtime"] = p.stat().st_mtime
-                if game and game.lower() not in data.get("game", "").lower():
-                    continue
-                if streamer and streamer.lower() not in data.get("streamer", "").lower():
-                    continue
-                if channel_key:
-                    target = data.get("_target_channel")
-                    uploaded = data.get("channel")
-                    # Prefer explicit target channel; fall back to the upload channel for older clips.
-                    if target:
-                        if target != channel_key:
-                            continue
-                    elif uploaded and uploaded != channel_key:
-                        continue
-                    elif not uploaded:
-                        continue
-                if status == "output":
-                    processed_path = data.get("processed_path")
-                    if not processed_path or not Path(processed_path).exists():
-                        continue
-                clips.append(data)
-                if not collect_all and len(clips) >= limit:
-                    break
-            except Exception as e:
-                logger.debug("Skipping %s: %s", p.name, e)
-                continue
+        sort_key = sort if sort else ("recent" if status == "output" else "fetched_at")
 
-        if status == "output" and include_orphans and (collect_all or len(clips) < limit):
-            existing_ids = {str(c.get("id", "")).strip() for c in clips}
-            for mp4 in sorted(scan_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
-                if not collect_all and len(clips) >= limit:
-                    break
-                if not _looks_publishable_video(mp4):
-                    continue
-                clip_id = mp4.stem
-                if clip_id in existing_ids:
-                    continue
-                clip = _synthesize_output_meta(mp4)
-                if not include_compilations and ("compilation" in clip_id or clip.get("clip_count")):
-                    continue
-                if game and game.lower() not in clip.get("game", "").lower():
-                    continue
-                if streamer and streamer.lower() not in clip.get("streamer", "").lower():
-                    continue
-                if channel_key:
-                    # Orphans have no channel assignment; only show them in the all-channels view.
-                    continue
-                clip["_mtime"] = mp4.stat().st_mtime
-                clips.append(clip)
+        clips = list_clips(
+            config,
+            status=status,
+            game=game if game else None,
+            channel=channel_key if channel_key else None,
+            streamer=streamer if streamer else None,
+            sort=sort_key,
+            limit=limit,
+            exclude_compilations=(status == "output" and not include_compilations),
+        )
+
+        # For output clips, verify processed_path still exists
+        if status == "output":
+            clips = [c for c in clips if c.get("processed_path") and Path(c["processed_path"]).exists()]
+
+        # Orphan output videos (MP4 files with no DB entry)
+        if status == "output" and include_orphans and len(clips) < limit:
+            output_dir = config["_output_dir"]
+            if output_dir.exists():
+                existing_ids = {str(c.get("id", "")).strip() for c in clips}
+                for mp4 in sorted(output_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+                    if len(clips) >= limit:
+                        break
+                    if not _looks_publishable_video(mp4):
+                        continue
+                    clip_id = mp4.stem
+                    if clip_id in existing_ids:
+                        continue
+                    clip = _synthesize_output_meta(mp4)
+                    if not include_compilations and ("compilation" in clip_id or clip.get("clip_count")):
+                        continue
+                    if game and game.lower() not in clip.get("game", "").lower():
+                        continue
+                    if streamer and streamer.lower() not in clip.get("streamer", "").lower():
+                        continue
+                    if channel_key:
+                        continue
+                    clips.append(clip)
 
         if status == "output":
             from clipper.learn import get_learned_weights
@@ -494,21 +474,6 @@ def create_app(config: dict | None = None) -> FastAPI:
                 except Exception:
                     clip["_score"] = 0
 
-        # Sorting
-        if sort == "score":
-            clips.sort(key=lambda c: c.get("_score", 0), reverse=True)
-        elif sort in ("recent", "") and status == "output":
-            clips.sort(key=lambda c: c.get("_mtime", 0), reverse=True)
-        elif sort == "duration":
-            clips.sort(key=lambda c: c.get("duration", 0), reverse=True)
-        elif sort == "views":
-            clips.sort(key=lambda c: c.get("view_count", 0), reverse=True)
-        elif sort == "title":
-            clips.sort(key=lambda c: c.get("title", "").lower())
-
-        if len(clips) > limit:
-            clips = clips[:limit]
-
         if status == "output":
             from clipper.upload.youtube import _build_description, _build_tags, _build_title
 
@@ -519,9 +484,6 @@ def create_app(config: dict | None = None) -> FastAPI:
                     clip["_generated_tags"] = _build_tags(clip, config)
                 except Exception:
                     continue
-
-        for clip in clips:
-            clip.pop("_mtime", None)
 
         return {"clips": clips, "limit": limit}
 
@@ -568,18 +530,20 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.get("/api/video/{clip_id}")
     def get_video(clip_id: str):
         output_dir = config["_output_dir"]
-        meta_path = _resolve_clip_meta(output_dir, clip_id)
 
+        # Try metadata-based resolution first
         try:
+            meta_path = _resolve_clip_meta(output_dir, clip_id)
             data = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            raise HTTPException(500, f"Failed to read clip metadata: {e}")
+            video_path = data.get("processed_path")
+            if video_path and Path(video_path).exists():
+                return FileResponse(video_path, media_type="video/mp4")
+        except (HTTPException, json.JSONDecodeError, OSError):
+            pass
 
-        video_path = data.get("processed_path")
-        if not video_path or not Path(video_path).exists():
-            raise HTTPException(404, f"Video file not found for clip {clip_id}")
-
-        return FileResponse(video_path, media_type="video/mp4")
+        # Fallback: find video file directly
+        video_path = _resolve_output_video_path(output_dir, clip_id)
+        return FileResponse(str(video_path), media_type="video/mp4")
 
     @app.post("/api/workflow/start")
     def workflow_start(req: WorkflowStartRequest):
@@ -595,13 +559,13 @@ def create_app(config: dict | None = None) -> FastAPI:
                     from clipper.workflow import run_shorts_workflow
                     run_shorts_workflow(
                         config, game=req.game, count=req.count,
-                        auto=True, channel=req.channel, state=state,
+                        channel=req.channel, state=state,
                     )
-                elif req.recipe in ("compilation", "snipe"):
+                elif req.recipe == "compilation":
                     from clipper.workflow import run_compilation_workflow
                     run_compilation_workflow(
                         config, game=req.game, duration=None,
-                        auto=True, channel=req.channel, state=state,
+                        channel=req.channel, state=state,
                     )
                 if state.phase not in ("error",):
                     state.set_phase("done", f"{state.completed} clips processed")
@@ -617,8 +581,8 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.post("/api/workflow/fetch-score")
     def workflow_fetch_score(req: FetchScoreRequest):
         """Synchronous: fetch clips for a game, score them, return tiers."""
-        from clipper.workflow import _fetch_clips
-        from clipper.cli import _load_and_score_pending
+        from clipper.workflow import _fetch_clips, _load_and_score_pending
+        from clipper.db import get_db
 
         try:
             fetched = _fetch_clips(
@@ -630,6 +594,23 @@ def create_app(config: dict | None = None) -> FastAPI:
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
+
+        # Reset the review queue to only show clips from this fetch batch.
+        # Step 1: skip ALL currently pending clips (clean slate).
+        # Step 2: set all fetched clips to pending (re-activate even if previously skipped).
+        fetched_ids = {str(c.get("id", "")).strip() for c in (fetched or []) if c.get("id")}
+
+        conn = get_db(config)
+        conn.execute("UPDATE clips SET status = 'skipped' WHERE status = 'pending'")
+        if fetched_ids:
+            id_list = list(fetched_ids)
+            placeholders = ",".join("?" for _ in id_list)
+            conn.execute(
+                f"UPDATE clips SET status = 'pending' WHERE id IN ({placeholders}) AND status = 'skipped'",
+                id_list,
+            )
+        conn.commit()
+
         if not fetched:
             return {"clips": [], "tiers": [], "clip_count": 0}
         pending = _load_and_score_pending(config, game=req.game)
@@ -672,11 +653,11 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.post("/api/workflow/approve-process")
     def workflow_approve_process(req: ApproveProcessRequest):
-        """Move selected clips to approved, start processing in background."""
+        """Mark selected clips as approved, start processing in background."""
         if workflow_thread["current"] and workflow_thread["current"].is_alive():
             raise HTTPException(409, "A workflow is already running")
 
-        import shutil
+        from clipper.db import get_db, update_clip as db_update_clip
 
         channel_key = (req.channel or "").strip() or None
         channels_cfg = config.get("channels", {}) or {}
@@ -689,54 +670,28 @@ def create_app(config: dict | None = None) -> FastAPI:
         if layout_key and layout_key not in ("blur", "fill"):
             raise HTTPException(400, f"Unknown shorts_layout: {layout_key}")
 
-        queue_dir = config["_queue_dir"]
-        pending_dir = queue_dir / "pending"
-        approved_dir = queue_dir / "approved"
-        skipped_dir = queue_dir / "skipped"
-        approved_dir.mkdir(parents=True, exist_ok=True)
-        skipped_dir.mkdir(parents=True, exist_ok=True)
+        conn = get_db(config)
 
-        # Reset approved queue before every new batch so stale entries cannot
-        # leak into this run.
-        for stale in approved_dir.glob("*.json"):
-            try:
-                target = skipped_dir / stale.name
-                if target.exists():
-                    stale.unlink(missing_ok=True)
-                else:
-                    shutil.move(str(stale), str(target))
-            except OSError:
-                stale.unlink(missing_ok=True)
+        # Reset any previously approved clips back to skipped
+        conn.execute("UPDATE clips SET status = 'skipped' WHERE status = 'approved'")
+        conn.commit()
 
         selected_ids = set(req.clip_ids)
         layout_overrides = req.layout_overrides if isinstance(req.layout_overrides, dict) else {}
         approved_count = 0
 
-        # Move selected to approved, rest to skipped
-        for path in sorted(pending_dir.glob("*.json")):
-            try:
-                data = json.loads(path.read_text())
-                clip_id = data.get("id", path.stem)
-                if clip_id in selected_ids:
-                    dirty = False
-                    if channel_key:
-                        data["_target_channel"] = channel_key
-                        dirty = True
-                    if layout_key:
-                        data["_shorts_layout"] = layout_key
-                        dirty = True
-                    override = layout_overrides.get(str(clip_id))
-                    if isinstance(override, dict):
-                        data["_layout_override"] = override
-                        dirty = True
-                    if dirty:
-                        path.write_text(json.dumps(data, indent=2))
-                    shutil.move(str(path), str(approved_dir / path.name))
-                    approved_count += 1
-                else:
-                    shutil.move(str(path), str(skipped_dir / path.name))
-            except (json.JSONDecodeError, OSError):
-                shutil.move(str(path), str(skipped_dir / path.name))
+        for clip_id in selected_ids:
+            updates: dict = {"status": "approved"}
+            if channel_key:
+                updates["channel"] = channel_key
+            if layout_key:
+                updates["_shorts_layout"] = layout_key
+            db_update_clip(config, clip_id, **updates)
+            approved_count += 1
+
+        # Skip remaining pending
+        conn.execute("UPDATE clips SET status = 'skipped' WHERE status = 'pending'")
+        conn.commit()
 
         if approved_count == 0:
             raise HTTPException(400, "No clips matched the provided IDs")
@@ -744,11 +699,11 @@ def create_app(config: dict | None = None) -> FastAPI:
         # Reset state
         state.reset(recipe=req.recipe, phase="processing", detail=f"Processing {approved_count} clips")
 
-        for_compilation = req.recipe in ("compilation", "snipe")
+        for_compilation = req.recipe == "compilation"
 
         def _run():
             try:
-                from clipper.cli import _process_clips
+                from clipper.workflow import _process_clips
                 _process_clips(config, for_compilation=for_compilation, state=state)
                 if state.phase != "error":
                     state.set_phase("done", f"{state.completed} clips processed")
@@ -835,11 +790,13 @@ def create_app(config: dict | None = None) -> FastAPI:
                 break
 
         if video_id:
+            from clipper.db import update_clip as db_update_clip
             clip["video_id"] = video_id
             if used_channel:
                 clip["channel"] = used_channel
                 clip.setdefault("_target_channel", used_channel)
             meta_path.write_text(json.dumps(clip, indent=2))
+            db_update_clip(config, req.clip_id, video_id=video_id, channel=used_channel or "")
             return {"video_id": video_id, "channel": used_channel, "attempts": attempts}
 
         attempted = ", ".join([c for c in channel_order if c]) or "default OAuth token"
@@ -900,11 +857,13 @@ def create_app(config: dict | None = None) -> FastAPI:
                     break
 
             if video_id:
+                from clipper.db import update_clip as db_update_clip
                 clip["video_id"] = video_id
                 if used_channel:
                     clip["channel"] = used_channel
                     clip.setdefault("_target_channel", used_channel)
                 meta_path.write_text(json.dumps(clip, indent=2))
+                db_update_clip(config, clip_id, video_id=video_id, channel=used_channel or "")
                 results.append({"clip_id": clip_id, "video_id": video_id, "channel": used_channel, "attempts": attempts})
             else:
                 attempted = ", ".join([c for c in channel_order if c]) or "default OAuth token"
@@ -916,17 +875,33 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.patch("/api/clips/{clip_id}")
     def update_clip(clip_id: str, req: ClipUpdateRequest):
-        output_dir = config["_output_dir"]
-        meta_path = _resolve_clip_meta(output_dir, clip_id)
+        from clipper.db import update_clip as db_update_clip, get_clip
 
-        clip = json.loads(meta_path.read_text())
+        output_dir = config["_output_dir"]
+        updates: dict = {}
         if req.title_override is not None:
-            clip["_title_override"] = req.title_override
+            updates["title_override"] = req.title_override
         if req.description_override is not None:
-            clip["_description_override"] = req.description_override
+            updates["description_override"] = req.description_override
         if req.tags_override is not None:
-            clip["_tags_override"] = req.tags_override
-        meta_path.write_text(json.dumps(clip, indent=2))
+            updates["tags_override"] = json.dumps(req.tags_override)
+
+        if updates:
+            db_update_clip(config, clip_id, **updates)
+
+        # Also update the JSON file for backward compat (upload reads it)
+        meta_path = output_dir / f"{clip_id}.json"
+        if meta_path.exists():
+            clip = json.loads(meta_path.read_text())
+            if req.title_override is not None:
+                clip["_title_override"] = req.title_override
+            if req.description_override is not None:
+                clip["_description_override"] = req.description_override
+            if req.tags_override is not None:
+                clip["_tags_override"] = req.tags_override
+            meta_path.write_text(json.dumps(clip, indent=2))
+        else:
+            clip = get_clip(config, clip_id) or {}
 
         # Sync to YouTube if requested and clip has been uploaded
         if req.sync_youtube and clip.get("video_id"):
@@ -943,6 +918,102 @@ def create_app(config: dict | None = None) -> FastAPI:
                 raise HTTPException(502, "Saved locally but YouTube sync failed")
 
         return {"ok": True}
+
+    @app.get("/api/clips/{clip_id}/subtitles")
+    def get_subtitles(clip_id: str):
+        """Parse ASS subtitle file and return structured lines."""
+        from clipper.db import get_clip as db_get_clip
+
+        clip = db_get_clip(config, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+
+        ass_path_str = clip.get("_subtitle_path")
+        if not ass_path_str:
+            # Try to find .ass next to processed video
+            processed = clip.get("processed_path", "")
+            if processed:
+                candidate = Path(processed).with_suffix(".ass")
+                if candidate.exists():
+                    ass_path_str = str(candidate)
+
+        if not ass_path_str or not Path(ass_path_str).exists():
+            raise HTTPException(404, f"No subtitle file for clip {clip_id}")
+
+        ass_path = Path(ass_path_str)
+        lines = []
+        idx = 0
+        for raw_line in ass_path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.startswith("Dialogue:"):
+                continue
+            # Format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+            parts = raw_line.split(",", 9)
+            if len(parts) < 10:
+                continue
+            start = parts[1].strip()
+            end = parts[2].strip()
+            raw_text = parts[9]
+            # Strip ASS override tags for display
+            plain = re.sub(r"\{[^}]*\}", "", raw_text).replace("\\N", " ").strip()
+            lines.append({
+                "index": idx,
+                "start": start,
+                "end": end,
+                "text": plain,
+                "raw": raw_text,
+            })
+            idx += 1
+
+        return {"lines": lines, "ass_path": str(ass_path)}
+
+    @app.put("/api/clips/{clip_id}/subtitles")
+    def update_subtitles(clip_id: str, body: dict):
+        """Update subtitle lines. Regenerates ASS file preserving header."""
+        from clipper.db import get_clip as db_get_clip
+
+        clip = db_get_clip(config, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+
+        ass_path_str = clip.get("_subtitle_path")
+        if not ass_path_str:
+            processed = clip.get("processed_path", "")
+            if processed:
+                candidate = Path(processed).with_suffix(".ass")
+                if candidate.exists():
+                    ass_path_str = str(candidate)
+
+        if not ass_path_str or not Path(ass_path_str).exists():
+            raise HTTPException(404, f"No subtitle file for clip {clip_id}")
+
+        ass_path = Path(ass_path_str)
+        updated_lines = body.get("lines", [])
+
+        # Read existing file, keep everything before [Events] dialogue lines
+        original = ass_path.read_text(encoding="utf-8")
+        header_lines = []
+        in_events = False
+        for line in original.splitlines():
+            if line.startswith("Dialogue:"):
+                in_events = True
+                continue
+            header_lines.append(line)
+
+        # Rebuild dialogue lines from updated data
+        dialogue_lines = []
+        for item in updated_lines:
+            start = item.get("start", "0:00:00.00")
+            end = item.get("end", "0:00:00.00")
+            raw = item.get("raw", "")
+            text = item.get("text", "")
+            # If raw is present, use it (preserves ASS tags); otherwise use plain text
+            content = raw if raw else text.upper()
+            dialogue_lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{content}")
+
+        output = "\n".join(header_lines) + "\n" + "\n".join(dialogue_lines) + "\n"
+        ass_path.write_text(output, encoding="utf-8")
+
+        return {"ok": True, "lines_written": len(dialogue_lines)}
 
     @app.get("/api/clips/{clip_id}/title-preview")
     def get_title_preview(clip_id: str):
@@ -1012,26 +1083,28 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.get("/api/releases")
     def get_releases(channel: str = Query("all")):
-        from clipper.schedule import get_pending_releases
-        releases = get_pending_releases(config)
+        from clipper.db import list_releases
+
         channel_key = str(channel or "").strip()
         if channel_key.lower() in ("", "all", "*"):
-            return {"releases": releases}
-        return {"releases": [r for r in releases if r.get("channel") == channel_key]}
+            channel_key = None
+
+        releases = list_releases(config, channel=channel_key)
+        return {"releases": releases}
 
     @app.post("/api/releases")
     def create_release(req: ReleaseRequest):
-        from clipper.schedule import schedule_release
+        from clipper.db import create_release as db_create_release
 
         try:
             scheduled_at = datetime.fromisoformat(req.scheduled_at)
         except ValueError:
             raise HTTPException(400, f"Invalid datetime: {req.scheduled_at}")
 
-        path = schedule_release(
-            req.clip_id, req.channel, scheduled_at, config,
+        release_id = db_create_release(
+            config, req.clip_id, req.channel, scheduled_at.isoformat(),
         )
-        return {"path": str(path)}
+        return {"id": release_id}
 
     @app.get("/api/analytics")
     def get_analytics(
@@ -1046,6 +1119,15 @@ def create_app(config: dict | None = None) -> FastAPI:
             return {"videos": fetch_channel_recent(days=days, refresh=refresh, channel=channel_key, config=config)}
         videos, errors = fetch_channels_recent(config, days=days, refresh=refresh)
         return {"videos": videos, "errors": errors}
+
+    @app.get("/api/analytics/{video_id}/retention")
+    def get_retention_curve(video_id: str):
+        """Return audience retention curve for a video."""
+        from clipper.analytics import fetch_retention_curve
+        curve = fetch_retention_curve(video_id)
+        if curve is None:
+            return {"video_id": video_id, "curve": None, "error": "Retention data unavailable"}
+        return {"video_id": video_id, "curve": curve}
 
     @app.get("/api/growth/scoreboard")
     def get_growth_scoreboard(
@@ -1113,7 +1195,7 @@ def create_app(config: dict | None = None) -> FastAPI:
             import copy
             from clipper.learn import collect_game_stats, collect_performance, train_weights
             from clipper.fetch.twitch import fetch_twitch_clips
-            from clipper.cli import _load_and_score_pending, _approve_clips, _process_clips
+            from clipper.workflow import _load_and_score_pending, _approve_clips, _process_clips
 
             try:
                 # Step 1: Refresh game stats
@@ -1184,58 +1266,29 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.get("/api/compilations")
     def get_compilations(channel: str = Query("all")):
         """Return built compilations from output/ (ready to upload/publish)."""
-        output_dir = config["_output_dir"]
-        if not output_dir.exists():
-            return {"compilations": []}
+        from clipper.db import get_db
 
         channel_key = str(channel or "").strip()
         if channel_key.lower() in ("", "all", "*"):
             channel_key = ""
 
+        conn = get_db(config)
+        conditions = ["status = 'output'", "id LIKE 'compilation_%'"]
+        params: list = []
+        if channel_key:
+            conditions.append("channel = ?")
+            params.append(channel_key)
+
+        where = f"WHERE {' AND '.join(conditions)}"
+        rows = conn.execute(f"SELECT * FROM clips {where} ORDER BY updated_at DESC", params).fetchall()
+
+        from clipper.db import _row_to_clip
         comps = []
-        for p in sorted(output_dir.glob("*.json"), reverse=True):
-            try:
-                data = json.loads(p.read_text())
-                if "compilation" not in p.stem and not data.get("clip_count"):
-                    continue
-                if not data.get("processed_path") or not Path(data["processed_path"]).exists():
-                    continue
-                if channel_key:
-                    target = data.get("_target_channel")
-                    uploaded = data.get("channel")
-                    if target:
-                        if target != channel_key:
-                            continue
-                    elif uploaded and uploaded != channel_key:
-                        continue
-                    elif not uploaded:
-                        continue
-                data["_path"] = str(p)
-                # Ensure id is set
-                if "id" not in data:
-                    data["id"] = p.stem
-                # Compute duration from file if missing
-                if "duration" not in data:
-                    try:
-                        import subprocess
-                        from clipper.config import get_ffmpeg
-                        result = subprocess.run(
-                            [get_ffmpeg(), "-i", data["processed_path"]],
-                            capture_output=True, text=True, timeout=10,
-                        )
-                        for line in result.stderr.split("\n"):
-                            if "Duration:" in line:
-                                ts = line.split("Duration:")[1].split(",")[0].strip()
-                                parts = ts.split(":")
-                                data["duration"] = round(
-                                    int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]), 1
-                                )
-                                break
-                    except (ValueError, IndexError, subprocess.SubprocessError):
-                        data["duration"] = 0
-                comps.append(data)
-            except (json.JSONDecodeError, OSError):
+        for r in rows:
+            data = _row_to_clip(r)
+            if not data.get("processed_path") or not Path(data["processed_path"]).exists():
                 continue
+            comps.append(data)
 
         return {"compilations": comps}
 
@@ -1244,44 +1297,31 @@ def create_app(config: dict | None = None) -> FastAPI:
         """Return output clips eligible for compilation (have processed_path, not compilations)."""
         from clipper.process.score import score_clip
         from clipper.learn import get_learned_weights
-
-        output_dir = config["_output_dir"]
-        if not output_dir.exists():
-            return {"clips": []}
+        from clipper.db import list_clips
 
         channel_key = str(channel or "").strip()
         if channel_key.lower() in ("", "all", "*"):
             channel_key = ""
 
         weights = get_learned_weights(config)
+        raw = list_clips(
+            config,
+            status="output",
+            channel=channel_key if channel_key else None,
+            sort="score",
+            limit=500,
+            exclude_compilations=True,
+        )
+
         clips = []
-        for p in sorted(output_dir.glob("*.json")):
-            try:
-                data = json.loads(p.read_text())
-                # Skip compilations and clips without processed video
-                if "compilation" in p.stem:
-                    continue
-                if not data.get("processed_path") or not Path(data["processed_path"]).exists():
-                    continue
-                # Skip vertical Shorts — compilation is landscape only
-                if data.get("is_shorts"):
-                    continue
-                if channel_key:
-                    target = data.get("_target_channel")
-                    uploaded = data.get("channel")
-                    if target:
-                        if target != channel_key:
-                            continue
-                    elif uploaded and uploaded != channel_key:
-                        continue
-                    elif not uploaded:
-                        continue
-                data["_path"] = str(p)
-                if "_score" not in data:
-                    data["_score"] = round(score_clip(data, weights=weights), 1)
-                clips.append(data)
-            except (json.JSONDecodeError, OSError):
+        for data in raw:
+            if not data.get("processed_path") or not Path(data["processed_path"]).exists():
                 continue
+            if data.get("is_shorts"):
+                continue
+            if "_score" not in data:
+                data["_score"] = round(score_clip(data, weights=weights), 1)
+            clips.append(data)
 
         clips.sort(key=lambda c: c.get("_score", 0), reverse=True)
         return {"clips": clips}
@@ -1390,21 +1430,17 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.get("/api/learn/status")
     def learn_status():
-        queue_dir = config["_queue_dir"]
-        weights_path = queue_dir / "learned_weights.json"
+        from clipper.db import get_weights
 
-        if not weights_path.exists():
+        data = get_weights(config)
+        if not data:
             return {"learned": False, "sample_count": 0, "weights": None}
 
-        try:
-            data = json.loads(weights_path.read_text())
-            return {
-                "learned": True,
-                "sample_count": data.get("sample_size", 0),
-                "weights": data.get("weights"),
-            }
-        except (json.JSONDecodeError, OSError):
-            return {"learned": False, "sample_count": 0, "weights": None}
+        return {
+            "learned": True,
+            "sample_count": data.get("sample_size", 0),
+            "weights": data.get("weights"),
+        }
 
     # -- Thumbnail endpoints --
 
@@ -1456,6 +1492,7 @@ def create_app(config: dict | None = None) -> FastAPI:
         # and cache it locally so the crop UI always has a stable same-origin image.
         if clip is None and not video_path:
             queue_dir = config["_queue_dir"]
+            # Check JSON files on disk first (legacy path)
             for sub in ("pending", "approved", "skipped"):
                 candidate = queue_dir / sub / f"{clip_id}.json"
                 if candidate.exists():
@@ -1464,6 +1501,11 @@ def create_app(config: dict | None = None) -> FastAPI:
                     except Exception:
                         clip = None
                     break
+
+            # Fall back to SQLite DB if no JSON file found
+            if clip is None:
+                from clipper.db import get_clip as db_get_clip
+                clip = db_get_clip(config, clip_id)
 
             thumb_url = (clip or {}).get("thumbnail_url")
             if not isinstance(thumb_url, str) or not thumb_url.strip():

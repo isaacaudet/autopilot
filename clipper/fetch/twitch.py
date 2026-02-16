@@ -202,47 +202,13 @@ def _standardize_clip(clip: dict) -> dict:
     }
 
 
-def _load_history(queue_dir: Path) -> set[str]:
-    """Load the set of previously fetched clip IDs."""
-    history_path = queue_dir / "history.json"
-    if history_path.exists():
-        with open(history_path) as f:
-            return set(json.load(f))
-    return set()
+def _save_to_queue(clips: list[dict], config: dict) -> int:
+    """Save clips to the pending queue in SQLite. Returns count of new clips saved.
 
-
-def _save_history(queue_dir: Path, history: set[str]) -> None:
-    """Persist the fetched clip ID history."""
-    history_path = queue_dir / "history.json"
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(history_path, "w") as f:
-        json.dump(sorted(history), f)
-
-
-def _save_to_queue(clips: list[dict], queue_dir: Path) -> int:
-    """Save clips as JSON files to the pending queue. Returns count saved.
-
-    Skips clips that have ever been fetched before (tracked in history.json).
+    Skips clips that have ever been fetched before (tracked in history table).
     """
-    pending_dir = queue_dir / "pending"
-    pending_dir.mkdir(parents=True, exist_ok=True)
-
-    history = _load_history(queue_dir)
-    saved = 0
-    for clip in clips:
-        if clip["id"] in history:
-            continue
-        clip_path = pending_dir / f"{clip['id']}.json"
-        if clip_path.exists():
-            history.add(clip["id"])
-            continue
-        with open(clip_path, "w") as f:
-            json.dump(clip, f, indent=2)
-        history.add(clip["id"])
-        saved += 1
-
-    _save_history(queue_dir, history)
-    return saved
+    from clipper.db import save_clips_batch
+    return save_clips_batch(config, clips, status="pending")
 
 
 def _print_clips_table(clips: list[dict]) -> None:
@@ -280,11 +246,17 @@ def fetch_twitch_clips(
     dry_run: bool = False,
     verbose: bool = False,
     discover_mode: bool = False,
+    game_priorities: dict[str, float] | None = None,
 ) -> list[dict]:
     """Fetch top Twitch clips based on config, optionally saving to queue.
 
     If discover_mode=True, ignores configured games/streamers and sweeps
     top 20 trending games across all of Twitch for the best clips.
+
+    Args:
+        game_priorities: Optional dict of {game_name: multiplier} from
+            game_stats.json. When in discover mode, proven winners get
+            fetched first with higher clip quotas.
 
     Returns list of standardized clip dicts.
     """
@@ -335,6 +307,16 @@ def fetch_twitch_clips(
         top_games = _fetch_top_games(headers, count=20)
         console.print(f"  Scanning {len(top_games)} trending games...")
 
+        # Sort games by priority: proven winners first, then by trending rank
+        if game_priorities:
+            sorted_games = sorted(
+                top_games.items(),
+                key=lambda x: game_priorities.get(x[0], 1.0),
+                reverse=True,
+            )
+        else:
+            sorted_games = list(top_games.items())
+
         # Two sweeps: short window (3h) catches clips blowing up RIGHT NOW,
         # long window (24h) catches proven performers. The velocity scoring
         # will rank the fresh high-velocity clips above stale high-view clips.
@@ -347,13 +329,17 @@ def fetch_twitch_clips(
             sweep_count = 0
             console.print(f"  [dim]Sweep: last {sweep_label} (min {sweep_min_views} views)...[/dim]")
 
-            for name, gid in top_games.items():
+            for name, gid in sorted_games:
+                # Scale clip quota by game priority: winners get more clips
+                priority = game_priorities.get(name, 1.0) if game_priorities else 1.0
+                game_clip_count = max(20, int(clips_per_source * priority))
                 if verbose:
-                    console.print(f"[dim]    {name}...[/dim]")
+                    priority_label = f" [{priority}x]" if priority != 1.0 else ""
+                    console.print(f"[dim]    {name}{priority_label} ({game_clip_count} clips)...[/dim]")
                 raw_clips = _fetch_clips(
                     headers,
                     game_id=gid,
-                    first=clips_per_source,
+                    first=game_clip_count,
                     started_at=sweep_start,
                 )
                 total_fetched += len(raw_clips)
@@ -395,7 +381,7 @@ def fetch_twitch_clips(
         if dry_run:
             _print_clips_table(all_clips)
         else:
-            saved = _save_to_queue(all_clips, config["_queue_dir"])
+            saved = _save_to_queue(all_clips, config)
             console.print(f"  Saved {saved} new clip(s) to queue ({len(all_clips) - saved} already seen)")
 
         return all_clips
@@ -468,7 +454,7 @@ def fetch_twitch_clips(
     if dry_run:
         _print_clips_table(all_clips)
     else:
-        saved = _save_to_queue(all_clips, config["_queue_dir"])
+        saved = _save_to_queue(all_clips, config)
         console.print(f"  Saved {saved} new clip(s) to queue ({len(all_clips) - saved} already queued)")
 
     return all_clips

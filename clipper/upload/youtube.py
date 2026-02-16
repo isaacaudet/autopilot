@@ -1,10 +1,16 @@
 """YouTube upload with optimized metadata for discoverability."""
 
+import html
+import json
+import logging
 import re
 import subprocess
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 from rich.console import Console
 
 from clipper.upload.auth import get_youtube_service
@@ -33,37 +39,67 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", text.lower())
 
 
+def _normalize_text(value: str) -> str:
+    """Normalize text from clip metadata (decode entities + normalize spaces)."""
+    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()
+
+
+def _sanitize_tag(tag: str) -> str:
+    """Sanitize a single YouTube tag to a safe, compact form."""
+    cleaned = _normalize_text(tag).lstrip("#")
+    cleaned = cleaned.replace(",", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Keep common tag characters and remove noisy punctuation.
+    cleaned = re.sub(r"[^\w \-&+]", "", cleaned, flags=re.UNICODE).strip()
+    # YouTube enforces max tag length per term.
+    return cleaned[:30].strip()
+
+
 def _build_tags(clip: dict, config: dict) -> list[str]:
     """Build an optimized tag list for YouTube search."""
-    tags = []
+    tags: list[str] = []
 
-    streamer = clip.get("streamer", "")
-    game = clip.get("game", "")
-    title = clip.get("title", "")
+    streamer = _normalize_text(clip.get("streamer", ""))
+    game = _normalize_text(clip.get("game", ""))
+    title = _normalize_text(clip.get("title", ""))
+    override_tags = clip.get("_tags_override")
 
-    # Streamer variations
-    if streamer:
-        tags.append(streamer)
-        tags.append(f"{streamer} clips")
-        tags.append(f"{streamer} twitch")
-        tags.append(f"{streamer} best moments")
+    if isinstance(override_tags, str):
+        override_candidates = [t.strip() for t in override_tags.split(",") if t.strip()]
+    elif isinstance(override_tags, list):
+        override_candidates = [str(t).strip() for t in override_tags if str(t).strip()]
+    else:
+        override_candidates = []
 
-    # Game variations — expand known games
-    if game:
-        expansions = GAME_TAG_EXPANSIONS.get(game, [game.lower()])
-        tags.extend(expansions)
-        tags.append(f"{game} clips")
-        tags.append(f"{game} funny moments")
+    # Respect explicit tag overrides from Studio first.
+    if override_candidates:
+        tags.extend(override_candidates)
 
-    # Title keywords (strip short words)
-    title_words = [w for w in title.split() if len(w) > 3]
-    if title_words:
-        tags.append(" ".join(title_words[:5]))
+    # No override -> auto-generate tags.
+    if not override_candidates:
+        # Streamer variations
+        if streamer:
+            tags.append(streamer)
+            tags.append(f"{streamer} clips")
+            tags.append(f"{streamer} twitch")
+            tags.append(f"{streamer} best moments")
 
-    # Platform
-    platform = clip.get("platform", "")
-    if platform:
-        tags.append(f"{platform} clips")
+        # Game variations — expand known games
+        if game:
+            expansions = GAME_TAG_EXPANSIONS.get(game, [game.lower()])
+            tags.extend(expansions)
+            tags.append(f"{game} clips")
+            tags.append(f"{game} funny moments")
+
+        # Title keywords (strip short words)
+        title_words = [w for w in title.split() if len(w) > 3]
+        if title_words:
+            tags.append(" ".join(title_words[:5]))
+
+        # Platform
+        platform = _normalize_text(clip.get("platform", ""))
+        if platform:
+            tags.append(f"{platform} clips")
 
     # Shorts
     if clip.get("is_shorts"):
@@ -72,14 +108,14 @@ def _build_tags(clip: dict, config: dict) -> list[str]:
 
     # Global tags from config
     global_tags = config.get("upload", {}).get("global_tags", [])
-    tags.extend(global_tags)
+    tags.extend([str(t) for t in global_tags])
 
     # Deduplicate, preserve order, cap at 500 chars total (YouTube limit)
     seen = set()
     unique_tags = []
     total_len = 0
-    for tag in tags:
-        tag = tag.strip()
+    for raw_tag in tags:
+        tag = _sanitize_tag(raw_tag)
         if not tag or tag.lower() in seen:
             continue
         seen.add(tag.lower())
@@ -99,14 +135,16 @@ def _build_title(clip: dict, config: dict) -> str:
     """
     from clipper.process.titles import generate_title, sanitize_title
 
-    result = generate_title(clip)
+    normalized_clip = dict(clip)
+    normalized_clip["title"] = _normalize_text(clip.get("title", ""))
+    result = generate_title(normalized_clip)
 
     # Safety net: sanitize again in case title was set externally
     sanitized = sanitize_title(result)
     if sanitized is None:
-        streamer = clip.get("streamer", "Unknown").upper()
+        streamer = clip.get("streamer", "Unknown")
         game = clip.get("game", "")
-        result = f"{streamer} {game} MOMENT" if game else f"{streamer} INSANE MOMENT"
+        result = f"{game} Moment | {streamer}" if game else f"Insane Moment | {streamer}"
     else:
         result = sanitized
 
@@ -254,7 +292,8 @@ def _extract_thumbnail(video_path: str, output_path: str) -> str | None:
             capture_output=True, text=True, check=True,
         )
         return output_path
-    except Exception:
+    except Exception as e:
+        logger.warning("Thumbnail extraction failed: %s", e)
         return None
 
 
@@ -353,13 +392,68 @@ def _upload_captions(service, video_id: str, video_path: str, verbose: bool = Fa
             console.print(f"  [yellow]Caption upload failed: {e}[/yellow]")
 
 
-def publish_video(video_id: str, verbose: bool = False) -> bool:
+def update_video_metadata(
+    video_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+    *,
+    channel: str | None = None,
+    config: dict | None = None,
+) -> bool:
+    """Update snippet metadata on an already-uploaded YouTube video.
+
+    Costs 50 quota units. Only updates fields that are provided.
+    """
+    try:
+        if channel:
+            from clipper.upload.auth import get_youtube_service_for_channel
+            service = get_youtube_service_for_channel(channel, config or {})
+        else:
+            service = get_youtube_service()
+        # Fetch current snippet (required — YouTube replaces the entire snippet)
+        current = service.videos().list(part="snippet", id=video_id).execute()
+        items = current.get("items", [])
+        if not items:
+            logger.error("Video %s not found on YouTube", video_id)
+            return False
+
+        snippet = items[0]["snippet"]
+        if title is not None:
+            snippet["title"] = title
+        if description is not None:
+            snippet["description"] = description
+        if tags is not None:
+            snippet["tags"] = tags
+
+        service.videos().update(
+            part="snippet",
+            body={"id": video_id, "snippet": snippet},
+        ).execute()
+        logger.info("Updated metadata for video %s", video_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to update video %s: %s", video_id, e)
+        return False
+
+
+def publish_video(
+    video_id: str,
+    verbose: bool = False,
+    *,
+    channel: str | None = None,
+    config: dict | None = None,
+) -> bool:
     """Check if a video is done processing and flip it to public.
 
     Returns True if the video was published, False if still processing or error.
     """
     try:
-        service = get_youtube_service()
+        if channel:
+            from clipper.upload.auth import get_youtube_service_for_channel
+            service = get_youtube_service_for_channel(channel, config or {})
+        else:
+            service = get_youtube_service()
         response = service.videos().list(
             part="status,processingDetails",
             id=video_id,
@@ -399,7 +493,7 @@ def publish_video(video_id: str, verbose: bool = False) -> bool:
         return False
 
 
-def upload_clip(clip, config, privacy="unlisted", verbose=False):
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None):
     """Upload a processed clip to YouTube with optimized metadata.
 
     Args:
@@ -407,6 +501,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False):
         config: Loaded config dict.
         privacy: YouTube privacy status (unlisted, public, private).
         verbose: Whether to print extra info.
+        channel: Optional channel name — uses channel-specific OAuth token if provided.
 
     Returns:
         Video ID string on success, None on failure.
@@ -442,9 +537,43 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False):
 
     console.print(f"  [bold]Title:[/bold] {title}")
     console.print(f"  [bold]Tags:[/bold] {len(tags)} tags")
+    if tags:
+        preview = ", ".join(tags[:6])
+        if len(tags) > 6:
+            preview += ", ..."
+        console.print(f"  [dim]Tag preview:[/dim] {preview}")
+    if description:
+        first_line = (description.splitlines()[0] if description.splitlines() else description).strip()
+        if len(first_line) > 90:
+            first_line = first_line[:87] + "..."
+        console.print(f"  [dim]Description:[/dim] {len(description)} chars · {first_line}")
+
+    def _parse_http_error(err: HttpError) -> tuple[str | None, str, int | None]:
+        status = getattr(getattr(err, "resp", None), "status", None)
+        reason = None
+        message = str(err)
+
+        try:
+            raw = getattr(err, "content", b"") or b""
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            if isinstance(payload, dict):
+                eobj = payload.get("error") or {}
+                if isinstance(eobj, dict):
+                    message = str(eobj.get("message") or message)
+                    errors = eobj.get("errors") or []
+                    if errors and isinstance(errors, list) and isinstance(errors[0], dict):
+                        reason = errors[0].get("reason") or reason
+        except Exception:
+            pass
+
+        return reason, message, status
 
     try:
-        service = get_youtube_service()
+        if channel:
+            from clipper.upload.auth import get_youtube_service_for_channel
+            service = get_youtube_service_for_channel(channel, config)
+        else:
+            service = get_youtube_service()
         request = service.videos().insert(
             part="snippet,status",
             body=body,
@@ -465,7 +594,9 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False):
         # Set thumbnail if configured
         if config.get("upload", {}).get("extract_thumbnail", False):
             thumb_path = Path(processed_path).with_suffix(".jpg")
-            thumb = _extract_thumbnail(processed_path, str(thumb_path))
+            # Prefer an existing prebuilt thumbnail (e.g. compilation builder output).
+            # Fallback to scene extraction for normal clips.
+            thumb = str(thumb_path) if thumb_path.exists() else _extract_thumbnail(processed_path, str(thumb_path))
             if thumb:
                 try:
                     service.thumbnails().set(
@@ -475,12 +606,28 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False):
                     console.print("  [green]Custom thumbnail set[/green]")
                 except Exception as e:
                     # Custom thumbnails require verified account
-                    if verbose:
-                        console.print(f"  [yellow]Thumbnail upload failed (may need verified account): {e}[/yellow]")
+                    console.print(f"  [yellow]Thumbnail upload failed (may need verified account): {e}[/yellow]")
 
         return video_id
 
+    except HttpError as e:
+        reason, message, status = _parse_http_error(e)
+        clip["_upload_error_reason"] = reason
+        clip["_upload_error_message"] = message
+        clip["_upload_error_status"] = status
+
+        if reason == "quotaExceeded" or "quotaExceeded" in message:
+            console.print("[red]YouTube API quota exceeded (project). Try again tomorrow or request more quota.[/red]")
+        elif reason == "uploadLimitExceeded" or "uploadLimitExceeded" in message:
+            console.print("[red]YouTube upload limit reached for this channel/account.[/red]")
+        else:
+            console.print(f"[red]Upload error:[/red] {message}")
+        return None
+
     except Exception as e:
+        clip["_upload_error_reason"] = None
+        clip["_upload_error_message"] = str(e)
+        clip["_upload_error_status"] = None
         error_msg = str(e)
         if "quotaExceeded" in error_msg:
             console.print("[red]YouTube API quota exceeded. Try again tomorrow.[/red]")

@@ -33,7 +33,6 @@ interface WorkflowDialogProps {
 const recipes = [
   { value: 'shorts', label: 'Batch Shorts', desc: 'Multiple shorts in parallel' },
   { value: 'compilation', label: 'Compilation', desc: 'Long-form compilation video' },
-  { value: 'snipe', label: 'Daily Snipe', desc: 'Fetch top clips and process' },
 ]
 
 const qualityColors: Record<string, string> = {
@@ -170,7 +169,7 @@ export function WorkflowDialog({ open, onOpenChange, defaultRecipe }: WorkflowDi
     }
     setSubmitting(true)
     try {
-      const apiRecipe = recipe === 'snipe' ? 'compilation' : recipe
+      const apiRecipe = recipe
       const targetChannel = workspaceChannel === 'all' ? null : workspaceChannel
       const layout = recipe === 'shorts' ? shortsLayout : null
       const selectedOverrideMap = Object.fromEntries(
@@ -214,7 +213,7 @@ export function WorkflowDialog({ open, onOpenChange, defaultRecipe }: WorkflowDi
     if (!q) return sourceCandidates
     return sourceCandidates.filter((s) => s.toLowerCase().includes(q))
   }, [sourceCandidates, sourceSearch])
-  const isCompilation = recipe === 'compilation' || recipe === 'snipe'
+  const isCompilation = recipe === 'compilation'
   const channelEntries = Object.entries(workspaceChannels ?? {})
   const needsChannel = channelEntries.length > 0
 

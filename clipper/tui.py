@@ -351,7 +351,7 @@ def _run_upload(config: dict, verbose: bool = False) -> None:
 
 def run_tui(verbose: bool = False) -> None:
     """Run the full interactive pipeline with a Live dashboard during processing."""
-    from clipper.cli import _process_clips
+    from clipper.workflow import _process_clips
 
     config = load_config()
 

@@ -1,7 +1,10 @@
 """Score clips by virality potential using audio energy, duration, and engagement."""
 
+import logging
 import subprocess
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from rich.console import Console
 
@@ -44,8 +47,10 @@ def _analyze_audio_energy(video_path: str) -> dict | None:
                 "max_volume": max_vol,
                 "dynamic_range_db": max_vol - mean_vol,
             }
-    except (subprocess.TimeoutExpired, Exception):
-        pass
+    except subprocess.TimeoutExpired:
+        logger.debug("Audio analysis timed out for %s", video_path)
+    except Exception as e:
+        logger.debug("Audio analysis failed for %s: %s", video_path, e)
 
     return None
 
@@ -71,7 +76,21 @@ _STRONG_KEYWORDS = {
 }
 
 
-def score_clip(clip: dict, downloaded_path: str | None = None) -> float:
+DEFAULT_WEIGHTS = {
+    "duration": 25,
+    "velocity": 35,
+    "keywords": 15,
+    "recency": 5,
+    "audio": 20,
+}
+
+
+def score_clip(
+    clip: dict,
+    downloaded_path: str | None = None,
+    weights: dict | None = None,
+    game_multiplier: float = 1.0,
+) -> float:
     """Score a clip's virality potential (0-100).
 
     Factors:
@@ -80,35 +99,38 @@ def score_clip(clip: dict, downloaded_path: str | None = None) -> float:
     - Title: viral keywords signal reaction/highlight moments
     - Recency: newer clips are more relevant
     - Audio energy: high dynamic range = reaction moments (post-download only)
+    - Game multiplier: scales score based on game's YouTube performance history
 
     Args:
         clip: Clip metadata dict (from fetch).
         downloaded_path: Path to downloaded video (for audio analysis). Optional.
+        weights: Optional learned weights dict (keys: duration, velocity, keywords,
+            recency, audio, llm). Values are max points per category. If None,
+            uses hardcoded defaults.
+        game_multiplier: Multiplier based on game's YouTube performance (default 1.0).
 
     Returns:
         Score from 0-100.
     """
+    w = weights or DEFAULT_WEIGHTS
     score = 0.0
 
-    # --- Duration score (0-25 points) ---
-    # 15-30s is the sweet spot for Shorts retention
+    # --- Duration score ---
+    max_dur = w.get("duration", 25)
     duration = clip.get("duration", 0)
     if 15 <= duration <= 30:
-        score += 25  # ideal range
+        score += max_dur
     elif 10 <= duration <= 45:
-        score += 18  # acceptable
+        score += max_dur * 0.72
     elif duration <= 60:
-        score += 10  # okay for Shorts
-    # >60s gets 0 duration points
+        score += max_dur * 0.40
 
-    # --- View velocity score (0-35 points) ---
-    # Views/hour is a much stronger signal than raw views.
-    # A clip with 400 views in 2 hours (200/hr) is hotter than
-    # 2000 views in 48 hours (42/hr).
+    # --- View velocity score ---
+    max_vel = w.get("velocity", 35)
     import datetime
     views = clip.get("view_count", 0)
     created = clip.get("created_at", "")
-    age_hours = 24.0  # fallback if no timestamp
+    age_hours = 24.0
 
     if created:
         try:
@@ -120,60 +142,81 @@ def score_clip(clip: dict, downloaded_path: str | None = None) -> float:
     velocity = views / age_hours
 
     if velocity >= 500:
-        score += 35  # explosive — grab immediately
+        score += max_vel
     elif velocity >= 200:
-        score += 30  # very hot
+        score += max_vel * 0.86
     elif velocity >= 100:
-        score += 25
+        score += max_vel * 0.71
     elif velocity >= 50:
-        score += 20  # promising
+        score += max_vel * 0.57
     elif velocity >= 20:
-        score += 15
+        score += max_vel * 0.43
     elif velocity >= 10:
-        score += 10  # moderate
+        score += max_vel * 0.29
     else:
-        score += 5   # low velocity
+        score += max_vel * 0.14
 
-    # --- Title score (0-15 points) ---
-    # Titles with viral keywords predict engagement on Shorts
+    # --- Title score ---
+    max_kw = w.get("keywords", 15)
     title = clip.get("title", "").lower()
     title_score = 0
     for keyword in _VIRAL_KEYWORDS:
         if keyword in title:
             if keyword in _STRONG_KEYWORDS:
-                title_score = max(title_score, 15)
+                title_score = max(title_score, max_kw)
             else:
-                title_score = max(title_score, 10)
+                title_score = max(title_score, max_kw * 0.67)
     score += title_score
 
-    # --- Recency bonus (0-5 points) ---
-    # Slight extra nudge for very fresh clips (velocity already captures most of this)
+    # --- Recency bonus ---
+    max_rec = w.get("recency", 5)
     if age_hours <= 3:
-        score += 5
+        score += max_rec
     elif age_hours <= 6:
-        score += 3
+        score += max_rec * 0.6
     elif age_hours <= 12:
-        score += 1
+        score += max_rec * 0.2
 
-    # --- Audio energy score (0-20 points) ---
+    # --- Audio energy score ---
+    max_audio = w.get("audio", 20)
     if downloaded_path and Path(downloaded_path).exists():
         audio = _analyze_audio_energy(downloaded_path)
         if audio:
             dr = audio["dynamic_range_db"]
-            # High dynamic range = reaction moment
-            # >20dB = screaming/huge reaction, >15dB = solid reaction
             if dr >= 20:
-                score += 20
+                score += max_audio
             elif dr >= 15:
-                score += 17
+                score += max_audio * 0.85
             elif dr >= 10:
-                score += 12
+                score += max_audio * 0.60
             elif dr >= 5:
-                score += 7
+                score += max_audio * 0.35
             else:
-                score += 3
+                score += max_audio * 0.15
 
-    return min(100, score)
+    # --- LLM bonus (if learned weights include it) ---
+    max_llm = w.get("llm", 0)
+    if max_llm > 0:
+        analysis = clip.get("_analysis")
+        if analysis:
+            llm_score = analysis.get("entertainment_score", 5)
+            score += max_llm * (llm_score / 10.0)
+
+    return min(100, score * game_multiplier)
+
+
+def enhanced_score(clip: dict) -> float:
+    """Score with LLM entertainment bonus (post-analysis).
+
+    Adds up to +/-20 points based on LLM entertainment_score.
+    Falls back to base score_clip() if no analysis available.
+    """
+    base = score_clip(clip)
+    analysis = clip.get("_analysis")
+    if not analysis:
+        return base
+    llm_bonus = (analysis.get("entertainment_score", 5) - 5) * 4  # -16 to +20
+    return min(100, max(0, base + llm_bonus))
 
 
 def rank_clips(clips: list[dict]) -> list[dict]:
