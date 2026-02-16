@@ -55,6 +55,28 @@ type LayoutTuning = {
   subtitleMarginRatio: number
 }
 
+function rectEquals(a: FacecamRect, b: FacecamRect): boolean {
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
+}
+
+function tuningEquals(a: LayoutTuning, b: LayoutTuning): boolean {
+  return (
+    a.safeTopRatio === b.safeTopRatio &&
+    a.safeBottomRatio === b.safeBottomRatio &&
+    a.facecamBandRatio === b.facecamBandRatio &&
+    a.gameplayZoom === b.gameplayZoom &&
+    a.gameplayZoomNoFacecam === b.gameplayZoomNoFacecam &&
+    a.gameplayXBias === b.gameplayXBias &&
+    a.gameplayYBias === b.gameplayYBias &&
+    a.hudHeightRatio === b.hudHeightRatio &&
+    a.hudScale === b.hudScale &&
+    a.hudXRatio === b.hudXRatio &&
+    a.hudYRatio === b.hudYRatio &&
+    a.titleYRatio === b.titleYRatio &&
+    a.subtitleMarginRatio === b.subtitleMarginRatio
+  )
+}
+
 type CropCarryForward = {
   facecam: FacecamRect
   hud: FacecamRect
@@ -817,6 +839,7 @@ export function CropProfilesDialog({
     for (const c of clips) if (c.streamer) set.add(c.streamer)
     return Array.from(set).sort((a, b) => a.localeCompare(b))
   }, [clips])
+  const streamersKey = useMemo(() => streamers.join('|'), [streamers])
 
   const sampleClips = useMemo(() => {
     if (!selectedStreamer) return []
@@ -982,12 +1005,12 @@ export function CropProfilesDialog({
       subtitleMarginRatio: clipOverride?.subtitle_margin_ratio ?? existing?.subtitle_margin_ratio ?? carry?.tuning.subtitleMarginRatio,
     })
 
-    setFacecamRect(face)
-    setHudRect(hud)
-    setFacecamEnabled(faceOn)
-    setHudEnabled(hudOn)
-    setTuning(tuned)
-  }, [open, selectedStreamer, profiles, streamers, initialStreamer, currentReviewClip?.id, sampleClipId, localClipOverrides])
+    setFacecamRect((prev) => (rectEquals(prev, face) ? prev : face))
+    setHudRect((prev) => (rectEquals(prev, hud) ? prev : hud))
+    setFacecamEnabled((prev) => (prev === faceOn ? prev : faceOn))
+    setHudEnabled((prev) => (prev === hudOn ? prev : hudOn))
+    setTuning((prev) => (tuningEquals(prev, tuned) ? prev : tuned))
+  }, [open, selectedStreamer, profiles, streamersKey, initialStreamer, currentReviewClip?.id, sampleClipId, localClipOverrides])
 
   useEffect(() => {
     if (!open) return
