@@ -86,6 +86,50 @@ function stringArrayEquals(a: string[], b: string[]): boolean {
   return true
 }
 
+function layoutProfileEquals(a?: LayoutProfile, b?: LayoutProfile): boolean {
+  if (a === b) return true
+  if (!a && !b) return true
+  if (!a || !b) return false
+  const faceA = a.facecam
+  const faceB = b.facecam
+  if (!!faceA !== !!faceB) return false
+  if (faceA && faceB && !rectEquals(faceA, faceB)) return false
+  const hudA = a.hud
+  const hudB = b.hud
+  if (!!hudA !== !!hudB) return false
+  if (hudA && hudB && !rectEquals(hudA, hudB)) return false
+
+  return (
+    a.facecam_enabled === b.facecam_enabled &&
+    a.hud_enabled === b.hud_enabled &&
+    a.safe_top_ratio === b.safe_top_ratio &&
+    a.safe_bottom_ratio === b.safe_bottom_ratio &&
+    a.facecam_band_ratio === b.facecam_band_ratio &&
+    a.gameplay_zoom === b.gameplay_zoom &&
+    a.gameplay_zoom_no_facecam === b.gameplay_zoom_no_facecam &&
+    a.gameplay_x_bias === b.gameplay_x_bias &&
+    a.gameplay_y_bias === b.gameplay_y_bias &&
+    a.hud_height_ratio === b.hud_height_ratio &&
+    a.hud_scale === b.hud_scale &&
+    a.hud_x_ratio === b.hud_x_ratio &&
+    a.hud_y_ratio === b.hud_y_ratio &&
+    a.title_y_ratio === b.title_y_ratio &&
+    a.subtitle_margin_ratio === b.subtitle_margin_ratio
+  )
+}
+
+function layoutOverridesEqual(a: Record<string, LayoutProfile>, b: Record<string, LayoutProfile>): boolean {
+  if (a === b) return true
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length !== bKeys.length) return false
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false
+    if (!layoutProfileEquals(a[key], b[key])) return false
+  }
+  return true
+}
+
 type CropCarryForward = {
   facecam: FacecamRect
   hud: FacecamRect
@@ -842,6 +886,7 @@ export function CropProfilesDialog({
     [reviewClips, confirmedSet],
   )
   const currentReviewClip = reviewClips[Math.max(0, Math.min(reviewIndex, reviewClips.length - 1))] ?? null
+  const isReviewMode = reviewClips.length > 0
 
   const streamers = useMemo(() => {
     const set = new Set<string>()
@@ -860,6 +905,7 @@ export function CropProfilesDialog({
 
   useEffect(() => {
     if (!open) return
+    if (isReviewMode) return
     if (!selectedStreamer) {
       setSampleClipId(null)
       return
@@ -869,7 +915,7 @@ export function CropProfilesDialog({
       return
     }
     setSampleClipId((prev) => (prev && sampleClips.some((c) => c.id === prev) ? prev : sampleClips[0].id))
-  }, [open, selectedStreamer, sampleClips])
+  }, [open, selectedStreamer, sampleClips, isReviewMode])
 
   useEffect(() => {
     if (!open) return
@@ -916,8 +962,10 @@ export function CropProfilesDialog({
 
   useEffect(() => {
     if (!onClipOverridesChange) return
+    const incoming = clipOverrides ?? {}
+    if (layoutOverridesEqual(incoming, localClipOverrides)) return
     onClipOverridesChange(localClipOverrides)
-  }, [localClipOverrides, onClipOverridesChange])
+  }, [localClipOverrides, clipOverrides, onClipOverridesChange])
 
   useEffect(() => {
     if (!open) return
@@ -930,6 +978,7 @@ export function CropProfilesDialog({
 
   useEffect(() => {
     if (!open) return
+    if (!isReviewMode) return
     if (!currentReviewClip) return
     if (currentReviewClip.streamer && currentReviewClip.streamer !== selectedStreamer) {
       setSelectedStreamer(currentReviewClip.streamer)
@@ -937,19 +986,22 @@ export function CropProfilesDialog({
     if (currentReviewClip.id !== sampleClipId) {
       setSampleClipId(currentReviewClip.id)
     }
-  }, [open, currentReviewClip, selectedStreamer, sampleClipId])
+  }, [open, currentReviewClip, selectedStreamer, sampleClipId, isReviewMode])
 
   useEffect(() => {
     if (!open) return
+    if (!isReviewMode) return
     if (!sampleClipId) return
     const idx = reviewClips.findIndex((c) => c.id === sampleClipId)
     if (idx >= 0 && idx !== reviewIndex) {
       setReviewIndex(idx)
     }
-  }, [open, sampleClipId, reviewClips, reviewIndex])
+  }, [open, sampleClipId, reviewClips, reviewIndex, isReviewMode])
 
-  const imageSrc = sampleClipId
-    ? `/api/clips/${encodeURIComponent(sampleClipId)}/thumbnail?source=true${thumbAt === null ? '' : `&at=${thumbAt}`}`
+  const activeClipId = isReviewMode ? (currentReviewClip?.id ?? sampleClipId) : sampleClipId
+
+  const imageSrc = activeClipId
+    ? `/api/clips/${encodeURIComponent(activeClipId)}/thumbnail?source=true${thumbAt === null ? '' : `&at=${thumbAt}`}`
     : ''
 
   useEffect(() => {
@@ -976,7 +1028,6 @@ export function CropProfilesDialog({
     setView('edit')
     const key = selectedStreamer.trim().toLowerCase()
     const existing = profiles?.[key] ?? null
-    const activeClipId = currentReviewClip?.id ?? sampleClipId
     const clipOverride = activeClipId ? localClipOverrides[activeClipId] : undefined
 
     const carry = carryForwardRef.current
@@ -1024,7 +1075,7 @@ export function CropProfilesDialog({
     setFacecamEnabled((prev) => (prev === faceOn ? prev : faceOn))
     setHudEnabled((prev) => (prev === hudOn ? prev : hudOn))
     setTuning((prev) => (tuningEquals(prev, tuned) ? prev : tuned))
-  }, [open, selectedStreamer, profiles, streamersKey, initialStreamer, currentReviewClip?.id, sampleClipId, localClipOverrides])
+  }, [open, selectedStreamer, profiles, streamersKey, initialStreamer, currentReviewClip?.id, activeClipId, localClipOverrides])
 
   useEffect(() => {
     if (!open) return
@@ -1221,8 +1272,8 @@ export function CropProfilesDialog({
                     }`}
                     onClick={() => setView('preview')}
                     type="button"
-                    disabled={!sampleClipId}
-                    title={!sampleClipId ? 'Pick a streamer with an available clip' : 'Preview the final vertical layout'}
+                    disabled={!activeClipId}
+                    title={!activeClipId ? 'Pick a streamer with an available clip' : 'Preview the final vertical layout'}
                   >
                     Preview
                   </button>
@@ -1260,8 +1311,8 @@ export function CropProfilesDialog({
                 }`}
                 onClick={() => setView('preview')}
                 type="button"
-                disabled={!sampleClipId}
-                title={!sampleClipId ? 'Pick a streamer with an available clip' : 'Preview the final vertical layout'}
+                disabled={!activeClipId}
+                title={!activeClipId ? 'Pick a streamer with an available clip' : 'Preview the final vertical layout'}
               >
                 Preview
               </button>
@@ -1397,7 +1448,7 @@ export function CropProfilesDialog({
             </div>
 
             <div className="px-5 py-4 pb-36 overflow-y-auto min-h-0">
-              {!sampleClipId ? (
+              {!activeClipId ? (
                 <div className="h-full flex items-center justify-center">
                   <div className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">
                     Pick a streamer with an available clip in Studio to calibrate.
@@ -1470,7 +1521,7 @@ export function CropProfilesDialog({
                           <Select
                             value={thumbAt === null ? 'scene' : String(thumbAt)}
                             onValueChange={(v) => setThumbAt(v === 'scene' ? null : Number(v))}
-                            disabled={!sampleClipId}
+                            disabled={!activeClipId}
                           >
                             <SelectTrigger className="h-8 w-[160px]">
                               <SelectValue placeholder="Frame" />
@@ -1485,7 +1536,7 @@ export function CropProfilesDialog({
                             </SelectContent>
                           </Select>
                           <Select
-                            value={sampleClipId ?? ''}
+                            value={activeClipId ?? ''}
                             onValueChange={(v) => setSampleClipId(v)}
                             disabled={sampleClips.length === 0}
                           >
@@ -1501,7 +1552,7 @@ export function CropProfilesDialog({
                             </SelectContent>
                           </Select>
 
-                          <Button size="sm" variant="outline" onClick={() => setView('preview')} disabled={!sampleClipId}>
+                          <Button size="sm" variant="outline" onClick={() => setView('preview')} disabled={!activeClipId}>
                             Preview 9:16
                           </Button>
                         </div>
@@ -1593,7 +1644,7 @@ export function CropProfilesDialog({
                           <Select
                             value={thumbAt === null ? 'scene' : String(thumbAt)}
                             onValueChange={(v) => setThumbAt(v === 'scene' ? null : Number(v))}
-                            disabled={!sampleClipId}
+                            disabled={!activeClipId}
                           >
                             <SelectTrigger className="h-8 w-[160px]">
                               <SelectValue placeholder="Frame" />
@@ -1608,7 +1659,7 @@ export function CropProfilesDialog({
                             </SelectContent>
                           </Select>
                           <Select
-                            value={sampleClipId ?? ''}
+                            value={activeClipId ?? ''}
                             onValueChange={(v) => setSampleClipId(v)}
                             disabled={sampleClips.length === 0}
                           >
