@@ -77,6 +77,15 @@ function tuningEquals(a: LayoutTuning, b: LayoutTuning): boolean {
   )
 }
 
+function stringArrayEquals(a: string[], b: string[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 type CropCarryForward = {
   facecam: FacecamRect
   hud: FacecamRect
@@ -865,18 +874,23 @@ export function CropProfilesDialog({
   useEffect(() => {
     if (!open) return
     const incoming = (confirmedClipIds ?? []).filter((id) => reviewClips.some((c) => c.id === id))
-    setLocalConfirmedClipIds(incoming)
+    setLocalConfirmedClipIds((prev) => (stringArrayEquals(prev, incoming) ? prev : incoming))
   }, [open, confirmedClipIds, reviewClips])
 
   useEffect(() => {
     if (!open) return
-    setLocalConfirmedClipIds((prev) => prev.filter((id) => reviewClips.some((c) => c.id === id)))
+    setLocalConfirmedClipIds((prev) => {
+      const next = prev.filter((id) => reviewClips.some((c) => c.id === id))
+      return stringArrayEquals(prev, next) ? prev : next
+    })
   }, [open, reviewClips])
 
   useEffect(() => {
     if (!onConfirmedClipIdsChange) return
+    const incoming = confirmedClipIds ?? []
+    if (stringArrayEquals(incoming, localConfirmedClipIds)) return
     onConfirmedClipIdsChange(localConfirmedClipIds)
-  }, [localConfirmedClipIds, onConfirmedClipIdsChange])
+  }, [localConfirmedClipIds, confirmedClipIds, onConfirmedClipIdsChange])
 
   useEffect(() => {
     if (!open) return
