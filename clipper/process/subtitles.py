@@ -1,16 +1,74 @@
 """Transcribe video audio to ASS subtitles with word-level timing."""
 
 import json
+import re
 import threading
 from pathlib import Path
 
 from rich.console import Console
+from clipper.layout_profiles import load_facecam_profiles, normalize_layout_tuning
 
 console = Console()
+
+_TUNING_KEYS = (
+    "safe_top_ratio",
+    "safe_bottom_ratio",
+    "facecam_band_ratio",
+    "gameplay_zoom",
+    "gameplay_zoom_no_facecam",
+    "gameplay_x_bias",
+    "gameplay_y_bias",
+    "hud_height_ratio",
+    "hud_scale",
+    "hud_x_ratio",
+    "hud_y_ratio",
+    "title_y_ratio",
+    "subtitle_margin_ratio",
+)
+
+
+def _effective_layout_profile(config: dict, clip: dict | None) -> dict:
+    """Return streamer profile merged with optional per-clip layout override."""
+    merged: dict = {}
+    if clip:
+        streamer = str(clip.get("streamer") or "").strip().lower()
+        if streamer:
+            prof = load_facecam_profiles(config).get(streamer)
+            if isinstance(prof, dict):
+                merged.update(prof)
+
+        override = clip.get("_layout_override")
+        if isinstance(override, dict):
+            if override.get("facecam_enabled") is not None:
+                merged["facecam_enabled"] = bool(override.get("facecam_enabled"))
+            if override.get("hud_enabled") is not None:
+                merged["hud_enabled"] = bool(override.get("hud_enabled"))
+            tuning_override = {k: override.get(k) for k in _TUNING_KEYS if k in override}
+            merged.update(normalize_layout_tuning(tuning_override))
+    return merged
 
 # Serializes Whisper calls — Numba's workqueue threading layer is not
 # thread-safe and aborts when accessed from multiple threads concurrently.
 _transcribe_lock = threading.Lock()
+
+# Module-level Whisper model cache — avoids reloading for each clip
+_cached_model = None
+_cached_model_name = None
+
+
+def _get_or_load_model(model_name: str, device: str):
+    """Load faster-whisper model, reusing cached instance if same model+device."""
+    global _cached_model, _cached_model_name
+    key = f"{model_name}:{device}"
+    if _cached_model is not None and _cached_model_name == key:
+        return _cached_model
+    console.print(f"[blue]Loading Whisper model:[/blue] {model_name} on {device}")
+    from faster_whisper import WhisperModel
+    compute_type = "float16" if device == "cuda" else "int8"
+    _cached_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    _cached_model_name = key
+    return _cached_model
+
 
 # ASS header template for Shorts-style subtitles
 # MarginV ~450 places text in the lower-center safe zone (not at the very bottom)
@@ -112,21 +170,28 @@ def _group_words_into_phrases(words: list[dict], max_words: int = 3, max_duratio
             "words": list(current_word_timings),
         })
 
-    # Enforce minimum duration per phrase (at least 0.5s visible)
-    MIN_DURATION = 0.5
+    # Enforce minimum duration per phrase.
+    # Keep this short to avoid pushing subsequent lines late.
+    MIN_DURATION = 0.35
     for phrase in phrases:
         if phrase["end"] - phrase["start"] < MIN_DURATION:
             phrase["end"] = phrase["start"] + MIN_DURATION
 
-    # Fix overlapping phrases — each phrase must start after the previous one ends
+    # Fix overlaps while minimizing subtitle delay:
+    # try shortening the previous phrase first; only delay current if necessary.
+    GAP = 0.03
     for i in range(1, len(phrases)):
-        if phrases[i]["start"] < phrases[i - 1]["end"]:
-            # If this phrase starts before the previous one ends, push it forward
-            gap = 0.05  # 50ms gap between phrases
-            phrases[i]["start"] = phrases[i - 1]["end"] + gap
-            # Also ensure end is still after start
-            if phrases[i]["end"] <= phrases[i]["start"]:
-                phrases[i]["end"] = phrases[i]["start"] + MIN_DURATION
+        prev = phrases[i - 1]
+        curr = phrases[i]
+        if curr["start"] < prev["end"] + GAP:
+            target_prev_end = curr["start"] - GAP
+            min_prev_end = prev["start"] + MIN_DURATION
+            if target_prev_end >= min_prev_end:
+                prev["end"] = target_prev_end
+            else:
+                curr["start"] = prev["end"] + GAP
+                if curr["end"] <= curr["start"]:
+                    curr["end"] = curr["start"] + MIN_DURATION
 
     # Deduplicate phrases with near-identical text and overlapping times
     deduped = []
@@ -140,6 +205,39 @@ def _group_words_into_phrases(words: list[dict], max_words: int = 3, max_duratio
         deduped.append(phrase)
 
     return deduped
+
+
+def _apply_phrase_lead_in(phrases: list[dict], lead_in_seconds: float) -> list[dict]:
+    """Shift subtitle starts slightly earlier to reduce perceived lag."""
+    if lead_in_seconds <= 0 or not phrases:
+        return phrases
+
+    min_visible = 0.25
+    gap = 0.02
+    adjusted: list[dict] = []
+    for phrase in phrases:
+        start = max(0.0, float(phrase.get("start", 0)) - lead_in_seconds)
+        end = max(float(phrase.get("end", start)), start + min_visible)
+        item = dict(phrase)
+        item["start"] = start
+        item["end"] = end
+        adjusted.append(item)
+
+    # Resolve overlaps with the same "avoid delay" strategy.
+    for i in range(1, len(adjusted)):
+        prev = adjusted[i - 1]
+        curr = adjusted[i]
+        if curr["start"] < prev["end"] + gap:
+            target_prev_end = curr["start"] - gap
+            min_prev_end = prev["start"] + min_visible
+            if target_prev_end >= min_prev_end:
+                prev["end"] = target_prev_end
+            else:
+                curr["start"] = prev["end"] + gap
+                if curr["end"] <= curr["start"]:
+                    curr["end"] = curr["start"] + min_visible
+
+    return adjusted
 
 
 def _build_highlight_text(phrase: dict) -> str:
@@ -194,7 +292,26 @@ def _generate_ass_events(phrases: list[dict], highlight: bool = True, pop_animat
     return "\n".join(lines)
 
 
-def _check_segment_quality(segment: dict) -> str | None:
+def _resolve_subtitle_margin_v(config: dict, clip: dict | None = None) -> int:
+    """Resolve Shorts subtitle vertical margin from config + optional streamer profile."""
+    shorts_cfg = config.get("shorts", {}) or {}
+    fill_cfg = shorts_cfg.get("fill", {}) if isinstance(shorts_cfg.get("fill"), dict) else {}
+    h = int(shorts_cfg.get("height", 1920) or 1920)
+    margin_v = float(shorts_cfg.get("subtitle_margin_v", 450) or 450)
+    base_ratio = margin_v / float(max(1, h))
+    ratio = float(fill_cfg.get("subtitle_margin_ratio", base_ratio) or base_ratio)
+
+    merged = normalize_layout_tuning({"subtitle_margin_ratio": ratio})
+
+    prof = _effective_layout_profile(config, clip)
+    if prof:
+        merged.update(normalize_layout_tuning(prof))
+
+    out = int(round(float(merged.get("subtitle_margin_ratio", base_ratio)) * h))
+    return max(20, min(h - 20, out))
+
+
+def _check_segment_quality(segment) -> str | None:
     """Check a Whisper segment for hallucination indicators.
 
     Returns a reason string if the segment is suspicious, or None if it looks fine.
@@ -202,10 +319,17 @@ def _check_segment_quality(segment: dict) -> str | None:
     Gaming audio has loud SFX that tanks confidence even when speech is real,
     so thresholds are deliberately loose. Whisper's own no_speech_threshold
     already does the initial filtering.
+
+    Accepts both faster-whisper Segment objects (attribute access) and dicts.
     """
-    avg_logprob = segment.get("avg_logprob", 0)
-    compression_ratio = segment.get("compression_ratio", 0)
-    no_speech_prob = segment.get("no_speech_prob", 0)
+    if isinstance(segment, dict):
+        avg_logprob = segment.get("avg_logprob", 0)
+        compression_ratio = segment.get("compression_ratio", 0)
+        no_speech_prob = segment.get("no_speech_prob", 0)
+    else:
+        avg_logprob = getattr(segment, "avg_logprob", 0)
+        compression_ratio = getattr(segment, "compression_ratio", 0)
+        no_speech_prob = getattr(segment, "no_speech_prob", 0)
 
     # Only filter truly hallucinated loops (very high compression = repeated text)
     if compression_ratio > 2.8:
@@ -282,20 +406,26 @@ def _review_flagged_segments(
     return all_words
 
 
-def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | None:
+def transcribe(
+    video_path: Path,
+    config: dict,
+    clip: dict | None = None,
+    verbose: bool = False,
+) -> tuple[Path | None, list[dict] | None]:
     """Transcribe a video file and generate an ASS subtitle file.
 
     Uses word-level timestamps for precise, short phrase display.
-    Returns the Path to the .ass file, or None on failure.
+    Returns (ass_path, all_words) tuple — word data enables downstream LLM analysis.
+    Either or both may be None on failure.
     """
     try:
-        import whisper
+        from faster_whisper import WhisperModel  # noqa: F401
     except ImportError:
         console.print(
-            "[red]Error: openai-whisper is not installed. "
-            "Install it with: pip install openai-whisper[/red]"
+            "[red]Error: faster-whisper is not installed. "
+            "Install it with: pip install faster-whisper[/red]"
         )
-        return None
+        return None, None
 
     video_path = Path(video_path)
     sub_config = config.get("subtitles", {})
@@ -303,57 +433,86 @@ def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | 
 
     console.print(f"[blue]Transcribing:[/blue] {video_path.name} (model: {model_name})")
 
-    # Detect Apple Silicon MPS for GPU acceleration (falls back to CPU)
+    # faster-whisper: use CUDA if available, otherwise CPU with int8
     device = "cpu"
     try:
         import torch
-        if torch.backends.mps.is_available():
-            device = "mps"
-    except Exception:
+        if torch.cuda.is_available():
+            device = "cuda"
+    except ImportError:
         pass
 
     if verbose:
         console.print(f"  [dim]Whisper device: {device}[/dim]")
 
-    # Serialize transcription — Numba's workqueue layer is not thread-safe
-    # and crashes when multiple Whisper calls run concurrently.
+    # Serialize transcription for thread safety
     with _transcribe_lock:
         try:
-            model = whisper.load_model(model_name, device=device)
-            result = model.transcribe(
+            model = _get_or_load_model(model_name, device)
+            segments_iter, info = model.transcribe(
                 str(video_path),
                 word_timestamps=True,
                 language="en",
-                condition_on_previous_text=False,  # prevents hallucinated repetitions
-                no_speech_threshold=0.7,           # relaxed — gaming audio is noisy, don't over-filter
-                compression_ratio_threshold=2.8,   # relaxed — only reject obvious hallucinated loops
+                condition_on_previous_text=False,
+                no_speech_threshold=0.7,
+                compression_ratio_threshold=2.8,
                 initial_prompt="Gaming stream clip with voice commentary.",
-                verbose=verbose,
-                fp16=(device != "cpu"),
             )
+            segments = list(segments_iter)
         except Exception as e:
             console.print(f"[red]Transcription failed:[/red] {e}")
-            return None
+            return None, None
 
-    # Extract word-level timestamps
+    # Extract word-level timestamps from faster-whisper Segment objects
     all_words = []
-    for segment in result.get("segments", []):
-        words = segment.get("words", [])
+    for segment in segments:
+        words = segment.words
         if words:
-            all_words.extend(words)
+            all_words.extend([
+                {"word": w.word, "start": w.start, "end": w.end}
+                for w in words
+            ])
         else:
-            # Fallback: use segment-level timing if no word timestamps
-            text = segment.get("text", "").strip()
+            text = segment.text.strip()
             if text:
                 all_words.append({
                     "word": text,
-                    "start": segment["start"],
-                    "end": segment["end"],
+                    "start": segment.start,
+                    "end": segment.end,
                 })
 
     if not all_words:
         console.print("[yellow]No speech detected in video.[/yellow]")
-        return None
+        return None, None
+
+    def _is_gibberish_token(token: str) -> bool:
+        t = str(token or "").strip()
+        if not t:
+            return True
+        core = re.sub(r"^\\W+|\\W+$", "", t, flags=re.UNICODE)
+        if not core:
+            return True
+        if len(core) > 24:
+            return True
+        if re.search(r"(.)\\1{4,}", core.lower()):
+            return True
+        # If it's mostly non-ASCII, it's unlikely to be intended English dialogue.
+        ascii_ratio = sum(1 for c in core if ord(c) < 128) / max(1, len(core))
+        if ascii_ratio < 0.6:
+            return True
+        alpha = [c for c in core if c.isalpha()]
+        if len(alpha) >= 6 and not re.search(r"[aeiou]", core.lower()):
+            return True
+        return False
+
+    # Filter obviously gibberish tokens while keeping a safety net (don't delete too much).
+    words_before = len(all_words)
+    gibberish_filtered = [w for w in all_words if not _is_gibberish_token(w.get("word", ""))]
+    if gibberish_filtered and len(gibberish_filtered) >= words_before * 0.6:
+        removed = words_before - len(gibberish_filtered)
+        if removed > 0 and verbose:
+            console.print(f"  [dim]Removed {removed} gibberish token(s) before phrase grouping[/dim]")
+        all_words = gibberish_filtered
 
     # Auto-filter obvious hallucinations (delete segments, never skip the clip)
     # Safety net: if filtering would remove >70% of words, keep everything —
@@ -361,11 +520,11 @@ def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | 
     words_before = len(all_words)
     filtered_words = list(all_words)
 
-    for segment in result.get("segments", []):
+    for segment in segments:
         reason = _check_segment_quality(segment)
         if reason:
-            start = segment.get("start", 0)
-            end = segment.get("end", 0)
+            start = segment.start
+            end = segment.end
             if verbose:
                 console.print(f"  [dim]Flagged segment [{start:.1f}s-{end:.1f}s]: {reason}[/dim]")
             filtered_words = [
@@ -391,6 +550,8 @@ def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | 
     # Group words into short phrases
     max_words = sub_config.get("words_per_phrase", 3)
     phrases = _group_words_into_phrases(all_words, max_words=max_words)
+    lead_in_ms = int(sub_config.get("lead_in_ms", 80))
+    phrases = _apply_phrase_lead_in(phrases, max(0, lead_in_ms) / 1000.0)
 
     if verbose:
         console.print(f"  {len(all_words)} words -> {len(phrases)} phrases")
@@ -401,7 +562,7 @@ def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | 
     # Generate ASS file
     fontsize = sub_config.get("font_size", 34)
     outline = sub_config.get("outline_width", 4)
-    margin_v = config.get("shorts", {}).get("subtitle_margin_v", 450)
+    margin_v = _resolve_subtitle_margin_v(config, clip)
 
     if is_shorts:
         header = ASS_HEADER.format(fontsize=fontsize, outline=outline, marginv=margin_v)
@@ -417,4 +578,4 @@ def transcribe(video_path: Path, config: dict, verbose: bool = False) -> Path | 
         f.write("\n")
 
     console.print(f"[green]Subtitles saved:[/green] {ass_path.name} ({len(phrases)} phrases)")
-    return ass_path
+    return ass_path, all_words
