@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
@@ -173,7 +173,7 @@ export function PipelinePage() {
       )}
 
       {isComplete && state?.recipe === 'shorts' && (
-        <ShortsReview completedClipIds={state.completed_clip_ids ?? []} />
+        <ShortsReview completedClipIds={state.completed_clip_ids} />
       )}
 
       {isIdle && connected && (
@@ -194,22 +194,27 @@ export function PipelinePage() {
 
 // ─── Shorts Review ────────────────────────────────────────────────
 
-function ShortsReview({ completedClipIds }: { completedClipIds: string[] }) {
+function ShortsReview({ completedClipIds }: { completedClipIds: string[] | undefined }) {
   const [clips, setClips] = useState<ClipMeta[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [uploading, setUploading] = useState(false)
   const { channel: workspaceChannel } = useChannelScope()
 
+  // Stabilize the array reference — SSE creates new arrays on every heartbeat
+  const idsKey = (completedClipIds ?? []).join(',')
+  const stableIds = useMemo(() => completedClipIds ?? [], [idsKey])
+
   useEffect(() => {
+    if (stableIds.length === 0) return
     fetchQueue('output', { channel: workspaceChannel !== 'all' ? workspaceChannel : undefined })
       .then((all) => {
-        const idSet = new Set(completedClipIds)
+        const idSet = new Set(stableIds)
         const relevant = all.filter((c) => idSet.has(c.id))
         setClips(relevant)
         setSelected(new Set(relevant.map((c) => c.id)))
       })
       .catch(() => {})
-  }, [completedClipIds, workspaceChannel])
+  }, [stableIds, workspaceChannel])
 
   function toggleClip(id: string) {
     setSelected((prev) => {

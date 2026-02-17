@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, memo } from 'react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -96,6 +96,7 @@ export function StudioPage() {
   const [latestOnly, setLatestOnly] = useState(false)
   const [cropsOpen, setCropsOpen] = useState(false)
   const [subtitleClip, setSubtitleClip] = useState<ClipMeta | null>(null)
+  const [limit, setLimit] = useState(50)
   const { state: pipeline } = usePipeline()
   const { channel: workspaceChannel, channels: channelConfig } = useChannelScope()
 
@@ -155,6 +156,7 @@ export function StudioPage() {
         game: gameFilter || undefined,
         sort: sortBy,
         channel: workspaceChannel,
+        limit,
       })
       setClips(data)
     } catch {
@@ -162,7 +164,7 @@ export function StudioPage() {
     } finally {
       setLoading(false)
     }
-  }, [gameFilter, sortBy, workspaceChannel])
+  }, [gameFilter, sortBy, workspaceChannel, limit])
 
   useEffect(() => {
     loadClips()
@@ -179,18 +181,28 @@ export function StudioPage() {
     }
   }, [pipeline?.running, loadClips])
 
+  // Stabilize completed_clip_ids — SSE creates new arrays on every heartbeat
+  const completedIdsKey = (pipeline?.completed_clip_ids ?? []).join(',')
+  const stableCompletedIds = useMemo(
+    () => pipeline?.completed_clip_ids ?? [],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [completedIdsKey],
+  )
+
   // Client-side filters for type and status
-  const latestIds = new Set((pipeline?.completed_clip_ids ?? []).filter(Boolean))
-  const filteredClips = clips.filter((clip) => {
-    if (latestOnly && latestIds.size > 0 && !latestIds.has(clip.id)) return false
-    if (typeFilter === 'shorts' && !clip.is_shorts) return false
-    if (typeFilter === 'landscape' && (clip.is_shorts || clip.clip_count)) return false
-    if (typeFilter === 'compilation' && !clip.clip_count) return false
-    const uploaded = !!clip.video_id
-    if (statusFilter === 'ready' && uploaded) return false
-    if (statusFilter === 'uploaded' && !uploaded) return false
-    return true
-  })
+  const filteredClips = useMemo(() => {
+    const latestIds = new Set(stableCompletedIds.filter(Boolean))
+    return clips.filter((clip) => {
+      if (latestOnly && latestIds.size > 0 && !latestIds.has(clip.id)) return false
+      if (typeFilter === 'shorts' && !clip.is_shorts) return false
+      if (typeFilter === 'landscape' && (clip.is_shorts || clip.clip_count)) return false
+      if (typeFilter === 'compilation' && !clip.clip_count) return false
+      const uploaded = !!(clip.video_id || clip.tiktok_id || clip.instagram_id || clip.facebook_id)
+      if (statusFilter === 'ready' && uploaded) return false
+      if (statusFilter === 'uploaded' && !uploaded) return false
+      return true
+    })
+  }, [clips, latestOnly, stableCompletedIds, typeFilter, statusFilter])
 
   const channels = Object.entries(channelConfig ?? {})
   const workspaceLabel =
@@ -198,7 +210,7 @@ export function StudioPage() {
       ? 'All channels'
       : channelConfig?.[workspaceChannel]?.name ?? workspaceChannel
 
-  async function handleUpload(clip: ClipMeta) {
+  const handleUpload = useCallback(async function handleUpload(clip: ClipMeta) {
     setUploadStatuses((s) => ({ ...s, [clip.id]: 'uploading' }))
     try {
       const workspaceKey = workspaceChannel === 'all' ? null : workspaceChannel
@@ -216,9 +228,9 @@ export function StudioPage() {
       setUploadStatuses((s) => ({ ...s, [clip.id]: 'error' }))
       toast.error(err instanceof Error ? err.message : 'Upload failed')
     }
-  }
+  }, [uploadChannel, workspaceChannel, loadClips])
 
-  async function handlePublish(clipId: string) {
+  const handlePublish = useCallback(async function handlePublish(clipId: string) {
     try {
       const result = await publishClip(clipId)
       toast.success(`Published${result.channel ? ` (${result.channel})` : ''}`)
@@ -226,7 +238,7 @@ export function StudioPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Publish failed')
     }
-  }
+  }, [loadClips])
 
   function handleMetadataSaved() {
     setEditingClip(null)
@@ -291,11 +303,15 @@ export function StudioPage() {
           <SelectContent>
             <SelectItem value="__auto__">Upload: Workspace channel</SelectItem>
             <SelectItem value="__autoroute__">Upload: Auto route</SelectItem>
-            {channels.map(([key, value]) => (
-              <SelectItem key={key} value={key}>
-                Upload: {value.name ?? key}
-              </SelectItem>
-            ))}
+            {channels.map(([key, value]) => {
+              const plat = (value as { platform?: string }).platform ?? 'youtube'
+              const tag = plat === 'youtube' ? '' : ` [${plat.toUpperCase()}]`
+              return (
+                <SelectItem key={key} value={key}>
+                  Upload: {value.name ?? key}{tag}
+                </SelectItem>
+              )
+            })}
           </SelectContent>
         </Select>
         <Button
@@ -374,23 +390,32 @@ export function StudioPage() {
           </Button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredClips.map((clip) => (
-            <StudioCard
-              key={clip.id}
-              clip={clip}
-              uploadStatus={uploadStatuses[clip.id] ?? 'idle'}
-              isPlaying={playingClipId === clip.id}
-              onPlay={() => setPlayingClipId(playingClipId === clip.id ? null : clip.id)}
-              onStopPlay={() => setPlayingClipId(null)}
-              onUpload={() => handleUpload(clip)}
-              onPublish={() => handlePublish(clip.id)}
-              onEdit={() => setEditingClip(clip)}
-              onReveal={() => openOutputClip(clip.id).catch((err) => toast.error(err instanceof Error ? err.message : 'Reveal failed'))}
-              onSubtitles={() => setSubtitleClip(clip)}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredClips.map((clip) => (
+              <StudioCard
+                key={clip.id}
+                clip={clip}
+                uploadStatus={uploadStatuses[clip.id] ?? 'idle'}
+                isPlaying={playingClipId === clip.id}
+                onPlay={() => setPlayingClipId(playingClipId === clip.id ? null : clip.id)}
+                onStopPlay={() => setPlayingClipId(null)}
+                onUpload={() => handleUpload(clip)}
+                onPublish={() => handlePublish(clip.id)}
+                onEdit={() => setEditingClip(clip)}
+                onReveal={() => openOutputClip(clip.id).catch((err) => toast.error(err instanceof Error ? err.message : 'Reveal failed'))}
+                onSubtitles={() => setSubtitleClip(clip)}
+              />
+            ))}
+          </div>
+          {filteredClips.length >= limit && (
+            <div className="flex justify-center pt-4">
+              <Button variant="outline" onClick={() => setLimit(l => l + 50)}>
+                Load more
+              </Button>
+            </div>
+          )}
+        </>
       )}
 
       {/* Metadata sheet */}
@@ -411,13 +436,14 @@ export function StudioPage() {
           onOpenChange={(open) => { if (!open) setSubtitleClip(null) }}
           clipId={subtitleClip.id}
           clipTitle={subtitleClip._title_override ?? subtitleClip._generated_title ?? subtitleClip.title}
+          clip={subtitleClip}
         />
       )}
     </div>
   )
 }
 
-function StudioCard({
+const StudioCard = memo(function StudioCard({
   clip,
   uploadStatus,
   isPlaying,
@@ -527,9 +553,19 @@ function StudioCard({
       <div className="p-3 space-y-2">
         {/* Status badges */}
         <div className="flex items-center gap-1.5 flex-wrap">
-          {clip.video_id ? (
-            <Badge variant="secondary" className="text-[10px]">uploaded</Badge>
-          ) : (
+          {clip.video_id && (
+            <Badge variant="secondary" className="text-[10px] bg-red-100 text-red-700">YT</Badge>
+          )}
+          {clip.tiktok_id && (
+            <Badge variant="secondary" className="text-[10px] bg-pink-100 text-pink-700">TT</Badge>
+          )}
+          {clip.instagram_id && (
+            <Badge variant="secondary" className="text-[10px] bg-purple-100 text-purple-700">IG</Badge>
+          )}
+          {clip.facebook_id && (
+            <Badge variant="secondary" className="text-[10px] bg-blue-100 text-blue-700">FB</Badge>
+          )}
+          {!clip.video_id && !clip.tiktok_id && !clip.instagram_id && !clip.facebook_id && (
             <Badge className="bg-primary text-primary-foreground text-[10px]">ready</Badge>
           )}
           {showTargetChannel && (
@@ -603,22 +639,20 @@ function StudioCard({
 
         {/* Actions */}
         <div className="flex items-center gap-1 pt-1">
-          {!clip.video_id && (
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 text-xs gap-1"
-              onClick={onUpload}
-              disabled={uploadStatus === 'uploading'}
-            >
-              {uploadStatus === 'uploading' ? (
-                <Loader2 className="size-3 animate-spin" />
-              ) : (
-                <Upload className="size-3" />
-              )}
-              Upload
-            </Button>
-          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs gap-1"
+            onClick={onUpload}
+            disabled={uploadStatus === 'uploading'}
+          >
+            {uploadStatus === 'uploading' ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <Upload className="size-3" />
+            )}
+            Upload
+          </Button>
           {clip.video_id && clip.video_id !== 'previously_uploaded' && (
             <Button
               size="sm"
@@ -674,7 +708,16 @@ function StudioCard({
       </div>
     </div>
   )
-}
+}, (prev, next) =>
+  prev.clip.id === next.clip.id &&
+  prev.clip.video_id === next.clip.video_id &&
+  prev.clip.tiktok_id === next.clip.tiktok_id &&
+  prev.clip.instagram_id === next.clip.instagram_id &&
+  prev.clip.facebook_id === next.clip.facebook_id &&
+  prev.clip._title_override === next.clip._title_override &&
+  prev.uploadStatus === next.uploadStatus &&
+  prev.isPlaying === next.isPlaying
+)
 
 function MetadataSheet({
   clip,
@@ -761,7 +804,16 @@ function MetadataSheet({
           <SheetDescription>
             {clip.streamer} — {clip.game}
             {clip.video_id && (
-              <span className="ml-2 text-xs text-primary">YouTube: {clip.video_id}</span>
+              <span className="ml-2 text-xs text-primary">YT: {clip.video_id}</span>
+            )}
+            {clip.tiktok_id && (
+              <span className="ml-2 text-xs text-pink-600">TT: {clip.tiktok_id}</span>
+            )}
+            {clip.instagram_id && (
+              <span className="ml-2 text-xs text-purple-600">IG: {clip.instagram_id}</span>
+            )}
+            {clip.facebook_id && (
+              <span className="ml-2 text-xs text-blue-600">FB: {clip.facebook_id}</span>
             )}
           </SheetDescription>
         </SheetHeader>

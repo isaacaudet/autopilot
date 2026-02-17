@@ -86,6 +86,23 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE performance ADD COLUMN retention_curve TEXT")
         conn.commit()
 
+    clip_columns = {r[1] for r in conn.execute("PRAGMA table_info(clips)").fetchall()}
+    if "hook_duration" not in clip_columns:
+        conn.execute("ALTER TABLE clips ADD COLUMN hook_duration REAL")
+        conn.execute("ALTER TABLE clips ADD COLUMN hook_text_override TEXT")
+        conn.commit()
+
+    # Multi-platform upload IDs
+    for col in ("tiktok_id", "instagram_id", "facebook_id"):
+        if col not in clip_columns:
+            conn.execute(f"ALTER TABLE clips ADD COLUMN {col} TEXT")
+    conn.commit()
+
+    rel_cols = {r[1] for r in conn.execute("PRAGMA table_info(releases)").fetchall()}
+    if "platform" not in rel_cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN platform TEXT DEFAULT 'youtube'")
+        conn.commit()
+
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS clips (
@@ -117,6 +134,8 @@ CREATE TABLE IF NOT EXISTS clips (
     title_override TEXT,
     description_override TEXT,
     tags_override TEXT,
+    hook_duration REAL,
+    hook_text_override TEXT,
     meta_json TEXT,
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -216,7 +235,9 @@ _CLIP_COLUMNS = {
     "channel", "is_shorts", "shorts_layout", "score", "processed_path",
     "subtitle_path", "source_path", "output_name", "analysis",
     "audio_energy_db", "video_id", "privacy", "title_override",
-    "description_override", "tags_override", "meta_json", "updated_at",
+    "description_override", "tags_override", "hook_duration",
+    "hook_text_override", "tiktok_id", "instagram_id", "facebook_id",
+    "meta_json", "updated_at",
 }
 
 # Mapping from clip dict underscore-prefixed keys to column names
@@ -230,7 +251,12 @@ _KEY_REMAP = {
     "_title_override": "title_override",
     "_description_override": "description_override",
     "_tags_override": "tags_override",
+    "_hook_duration": "hook_duration",
+    "_hook_text_override": "hook_text_override",
     "_analysis": "analysis",
+    "_tiktok_id": "tiktok_id",
+    "_instagram_id": "instagram_id",
+    "_facebook_id": "facebook_id",
 }
 
 
@@ -304,6 +330,16 @@ def _row_to_clip(row: sqlite3.Row) -> dict:
         clip["_tags_override"] = clip["tags_override"]
     if clip.get("analysis"):
         clip["_analysis"] = clip["analysis"]
+    if clip.get("hook_duration") is not None:
+        clip["_hook_duration"] = clip["hook_duration"]
+    if clip.get("hook_text_override"):
+        clip["_hook_text_override"] = clip["hook_text_override"]
+    if clip.get("tiktok_id"):
+        clip["_tiktok_id"] = clip["tiktok_id"]
+    if clip.get("instagram_id"):
+        clip["_instagram_id"] = clip["instagram_id"]
+    if clip.get("facebook_id"):
+        clip["_facebook_id"] = clip["facebook_id"]
 
     # Convert is_shorts back to bool
     clip["is_shorts"] = bool(clip.get("is_shorts"))
@@ -639,11 +675,12 @@ def delete_facecam_profile_db(config: dict, streamer: str) -> bool:
 
 
 def create_release(config: dict, clip_id: str, channel: str, scheduled_at: str,
-                   privacy: str = "unlisted", meta_path: str | None = None) -> int:
+                   privacy: str = "unlisted", meta_path: str | None = None,
+                   platform: str = "youtube") -> int:
     conn = get_db(config)
     cursor = conn.execute(
-        "INSERT INTO releases (clip_id, channel, scheduled_at, privacy, meta_path) VALUES (?, ?, ?, ?, ?)",
-        (clip_id, channel, scheduled_at, privacy, meta_path),
+        "INSERT INTO releases (clip_id, channel, scheduled_at, privacy, meta_path, platform) VALUES (?, ?, ?, ?, ?, ?)",
+        (clip_id, channel, scheduled_at, privacy, meta_path, platform),
     )
     conn.commit()
     return cursor.lastrowid

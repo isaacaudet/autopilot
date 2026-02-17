@@ -115,7 +115,7 @@ export async function uploadClip(
   clipId: string,
   privacy = 'unlisted',
   channel?: string | null,
-): Promise<{ video_id: string | null; channel: string | null }> {
+): Promise<{ video_id: string | null; channel: string | null; platform?: string }> {
   const res = await fetch(`${BASE}/api/upload`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -126,7 +126,7 @@ export async function uploadClip(
     throw new Error(err.detail || `Upload failed: ${res.status}`)
   }
   const data = await res.json()
-  return { video_id: data.video_id ?? null, channel: data.channel ?? null }
+  return { video_id: data.video_id ?? null, channel: data.channel ?? null, platform: data.platform }
 }
 
 export async function uploadBatch(
@@ -186,6 +186,8 @@ export async function updateClipMetadata(
     description_override?: string
     tags_override?: string[]
     sync_youtube?: boolean
+    hook_text_override?: string
+    hook_duration?: number
   },
 ): Promise<void> {
   const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}`, {
@@ -545,6 +547,14 @@ export async function fetchSubtitles(clipId: string): Promise<SubtitleLine[]> {
   }
   const data = await res.json()
   return data.lines
+}
+
+export async function reburnSubtitles(clipId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}/reburn`, { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Re-burn failed: ${res.status}` }))
+    throw new Error(err.detail || `Re-burn failed: ${res.status}`)
+  }
 }
 
 export async function updateSubtitles(clipId: string, lines: SubtitleLine[]): Promise<void> {

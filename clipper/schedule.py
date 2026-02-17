@@ -97,8 +97,8 @@ def get_pending_releases(config: dict) -> list[dict]:
 
 def execute_releases(config: dict, verbose: bool = False) -> int:
     """Upload + publish all releases whose time has come. Returns count published."""
-    from clipper.upload.youtube import upload_clip, publish_video
-    from clipper.db import pending_releases_due, update_release
+    from clipper.upload.dispatcher import upload_clip, publish_video, get_channel_platform, platform_id_column
+    from clipper.db import pending_releases_due, update_release, update_clip as db_update_clip
 
     due = pending_releases_due(config)
     published = 0
@@ -120,22 +120,29 @@ def execute_releases(config: dict, verbose: bool = False) -> int:
 
             channel = data.get("channel", "")
             privacy = data.get("privacy", "unlisted")
+            platform = get_channel_platform(channel, config)
 
-            console.print(f"[bold]Uploading:[/bold] {clip.get('title', '?')[:50]} → {channel}")
+            console.print(f"[bold]Uploading:[/bold] {clip.get('title', '?')[:50]} → {channel} ({platform})")
             video_id = upload_clip(clip, config, privacy=privacy, verbose=verbose, channel=channel)
 
             if video_id:
                 update_release(config, release_id, status="uploaded", video_id=video_id)
 
-                # Also update the clip meta
-                clip["video_id"] = video_id
+                # Store in correct field
+                id_col = platform_id_column(platform)
+                clip[id_col] = video_id
                 with open(meta_path, "w") as f:
                     json.dump(clip, f, indent=2)
 
-                console.print(f"[green]  Uploaded:[/green] https://youtube.com/watch?v={video_id}")
+                # Update DB
+                clip_id = data.get("clip_id", "")
+                if clip_id:
+                    db_update_clip(config, clip_id, **{id_col: video_id})
+
+                console.print(f"[green]  Uploaded ({platform}):[/green] {video_id}")
             else:
                 update_release(config, release_id, status="failed")
-                console.print(f"[red]  Upload failed.[/red]")
+                console.print("[red]  Upload failed.[/red]")
             continue
 
         # Publish uploaded releases
@@ -143,7 +150,8 @@ def execute_releases(config: dict, verbose: bool = False) -> int:
             video_id = data.get("video_id")
             if not video_id:
                 continue
-            if publish_video(video_id, verbose=verbose):
+            channel = data.get("channel", "")
+            if publish_video(video_id, verbose=verbose, channel=channel, config=config):
                 update_release(config, release_id, status="published")
                 published += 1
 

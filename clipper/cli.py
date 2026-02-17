@@ -82,10 +82,20 @@ def release(verbose):
 @cli.command()
 @click.option("--channel", "-c", required=True, help="Channel key from config.yaml.")
 def auth(channel):
-    """Set up YouTube OAuth for a channel."""
-    from clipper.upload.auth import setup_channel_auth
-
-    setup_channel_auth(channel, load_config())
+    """Set up OAuth for a channel (auto-detects platform from config)."""
+    config = load_config()
+    platform = config.get("channels", {}).get(channel, {}).get("platform", "youtube")
+    if platform == "youtube":
+        from clipper.upload.auth import setup_channel_auth
+        setup_channel_auth(channel, config)
+    elif platform == "tiktok":
+        from clipper.upload.auth import setup_tiktok_auth
+        setup_tiktok_auth(channel, config)
+    elif platform in ("instagram", "facebook"):
+        from clipper.upload.auth import setup_meta_auth
+        setup_meta_auth(channel, config, platform=platform)
+    else:
+        raise click.ClickException(f"Unknown platform: {platform}")
 
 
 def main():

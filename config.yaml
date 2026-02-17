@@ -56,6 +56,7 @@ shorts:
 channels:
   default:
     name: "Main Channel"
+    platform: youtube
     token_file: ".clipper_token.json"
     default_privacy: unlisted
     schedule:
@@ -63,8 +64,33 @@ channels:
       release_times: ["10:00", "14:00", "18:00"]
   class_instantiate:
     name: "class.instantiate@gmail.com"
+    platform: youtube
     token_file: ".clipper_token_class_instantiate.json"
     default_privacy: unlisted
     schedule:
       shorts_per_day: 2
       release_times: ["11:00", "15:00", "19:00"]
+  tiktok_main:
+    name: "TikTok Main"
+    platform: tiktok
+    token_file: ".clipper_tiktok_main.json"
+    default_privacy: public
+    schedule:
+      shorts_per_day: 3
+      release_times: ["09:00", "13:00", "17:00"]
+  instagram_main:
+    name: "Instagram Reels"
+    platform: instagram
+    token_file: ".clipper_instagram_main.json"
+    default_privacy: unlisted
+    schedule:
+      shorts_per_day: 2
+      release_times: ["10:00", "15:00"]
+  facebook_main:
+    name: "Facebook Reels"
+    platform: facebook
+    token_file: ".clipper_facebook_main.json"
+    default_privacy: unlisted
+    schedule:
+      shorts_per_day: 2
+      release_times: ["11:00", "16:00"]

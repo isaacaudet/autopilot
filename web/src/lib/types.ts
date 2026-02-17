@@ -10,6 +10,9 @@ export interface ClipMeta {
   _score?: number
   processed_path?: string
   video_id?: string
+  tiktok_id?: string
+  instagram_id?: string
+  facebook_id?: string
   channel?: string
   _target_channel?: string
   is_shorts?: boolean
@@ -22,6 +25,8 @@ export interface ClipMeta {
   _generated_tags?: string[]
   _orphan?: boolean
   _subtitle_path?: string
+  _hook_text_override?: string
+  _hook_duration?: number
   _analysis?: { category?: string; title_variants?: string[]; hook_text?: string; [key: string]: unknown }
   thumbnail_url?: string
   created_at?: string
@@ -79,6 +84,6 @@ export interface ConfigData {
     youtube: { channels: string[] }
   }
   settings: { min_views: number; max_duration: number; shorts_threshold: number }
-  channels: Record<string, { name: string; schedule: { shorts_per_day: number; release_times: string[] } }>
+  channels: Record<string, { name: string; platform?: string; schedule: { shorts_per_day: number; release_times: string[] } }>
   upload: { default_privacy: string; max_uploads_per_day: number }
 }

@@ -1,0 +1,172 @@
+"""Facebook Reels upload via Graph API v21.0.
+
+Requires:
+  - META_APP_ID and META_APP_SECRET in .env
+  - Page Access Token in channel's token file (obtained via ``clipper auth -c <channel>``)
+
+Duration: Facebook Reels require 4-60 seconds.
+"""
+
+import json
+import logging
+from pathlib import Path
+
+import requests
+from rich.console import Console
+
+from clipper.config import get_project_root
+
+logger = logging.getLogger(__name__)
+console = Console()
+
+GRAPH_API = "https://graph.facebook.com/v21.0"
+
+
+def _token_path_for_channel(channel: str | None, config: dict) -> Path:
+    channels = config.get("channels", {})
+    ch = channels.get(channel or "", {})
+    token_file = ch.get("token_file", f".clipper_facebook_{channel}.json")
+    return get_project_root() / token_file
+
+
+def _load_token(token_path: Path) -> dict:
+    if not token_path.exists():
+        raise RuntimeError(
+            f"Facebook token missing: {token_path.name}. "
+            "Run `clipper auth -c <channel>` to authenticate."
+        )
+    return json.loads(token_path.read_text())
+
+
+def _build_description(clip: dict, config: dict) -> str:
+    """Build a Facebook Reels description from clip metadata."""
+    title = clip.get("_title_override") or clip.get("title", "")
+    title = title.replace(" #Shorts", "").strip()
+
+    streamer = clip.get("streamer", "")
+    game = clip.get("game", "")
+
+    hashtags = []
+    if game:
+        hashtags.append(f"#{game.replace(' ', '').lower()}")
+    if streamer:
+        hashtags.append(f"#{streamer.replace(' ', '').lower()}")
+    hashtags.extend(["#gaming", "#clips", "#reels"])
+
+    return f"{title}\n\n{' '.join(hashtags)}"
+
+
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -> str | None:
+    """Upload a clip as a Facebook Reel. Returns the video_id on success."""
+    processed_path = clip.get("processed_path")
+    if not processed_path or not Path(processed_path).exists():
+        console.print(f"[red]Missing processed file: {processed_path}[/red]")
+        return None
+
+    duration = clip.get("duration", 0)
+    if duration < 4 or duration > 60:
+        console.print(f"[yellow]Skipping Facebook Reel: duration {duration:.1f}s outside 4-60s range.[/yellow]")
+        return None
+
+    token_path = _token_path_for_channel(channel, config)
+    token_data = _load_token(token_path)
+    page_id = token_data.get("page_id")
+    page_token = token_data.get("page_access_token")
+
+    if not page_id or not page_token:
+        raise RuntimeError("Facebook token file missing page_id or page_access_token.")
+
+    description = clip.get("_description_override") or _build_description(clip, config)
+    video_state = "PUBLISHED" if privacy == "public" else "DRAFT"
+
+    try:
+        # Step 1: Start upload session
+        console.print("  [bold]Uploading Facebook Reel...[/bold]")
+        start_resp = requests.post(
+            f"{GRAPH_API}/{page_id}/video_reels",
+            params={
+                "upload_phase": "start",
+                "access_token": page_token,
+            },
+            timeout=30,
+        )
+        start_resp.raise_for_status()
+        start_data = start_resp.json()
+        video_id = start_data.get("video_id")
+
+        if not video_id:
+            console.print(f"[red]Facebook start failed: {start_data}[/red]")
+            return None
+
+        # Step 2: Upload binary
+        file_size = Path(processed_path).stat().st_size
+        with open(processed_path, "rb") as f:
+            upload_resp = requests.post(
+                f"https://rupload.facebook.com/video-upload/v21.0/{video_id}",
+                headers={
+                    "Authorization": f"OAuth {page_token}",
+                    "offset": "0",
+                    "file_size": str(file_size),
+                    "Content-Type": "application/octet-stream",
+                },
+                data=f,
+                timeout=300,
+            )
+            upload_resp.raise_for_status()
+
+        # Step 3: Finish upload
+        finish_resp = requests.post(
+            f"{GRAPH_API}/{page_id}/video_reels",
+            params={
+                "upload_phase": "finish",
+                "access_token": page_token,
+                "video_id": video_id,
+                "video_state": video_state,
+                "description": description,
+            },
+            timeout=30,
+        )
+        finish_resp.raise_for_status()
+
+        console.print(f"[green]Facebook Reel uploaded:[/green] {video_id}")
+        return video_id
+
+    except Exception as e:
+        console.print(f"[red]Facebook upload error: {e}[/red]")
+        clip["_upload_error_reason"] = "facebook_error"
+        clip["_upload_error_message"] = str(e)
+        clip["_upload_error_status"] = None
+        return None
+
+
+def publish_video(video_id, verbose=False, *, channel=None, config=None) -> bool:
+    """Publish a draft Facebook Reel (re-send finish with PUBLISHED state)."""
+    if not config or not channel:
+        logger.error("publish_video requires config and channel for Facebook")
+        return False
+
+    token_path = _token_path_for_channel(channel, config)
+    token_data = _load_token(token_path)
+    page_id = token_data.get("page_id")
+    page_token = token_data.get("page_access_token")
+
+    if not page_id or not page_token:
+        return False
+
+    try:
+        resp = requests.post(
+            f"{GRAPH_API}/{page_id}/video_reels",
+            params={
+                "upload_phase": "finish",
+                "access_token": page_token,
+                "video_id": video_id,
+                "video_state": "PUBLISHED",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        console.print(f"[green]Facebook Reel published:[/green] {video_id}")
+        return True
+    except Exception as e:
+        console.print(f"[red]Facebook publish error: {e}[/red]")
+        return False

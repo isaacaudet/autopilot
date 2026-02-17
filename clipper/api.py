@@ -48,6 +48,8 @@ class ClipUpdateRequest(BaseModel):
     title_override: str | None = None
     description_override: str | None = None
     tags_override: list[str] | None = None
+    hook_text_override: str | None = None
+    hook_duration: float | None = None
     sync_youtube: bool = False
 
 
@@ -725,13 +727,13 @@ def create_app(config: dict | None = None) -> FastAPI:
                 thread = workflow_thread.get("current")
                 snap["running"] = thread is not None and thread.is_alive()
                 yield f"data: {json.dumps(snap)}\n\n"
-                if snap["running"] or snap["phase"] in ("done", "error"):
+                if snap["running"]:
                     idle_count = 0
                     shutdown_event.wait(0.25)
                 else:
-                    # Idle — send heartbeats less frequently
+                    # Idle / done / error — send heartbeats less frequently
                     idle_count += 1
-                    shutdown_event.wait(min(2.0, 0.5 * idle_count))
+                    shutdown_event.wait(min(5.0, 0.5 + 0.5 * idle_count))
 
         return StreamingResponse(
             _generate(),
@@ -743,14 +745,36 @@ def create_app(config: dict | None = None) -> FastAPI:
     def on_shutdown():
         shutdown_event.set()
 
+    def _merge_db_overrides(clip: dict, clip_id: str) -> dict:
+        """Merge DB-stored overrides into a clip dict so uploads always use latest edits."""
+        from clipper.db import get_clip as db_get_clip
+
+        db_clip = db_get_clip(config, clip_id)
+        if not db_clip:
+            return clip
+
+        for key in ("_title_override", "_description_override", "_tags_override",
+                     "_hook_text_override", "_hook_duration"):
+            db_val = db_clip.get(key)
+            if db_val is not None:
+                clip[key] = db_val
+        # Also set the non-prefixed DB column names for modules that read them
+        for key in ("title_override", "description_override", "tags_override",
+                     "hook_text_override", "hook_duration"):
+            db_val = db_clip.get(key)
+            if db_val is not None:
+                clip[key] = db_val
+        return clip
+
     @app.post("/api/upload")
     def upload_single(req: UploadRequest):
-        from clipper.upload.youtube import upload_clip
+        from clipper.upload.dispatcher import upload_clip, get_channel_platform, platform_id_column
 
         output_dir = config["_output_dir"]
         meta_path = _resolve_clip_meta(output_dir, req.clip_id)
 
         clip = json.loads(meta_path.read_text())
+        clip = _merge_db_overrides(clip, req.clip_id)
         channels_cfg = config.get("channels", {}) or {}
         if req.channel and req.channel not in channels_cfg:
             raise HTTPException(400, f"Unknown channel: {req.channel}")
@@ -767,6 +791,7 @@ def create_app(config: dict | None = None) -> FastAPI:
 
         video_id = None
         used_channel = None
+        used_platform = "youtube"
         attempts: list[dict] = []
         for channel_name in channel_order:
             video_id = upload_clip(clip, config, privacy=req.privacy, channel=channel_name)
@@ -787,17 +812,19 @@ def create_app(config: dict | None = None) -> FastAPI:
                     break
             if video_id:
                 used_channel = channel_name
+                used_platform = get_channel_platform(channel_name, config)
                 break
 
         if video_id:
             from clipper.db import update_clip as db_update_clip
-            clip["video_id"] = video_id
+            id_col = platform_id_column(used_platform)
+            clip[id_col] = video_id
             if used_channel:
                 clip["channel"] = used_channel
                 clip.setdefault("_target_channel", used_channel)
             meta_path.write_text(json.dumps(clip, indent=2))
-            db_update_clip(config, req.clip_id, video_id=video_id, channel=used_channel or "")
-            return {"video_id": video_id, "channel": used_channel, "attempts": attempts}
+            db_update_clip(config, req.clip_id, **{id_col: video_id, "channel": used_channel or ""})
+            return {"video_id": video_id, "channel": used_channel, "platform": used_platform, "attempts": attempts}
 
         attempted = ", ".join([c for c in channel_order if c]) or "default OAuth token"
         raise HTTPException(
@@ -808,7 +835,7 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.post("/api/upload/batch")
     def upload_batch(req: BatchUploadRequest):
-        from clipper.upload.youtube import upload_clip
+        from clipper.upload.dispatcher import upload_clip, get_channel_platform, platform_id_column
 
         output_dir = config["_output_dir"]
         channels_cfg = config.get("channels", {}) or {}
@@ -833,8 +860,10 @@ def create_app(config: dict | None = None) -> FastAPI:
                 continue
 
             clip = json.loads(meta_path.read_text())
+            clip = _merge_db_overrides(clip, clip_id)
             video_id = None
             used_channel = None
+            used_platform = "youtube"
             attempts: list[dict] = []
             for channel_name in channel_order:
                 video_id = upload_clip(clip, config, privacy=req.privacy, channel=channel_name)
@@ -854,17 +883,19 @@ def create_app(config: dict | None = None) -> FastAPI:
                         break
                 if video_id:
                     used_channel = channel_name
+                    used_platform = get_channel_platform(channel_name, config)
                     break
 
             if video_id:
                 from clipper.db import update_clip as db_update_clip
-                clip["video_id"] = video_id
+                id_col = platform_id_column(used_platform)
+                clip[id_col] = video_id
                 if used_channel:
                     clip["channel"] = used_channel
                     clip.setdefault("_target_channel", used_channel)
                 meta_path.write_text(json.dumps(clip, indent=2))
-                db_update_clip(config, clip_id, video_id=video_id, channel=used_channel or "")
-                results.append({"clip_id": clip_id, "video_id": video_id, "channel": used_channel, "attempts": attempts})
+                db_update_clip(config, clip_id, **{id_col: video_id, "channel": used_channel or ""})
+                results.append({"clip_id": clip_id, "video_id": video_id, "channel": used_channel, "platform": used_platform, "attempts": attempts})
             else:
                 attempted = ", ".join([c for c in channel_order if c]) or "default OAuth token"
                 last = attempts[-1] if attempts else {}
@@ -885,6 +916,10 @@ def create_app(config: dict | None = None) -> FastAPI:
             updates["description_override"] = req.description_override
         if req.tags_override is not None:
             updates["tags_override"] = json.dumps(req.tags_override)
+        if req.hook_text_override is not None:
+            updates["hook_text_override"] = req.hook_text_override
+        if req.hook_duration is not None:
+            updates["hook_duration"] = req.hook_duration
 
         if updates:
             db_update_clip(config, clip_id, **updates)
@@ -899,6 +934,10 @@ def create_app(config: dict | None = None) -> FastAPI:
                 clip["_description_override"] = req.description_override
             if req.tags_override is not None:
                 clip["_tags_override"] = req.tags_override
+            if req.hook_text_override is not None:
+                clip["_hook_text_override"] = req.hook_text_override
+            if req.hook_duration is not None:
+                clip["_hook_duration"] = req.hook_duration
             meta_path.write_text(json.dumps(clip, indent=2))
         else:
             clip = get_clip(config, clip_id) or {}
@@ -1015,6 +1054,45 @@ def create_app(config: dict | None = None) -> FastAPI:
 
         return {"ok": True, "lines_written": len(dialogue_lines)}
 
+    @app.post("/api/clips/{clip_id}/reburn")
+    def reburn_subtitles(clip_id: str):
+        """Re-burn subtitles onto the formatted video using the current ASS file."""
+        from clipper.db import get_clip as db_get_clip, update_clip
+        from clipper.process.burn import burn_subtitles
+        from clipper.process.titles import generate_hook_text
+
+        clip = db_get_clip(config, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+
+        ass_path_str = clip.get("_subtitle_path")
+        if not ass_path_str or not Path(ass_path_str).exists():
+            raise HTTPException(404, "No subtitle file")
+
+        source = clip.get("_source_path")
+        if not source:
+            raise HTTPException(404, "Source path not stored")
+        formatted = Path(source).with_name(f"{Path(source).stem}_shorts.mp4")
+        if not formatted.exists():
+            raise HTTPException(404, f"Formatted video not found: {formatted.name}")
+
+        streamer_slug = re.sub(r"[^a-z0-9]", "", clip.get("streamer", "unknown").lower())
+        game_slug = re.sub(r"[^a-z0-9]", "", clip.get("game", "").lower())[:12]
+        short_id = clip_id[:8]
+        output_name = f"{streamer_slug}_{game_slug}_{short_id}" if game_slug else f"{streamer_slug}_{short_id}"
+
+        hook_text = generate_hook_text(clip) if clip.get("is_shorts") else None
+
+        final_path = burn_subtitles(
+            formatted, Path(ass_path_str), config,
+            clip=clip, is_shorts=clip.get("is_shorts", False),
+            hook_text=hook_text, output_name=output_name,
+            censor_ranges=clip.get("censor_ranges"),
+        )
+
+        update_clip(config, clip_id, processed_path=str(final_path))
+        return {"ok": True, "processed_path": str(final_path)}
+
     @app.get("/api/clips/{clip_id}/title-preview")
     def get_title_preview(clip_id: str):
         from clipper.upload.youtube import _build_title
@@ -1050,36 +1128,56 @@ def create_app(config: dict | None = None) -> FastAPI:
 
     @app.post("/api/publish")
     def publish_videos(req: PublishRequest):
-        from clipper.upload.youtube import publish_video
+        from clipper.upload.dispatcher import publish_video
 
         results = []
         for vid in req.video_ids:
-            ok = publish_video(vid)
+            ok = publish_video(vid, config=config)
             results.append({"video_id": vid, "published": ok})
         return {"results": results}
 
     @app.post("/api/clips/{clip_id}/publish")
     def publish_clip(clip_id: str):
         """Publish a specific clip using the same channel it was uploaded with."""
+        from clipper.upload.dispatcher import publish_video, get_channel_platform, platform_id_column
+
         output_dir = config["_output_dir"]
         meta_path = _resolve_clip_meta(output_dir, clip_id)
         clip = json.loads(meta_path.read_text())
 
-        video_id = clip.get("video_id")
+        channel = clip.get("channel")
+        platform = get_channel_platform(channel, config)
+        id_col = platform_id_column(platform)
+        video_id = clip.get(id_col) or clip.get("video_id")
+
         if not video_id or video_id == "previously_uploaded":
             raise HTTPException(400, "Clip has not been uploaded yet")
 
-        from clipper.upload.youtube import publish_video
-
         ok = publish_video(
             video_id,
-            channel=clip.get("channel"),
+            channel=channel,
             config=config,
         )
         if ok:
             clip["_privacy"] = "public"
             meta_path.write_text(json.dumps(clip, indent=2))
-        return {"video_id": video_id, "published": ok, "channel": clip.get("channel")}
+        return {"video_id": video_id, "published": ok, "channel": channel, "platform": platform}
+
+    @app.get("/api/auth/status")
+    def get_auth_status():
+        """Returns which channels have valid token files."""
+        channels = config.get("channels", {})
+        root = config.get("_root", Path("."))
+        result = {}
+        for key, ch in channels.items():
+            token_file = ch.get("token_file", "")
+            token_path = root / token_file if token_file else None
+            result[key] = {
+                "platform": ch.get("platform", "youtube"),
+                "name": ch.get("name", key),
+                "has_token": bool(token_path and token_path.exists()),
+            }
+        return {"channels": result}
 
     @app.get("/api/releases")
     def get_releases(channel: str = Query("all")):
