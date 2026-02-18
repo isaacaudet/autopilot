@@ -57,6 +57,88 @@ def _get_duration(video_path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def get_video_duration(video_path: Path) -> float:
+    """Public helper to read media duration in seconds."""
+    return _get_duration(Path(video_path))
+
+
+def trim_manual_window(
+    video_path: Path,
+    *,
+    trim_start: float = 0.0,
+    trim_end: float = 0.0,
+    verbose: bool = False,
+) -> Path:
+    """Trim a clip by removing seconds from start/end.
+
+    Args:
+        trim_start: Seconds to remove from the beginning.
+        trim_end: Seconds to remove from the end.
+    """
+    video_path = Path(video_path)
+    start_cut = max(0.0, float(trim_start or 0.0))
+    end_cut = max(0.0, float(trim_end or 0.0))
+    if start_cut <= 0.0 and end_cut <= 0.0:
+        return video_path
+
+    try:
+        duration = _get_duration(video_path)
+    except (ValueError, OSError):
+        return video_path
+
+    if duration <= 0.0:
+        return video_path
+
+    start = min(start_cut, max(0.0, duration - 0.2))
+    end = max(start + 0.2, duration - end_cut)
+    if end - start < 0.35:
+        if verbose:
+            console.print(
+                f"  [yellow]Manual trim ignored:[/yellow] invalid window "
+                f"({start:.2f}s → {end:.2f}s)"
+            )
+        return video_path
+
+    output_path = video_path.with_name(f"{video_path.stem}_manualtrim.mp4")
+    cmd = [
+        get_ffmpeg(),
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-i",
+        str(video_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=180)
+        if verbose:
+            kept = max(0.0, end - start)
+            console.print(
+                f"  [green]Manual trim:[/green] "
+                f"-{start_cut:.2f}s start, -{end_cut:.2f}s end "
+                f"({duration:.2f}s → {kept:.2f}s)"
+            )
+        return output_path
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if verbose:
+            console.print(f"  [yellow]Manual trim failed, using original: {e}[/yellow]")
+        return video_path
+
+
 def find_peak_moment(video_path: Path, analysis: dict | None = None, verbose: bool = False) -> float | None:
     """Find the peak entertainment moment in a clip using audio + LLM signals.
 

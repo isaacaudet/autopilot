@@ -10,6 +10,31 @@ from clipper.layout_profiles import load_facecam_profiles, normalize_layout_tuni
 
 console = Console()
 
+_PROFANITY = {
+    "fuck", "fucking", "fucked", "fucker", "shit", "shitting", "shitty",
+    "bitch", "bitches", "ass", "asshole", "damn", "dammit", "goddamn",
+    "hell", "crap", "bastard", "piss", "pissed", "cock", "dick",
+    "pussy", "whore", "slut", "bollocks",
+}
+
+
+def _censor_words(all_words: list[dict]) -> tuple[list[dict], list[tuple[float, float]]]:
+    """Replace profane words with f*** style and collect mute time ranges."""
+    import string
+    censored = []
+    mute_ranges: list[tuple[float, float]] = []
+    for w in all_words:
+        text = w.get("word", "")
+        stripped = text.strip(string.punctuation).lower()
+        if stripped in _PROFANITY:
+            clean = text[0] + "***" if text else "***"
+            censored.append({**w, "word": clean})
+            mute_ranges.append((w.get("start", 0), w.get("end", 0)))
+        else:
+            censored.append(w)
+    return censored, mute_ranges
+
+
 _TUNING_KEYS = (
     "safe_top_ratio",
     "safe_bottom_ratio",
@@ -411,11 +436,11 @@ def transcribe(
     config: dict,
     clip: dict | None = None,
     verbose: bool = False,
-) -> tuple[Path | None, list[dict] | None]:
+) -> tuple[Path | None, list[dict] | None, list]:
     """Transcribe a video file and generate an ASS subtitle file.
 
     Uses word-level timestamps for precise, short phrase display.
-    Returns (ass_path, all_words) tuple — word data enables downstream LLM analysis.
+    Returns (ass_path, all_words, censor_ranges) tuple — word data enables downstream LLM analysis.
     Either or both may be None on failure.
     """
     try:
@@ -425,7 +450,7 @@ def transcribe(
             "[red]Error: faster-whisper is not installed. "
             "Install it with: pip install faster-whisper[/red]"
         )
-        return None, None
+        return None, None, []
 
     video_path = Path(video_path)
     sub_config = config.get("subtitles", {})
@@ -461,7 +486,7 @@ def transcribe(
             segments = list(segments_iter)
         except Exception as e:
             console.print(f"[red]Transcription failed:[/red] {e}")
-            return None, None
+            return None, None, []
 
     # Extract word-level timestamps from faster-whisper Segment objects
     all_words = []
@@ -483,7 +508,7 @@ def transcribe(
 
     if not all_words:
         console.print("[yellow]No speech detected in video.[/yellow]")
-        return None, None
+        return None, None, []
 
     def _is_gibberish_token(token: str) -> bool:
         t = str(token or "").strip()
@@ -547,6 +572,8 @@ def transcribe(
             console.print(f"  [dim]Filter too aggressive ({len(filtered_words)}/{words_before} remaining) — keeping original[/dim]")
         # keep all_words as-is
 
+    all_words, censor_ranges = _censor_words(all_words)
+
     # Group words into short phrases
     max_words = sub_config.get("words_per_phrase", 3)
     phrases = _group_words_into_phrases(all_words, max_words=max_words)
@@ -578,4 +605,4 @@ def transcribe(
         f.write("\n")
 
     console.print(f"[green]Subtitles saved:[/green] {ass_path.name} ({len(phrases)} phrases)")
-    return ass_path, all_words
+    return ass_path, all_words, censor_ranges

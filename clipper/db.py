@@ -467,8 +467,11 @@ def update_clip(config: dict, clip_id: str, **fields) -> bool:
     if not fields:
         return False
 
+    conn = get_db(config)
+
     # Remap underscore keys
     remapped = {}
+    extra: dict = {}
     for k, v in fields.items():
         col = _KEY_REMAP.get(k, k)
         if col in _CLIP_COLUMNS:
@@ -478,12 +481,34 @@ def update_clip(config: dict, clip_id: str, **fields) -> bool:
                 remapped[col] = 1 if v else 0
             else:
                 remapped[col] = v
+        else:
+            extra[k] = v
+
+    # Merge unknown keys into meta_json so per-clip extras (e.g. _layout_override)
+    # survive round-trips through SQLite.
+    if extra:
+        existing_meta: dict = {}
+        row = conn.execute("SELECT meta_json FROM clips WHERE id = ?", (clip_id,)).fetchone()
+        raw_meta = row["meta_json"] if row else None
+        if isinstance(raw_meta, str) and raw_meta.strip():
+            try:
+                parsed = json.loads(raw_meta)
+                if isinstance(parsed, dict):
+                    existing_meta = parsed
+            except (json.JSONDecodeError, ValueError):
+                existing_meta = {}
+
+        for k, v in extra.items():
+            if v is None:
+                existing_meta.pop(k, None)
+            else:
+                existing_meta[k] = v
+        remapped["meta_json"] = json.dumps(existing_meta) if existing_meta else None
 
     if not remapped:
         return False
 
     remapped["updated_at"] = datetime.now(timezone.utc).isoformat()
-    conn = get_db(config)
     sets = ", ".join(f"{k} = ?" for k in remapped)
     result = conn.execute(
         f"UPDATE clips SET {sets} WHERE id = ?",

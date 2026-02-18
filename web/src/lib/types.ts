@@ -27,6 +27,8 @@ export interface ClipMeta {
   _subtitle_path?: string
   _hook_text_override?: string
   _hook_duration?: number
+  _trim_start?: number
+  _trim_end?: number
   _analysis?: { category?: string; title_variants?: string[]; hook_text?: string; [key: string]: unknown }
   thumbnail_url?: string
   created_at?: string
@@ -65,6 +67,16 @@ export interface FetchScoreResponse {
   clips: ClipMeta[]
   tiers: Tier[]
   clip_count: number
+}
+
+export interface BestPicksResponse {
+  requested_period: string
+  period: '24h' | '3d' | '7d' | 'since_last_output'
+  game: string
+  candidate_count: number
+  limit: number
+  cutoff?: string | null
+  picks: ClipMeta[]
 }
 
 export interface Release {

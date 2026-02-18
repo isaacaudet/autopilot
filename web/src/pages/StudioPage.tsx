@@ -53,6 +53,7 @@ import {
   collectPerformance,
   trainWeights,
   fetchLearnStatus,
+  requeueClip,
   openOutputClip,
   openOutputFolder,
   resyncOutput,
@@ -62,10 +63,12 @@ import { usePipeline } from '@/hooks/usePipeline'
 import { useChannelScope } from '@/hooks/useChannelScope'
 import { CropProfilesDialog } from '@/components/CropProfilesDialog'
 import { SubtitleEditorDialog } from '@/components/SubtitleEditorDialog'
+import { CompilationBuilder } from '@/components/CompilationBuilder'
 
 type UploadStatus = 'idle' | 'uploading' | 'done' | 'error'
 type TypeFilter = 'all' | 'shorts' | 'landscape' | 'compilation'
 type StatusFilter = 'all' | 'ready' | 'uploaded'
+type StudioView = 'clips' | 'compilations'
 
 function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60)
@@ -97,6 +100,7 @@ export function StudioPage() {
   const [cropsOpen, setCropsOpen] = useState(false)
   const [subtitleClip, setSubtitleClip] = useState<ClipMeta | null>(null)
   const [limit, setLimit] = useState(50)
+  const [studioView, setStudioView] = useState<StudioView>('clips')
   const { state: pipeline } = usePipeline()
   const { channel: workspaceChannel, channels: channelConfig } = useChannelScope()
 
@@ -240,6 +244,16 @@ export function StudioPage() {
     }
   }, [loadClips])
 
+  const handleRequeue = useCallback(async function handleRequeue(clipId: string) {
+    try {
+      await requeueClip(clipId)
+      toast.success('Moved to pending review')
+      loadClips()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to requeue clip')
+    }
+  }, [loadClips])
+
   function handleMetadataSaved() {
     setEditingClip(null)
     loadClips()
@@ -255,171 +269,202 @@ export function StudioPage() {
         </div>
       )}
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-center gap-3">
-        <Input
-          placeholder="Filter by game..."
-          value={gameFilter}
-          onChange={(e) => setGameFilter(e.target.value)}
-          className="max-w-[180px]"
-        />
-        <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as TypeFilter)}>
-          <SelectTrigger className="w-[140px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All types</SelectItem>
-            <SelectItem value="shorts">Shorts</SelectItem>
-            <SelectItem value="landscape">Landscape</SelectItem>
-            <SelectItem value="compilation">Compilation</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
-          <SelectTrigger className="w-[140px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All status</SelectItem>
-            <SelectItem value="ready">Ready</SelectItem>
-            <SelectItem value="uploaded">Uploaded</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={sortBy} onValueChange={setSortBy}>
-          <SelectTrigger className="w-[130px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="recent">Recent</SelectItem>
-            <SelectItem value="score">Score</SelectItem>
-            <SelectItem value="duration">Duration</SelectItem>
-            <SelectItem value="views">Views</SelectItem>
-            <SelectItem value="title">Title</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={uploadChannel} onValueChange={setUploadChannel}>
-          <SelectTrigger className="w-[170px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__auto__">Upload: Workspace channel</SelectItem>
-            <SelectItem value="__autoroute__">Upload: Auto route</SelectItem>
-            {channels.map(([key, value]) => {
-              const plat = (value as { platform?: string }).platform ?? 'youtube'
-              const tag = plat === 'youtube' ? '' : ` [${plat.toUpperCase()}]`
-              return (
-                <SelectItem key={key} value={key}>
-                  Upload: {value.name ?? key}{tag}
-                </SelectItem>
-              )
-            })}
-          </SelectContent>
-        </Select>
+      <div className="inline-flex rounded-lg border bg-muted/20 p-1">
         <Button
           size="sm"
-          variant={latestOnly ? 'default' : 'outline'}
-          className="h-9 text-xs"
-          onClick={() => setLatestOnly((v) => !v)}
-          disabled={(pipeline?.completed_clip_ids?.length ?? 0) === 0}
-          title={latestOnly ? 'Showing most recent pipeline outputs' : 'Filter to most recent pipeline outputs'}
+          variant={studioView === 'clips' ? 'default' : 'ghost'}
+          className="h-8 px-3"
+          onClick={() => setStudioView('clips')}
         >
-          Latest run
+          Clips
         </Button>
-        <div className="ml-auto flex items-center gap-3">
-          {learnStatus && (
-            <span className="text-[11px] text-muted-foreground">
-              Scoring: {learnStatus.learned ? `learned (${learnStatus.sample_count} samples)` : 'defaults'}
-            </span>
-          )}
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs gap-1"
-            onClick={handleRetrain}
-            disabled={retraining}
-          >
-            {retraining ? <Loader2 className="size-3 animate-spin" /> : <Brain className="size-3" />}
-            Retrain
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs gap-1"
-            onClick={handleOpenOutputFolder}
-          >
-            <FolderOpen className="size-3" />
-            Output
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs gap-1"
-            onClick={() => setCropsOpen(true)}
-            disabled={clips.length === 0}
-            title="Calibrate facecam + HUD crops per streamer (used by Fill portrait layout)"
-          >
-            <Crop className="size-3" />
-            Crops
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs gap-1"
-            onClick={handleResync}
-            disabled={resyncing}
-          >
-            {resyncing ? <Loader2 className="size-3 animate-spin" /> : <Wrench className="size-3" />}
-            Reindex
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            {filteredClips.length} clip{filteredClips.length !== 1 ? 's' : ''}
-          </span>
-        </div>
+        <Button
+          size="sm"
+          variant={studioView === 'compilations' ? 'default' : 'ghost'}
+          className="h-8 px-3"
+          onClick={() => setStudioView('compilations')}
+        >
+          Compilations
+        </Button>
       </div>
 
-      {/* Card grid */}
-      {loading ? (
-        <div className="flex items-center justify-center py-20">
-          <Loader2 className="size-6 animate-spin text-muted-foreground" />
-        </div>
-      ) : filteredClips.length === 0 ? (
-        <div className="py-10 text-center space-y-3">
-          <p className="text-sm text-muted-foreground">No clips match your filters.</p>
-          <Button variant="outline" size="sm" onClick={handleResync} disabled={resyncing}>
-            {resyncing ? <Loader2 className="size-4 animate-spin mr-1" /> : <Wrench className="size-4 mr-1" />}
-            Reindex Output Folder
-          </Button>
-        </div>
-      ) : (
+      {studioView === 'clips' ? (
         <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredClips.map((clip) => (
-              <StudioCard
-                key={clip.id}
-                clip={clip}
-                uploadStatus={uploadStatuses[clip.id] ?? 'idle'}
-                isPlaying={playingClipId === clip.id}
-                onPlay={() => setPlayingClipId(playingClipId === clip.id ? null : clip.id)}
-                onStopPlay={() => setPlayingClipId(null)}
-                onUpload={() => handleUpload(clip)}
-                onPublish={() => handlePublish(clip.id)}
-                onEdit={() => setEditingClip(clip)}
-                onReveal={() => openOutputClip(clip.id).catch((err) => toast.error(err instanceof Error ? err.message : 'Reveal failed'))}
-                onSubtitles={() => setSubtitleClip(clip)}
-              />
-            ))}
+          {/* Filters */}
+          <div className="flex flex-wrap items-center gap-3">
+            <Input
+              placeholder="Filter by game..."
+              value={gameFilter}
+              onChange={(e) => setGameFilter(e.target.value)}
+              className="max-w-[180px]"
+            />
+            <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as TypeFilter)}>
+              <SelectTrigger className="w-[140px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All types</SelectItem>
+                <SelectItem value="shorts">Shorts</SelectItem>
+                <SelectItem value="landscape">Landscape</SelectItem>
+                <SelectItem value="compilation">Compilation</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
+              <SelectTrigger className="w-[140px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All status</SelectItem>
+                <SelectItem value="ready">Ready</SelectItem>
+                <SelectItem value="uploaded">Uploaded</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={sortBy} onValueChange={setSortBy}>
+              <SelectTrigger className="w-[130px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="recent">Recent</SelectItem>
+                <SelectItem value="score">Score</SelectItem>
+                <SelectItem value="duration">Duration</SelectItem>
+                <SelectItem value="views">Views</SelectItem>
+                <SelectItem value="title">Title</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={uploadChannel} onValueChange={setUploadChannel}>
+              <SelectTrigger className="w-[170px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__auto__">Upload: Workspace channel</SelectItem>
+                <SelectItem value="__autoroute__">Upload: Auto route</SelectItem>
+                {channels.map(([key, value]) => {
+                  const plat = (value as { platform?: string }).platform ?? 'youtube'
+                  const tag = plat === 'youtube' ? '' : ` [${plat.toUpperCase()}]`
+                  return (
+                    <SelectItem key={key} value={key}>
+                      Upload: {value.name ?? key}{tag}
+                    </SelectItem>
+                  )
+                })}
+              </SelectContent>
+            </Select>
+            <Button
+              size="sm"
+              variant={latestOnly ? 'default' : 'outline'}
+              className="h-9 text-xs"
+              onClick={() => setLatestOnly((v) => !v)}
+              disabled={(pipeline?.completed_clip_ids?.length ?? 0) === 0}
+              title={latestOnly ? 'Showing most recent pipeline outputs' : 'Filter to most recent pipeline outputs'}
+            >
+              Latest run
+            </Button>
+            <div className="ml-auto flex items-center gap-3">
+              {learnStatus && (
+                <span className="text-[11px] text-muted-foreground">
+                  Scoring: {learnStatus.learned ? `learned (${learnStatus.sample_count} samples)` : 'defaults'}
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1"
+                onClick={handleRetrain}
+                disabled={retraining}
+              >
+                {retraining ? <Loader2 className="size-3 animate-spin" /> : <Brain className="size-3" />}
+                Retrain
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1"
+                onClick={handleOpenOutputFolder}
+              >
+                <FolderOpen className="size-3" />
+                Output
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1"
+                onClick={() => setCropsOpen(true)}
+                disabled={clips.length === 0}
+                title="Calibrate facecam + HUD crops per streamer (used by Fill portrait layout)"
+              >
+                <Crop className="size-3" />
+                Crops
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1"
+                onClick={handleResync}
+                disabled={resyncing}
+              >
+                {resyncing ? <Loader2 className="size-3 animate-spin" /> : <Wrench className="size-3" />}
+                Reindex
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {filteredClips.length} clip{filteredClips.length !== 1 ? 's' : ''}
+              </span>
+            </div>
           </div>
-          {filteredClips.length >= limit && (
-            <div className="flex justify-center pt-4">
-              <Button variant="outline" onClick={() => setLimit(l => l + 50)}>
-                Load more
+
+          {/* Card grid */}
+          {loading ? (
+            <div className="flex items-center justify-center py-20">
+              <Loader2 className="size-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : filteredClips.length === 0 ? (
+            <div className="py-10 text-center space-y-3">
+              <p className="text-sm text-muted-foreground">No clips match your filters.</p>
+              <Button variant="outline" size="sm" onClick={handleResync} disabled={resyncing}>
+                {resyncing ? <Loader2 className="size-4 animate-spin mr-1" /> : <Wrench className="size-4 mr-1" />}
+                Reindex Output Folder
               </Button>
             </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredClips.map((clip) => (
+                  <StudioCard
+                    key={clip.id}
+                    clip={clip}
+                    uploadStatus={uploadStatuses[clip.id] ?? 'idle'}
+                    isPlaying={playingClipId === clip.id}
+                    onPlay={() => setPlayingClipId(playingClipId === clip.id ? null : clip.id)}
+                    onStopPlay={() => setPlayingClipId(null)}
+                    onUpload={() => handleUpload(clip)}
+                    onPublish={() => handlePublish(clip.id)}
+                    onEdit={() => setEditingClip(clip)}
+                    onRequeue={() => handleRequeue(clip.id)}
+                    onReveal={() => openOutputClip(clip.id).catch((err) => toast.error(err instanceof Error ? err.message : 'Reveal failed'))}
+                    onSubtitles={() => setSubtitleClip(clip)}
+                  />
+                ))}
+              </div>
+              {filteredClips.length >= limit && (
+                <div className="flex justify-center pt-4">
+                  <Button variant="outline" onClick={() => setLimit(l => l + 50)}>
+                    Load more
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </>
+      ) : (
+        <div className="space-y-3">
+          <div className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+            Build compilations from landscape clips with subtitles. Final render includes streamer name + rank numbering overlays.
+          </div>
+          <CompilationBuilder />
+        </div>
       )}
 
       {/* Metadata sheet */}
-      {editingClip && (
+      {studioView === 'clips' && editingClip && (
         <MetadataSheet
           clip={editingClip}
           open={!!editingClip}
@@ -428,9 +473,11 @@ export function StudioPage() {
         />
       )}
 
-      <CropProfilesDialog open={cropsOpen} onOpenChange={setCropsOpen} clips={clips} />
+      {studioView === 'clips' && (
+        <CropProfilesDialog open={cropsOpen} onOpenChange={setCropsOpen} clips={clips} />
+      )}
 
-      {subtitleClip && (
+      {studioView === 'clips' && subtitleClip && (
         <SubtitleEditorDialog
           open={!!subtitleClip}
           onOpenChange={(open) => { if (!open) setSubtitleClip(null) }}
@@ -452,6 +499,7 @@ const StudioCard = memo(function StudioCard({
   onUpload,
   onPublish,
   onEdit,
+  onRequeue,
   onReveal,
   onSubtitles,
 }: {
@@ -463,6 +511,7 @@ const StudioCard = memo(function StudioCard({
   onUpload: () => void
   onPublish: () => void
   onEdit: () => void
+  onRequeue: () => void
   onReveal: () => void
   onSubtitles: () => void
 }) {
@@ -673,6 +722,18 @@ const StudioCard = memo(function StudioCard({
             <Pencil className="size-3" />
             Edit
           </Button>
+          {!clip.clip_count && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs gap-1"
+              onClick={onRequeue}
+              title="Send this clip back to pending review so it can be reprocessed"
+            >
+              <RefreshCw className="size-3" />
+              Requeue
+            </Button>
+          )}
           {(clip.is_shorts || clip._subtitle_path) && (
             <Button
               size="sm"

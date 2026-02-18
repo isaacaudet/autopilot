@@ -33,7 +33,7 @@ import { useChannelScope } from '@/hooks/useChannelScope'
 import { CropProfilesDialog } from '@/components/CropProfilesDialog'
 
 /* ------------------------------------------------------------------ */
-/*  Per-clip title / hook overrides (not crop — those live in dialog)  */
+/*  Per-clip title / hook / trim overrides (crop lives in dialog)       */
 /* ------------------------------------------------------------------ */
 
 interface TitleOverrides {
@@ -41,15 +41,40 @@ interface TitleOverrides {
   hookText: string
 }
 
+interface TrimOverrides {
+  trimStart: number
+  trimEnd: number
+}
+
 function defaultTitleOverrides(clip: ClipMeta): TitleOverrides {
   return {
-    title: clip._analysis?.title_variants?.[0] ?? clip.title ?? '',
-    hookText: clip._analysis?.hook_text ?? '',
+    title: clip._title_override ?? clip._analysis?.title_variants?.[0] ?? clip.title ?? '',
+    hookText: clip._hook_text_override ?? clip._analysis?.hook_text ?? '',
+  }
+}
+
+function defaultTrimOverrides(clip: ClipMeta): TrimOverrides {
+  const rawStart = Number(clip._trim_start ?? 0)
+  const rawEnd = Number(clip._trim_end ?? 0)
+  const duration = Math.max(0, Number(clip.duration || 0))
+  const trimStart = Math.max(0, Number.isFinite(rawStart) ? rawStart : 0)
+  const maxEnd = Math.max(0, duration - trimStart - 0.2)
+  const trimEnd = Math.max(0, Math.min(maxEnd, Number.isFinite(rawEnd) ? rawEnd : 0))
+  return {
+    trimStart: Math.round(trimStart * 100) / 100,
+    trimEnd: Math.round(trimEnd * 100) / 100,
   }
 }
 
 function clipThumb(clip: ClipMeta): string {
   return clip.thumbnail_url || thumbnailUrl(clip.id)
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Number.isFinite(seconds) ? seconds : 0)
+  const mins = Math.floor(total / 60)
+  const secs = Math.floor(total % 60)
+  return `${mins}:${secs.toString().padStart(2, '0')}`
 }
 
 /* ------------------------------------------------------------------ */
@@ -67,6 +92,7 @@ export function EditPage() {
 
   // Title / hook per clip
   const [titleMap, setTitleMap] = useState<Record<string, TitleOverrides>>({})
+  const [trimMap, setTrimMap] = useState<Record<string, TrimOverrides>>({})
 
   // Layout mode
   const [shortsLayout, setShortsLayout] = useState<'blur' | 'fill'>(() => {
@@ -111,9 +137,28 @@ export function EditPage() {
     })
   }, [clips])
 
+  useEffect(() => {
+    if (clips.length === 0) return
+    setTrimMap((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const clip of clips) {
+        if (!next[clip.id]) {
+          next[clip.id] = defaultTrimOverrides(clip)
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [clips])
+
   // ── Derived ──
   const currentClip = clips[currentIndex] ?? null
   const titleOv = currentClip ? (titleMap[currentClip.id] ?? defaultTitleOverrides(currentClip)) : null
+  const trimOv = currentClip ? (trimMap[currentClip.id] ?? defaultTrimOverrides(currentClip)) : null
+  const trimmedDuration = currentClip && trimOv
+    ? Math.max(0, Number(currentClip.duration || 0) - trimOv.trimStart - trimOv.trimEnd)
+    : 0
   const confirmedSet = useMemo(() => new Set(confirmedClipIds), [confirmedClipIds])
   const clipIds = useMemo(() => clips.map((c) => c.id), [clips])
   const isFill = shortsLayout === 'fill'
@@ -128,6 +173,39 @@ export function EditPage() {
   // ── Handlers ──
   function updateTitle(clipId: string, key: keyof TitleOverrides, value: string) {
     setTitleMap((prev) => ({ ...prev, [clipId]: { ...prev[clipId], [key]: value } }))
+  }
+
+  function updateTrim(clipId: string, key: keyof TrimOverrides, rawValue: number) {
+    setTrimMap((prev) => {
+      const clip = clips.find((c) => c.id === clipId)
+      if (!clip) return prev
+      const duration = Math.max(0, Number(clip.duration || 0))
+      const current = prev[clipId] ?? defaultTrimOverrides(clip)
+      let trimStart = Math.max(0, Number.isFinite(current.trimStart) ? current.trimStart : 0)
+      let trimEnd = Math.max(0, Number.isFinite(current.trimEnd) ? current.trimEnd : 0)
+      const nextRaw = Math.max(0, Number.isFinite(rawValue) ? rawValue : 0)
+
+      if (key === 'trimStart') {
+        trimStart = Math.min(nextRaw, Math.max(0, duration - trimEnd - 0.2))
+      } else {
+        trimEnd = Math.min(nextRaw, Math.max(0, duration - trimStart - 0.2))
+      }
+
+      if (trimStart + trimEnd > Math.max(0, duration - 0.2)) {
+        if (key === 'trimStart') {
+          trimEnd = Math.max(0, duration - trimStart - 0.2)
+        } else {
+          trimStart = Math.max(0, duration - trimEnd - 0.2)
+        }
+      }
+
+      const next: TrimOverrides = {
+        trimStart: Math.round(trimStart * 100) / 100,
+        trimEnd: Math.round(trimEnd * 100) / 100,
+      }
+      if (current.trimStart === next.trimStart && current.trimEnd === next.trimEnd) return prev
+      return { ...prev, [clipId]: next }
+    })
   }
 
   function go(idx: number) {
@@ -159,6 +237,7 @@ export function EditPage() {
       return prev
     })
     setTitleMap(prev => { const n = { ...prev }; delete n[clipId]; return n })
+    setTrimMap(prev => { const n = { ...prev }; delete n[clipId]; return n })
     setClipOverrides(prev => { const n = { ...prev }; delete n[clipId]; return n })
     setConfirmedClipIds(prev => prev.filter(id => id !== clipId))
     toast.success('Clip skipped')
@@ -174,10 +253,15 @@ export function EditPage() {
       for (const clip of clips) {
         const cropOv = clipOverrides[clip.id]
         const tOv = titleMap[clip.id]
+        const trimOv = trimMap[clip.id] ?? defaultTrimOverrides(clip)
+        const titleOverride = String(tOv?.title ?? '').trim()
+        const hookOverride = String(tOv?.hookText ?? '').trim()
         mergedOverrides[clip.id] = {
           ...(cropOv ?? {}),
-          ...(tOv?.title ? { _title_override: tOv.title } : {}),
-          ...(tOv?.hookText ? { _hook_text_override: tOv.hookText } : {}),
+          _title_override: titleOverride,
+          _hook_text_override: hookOverride,
+          _trim_start: Math.max(0, Number(trimOv.trimStart || 0)),
+          _trim_end: Math.max(0, Number(trimOv.trimEnd || 0)),
         }
       }
       await approveProcess(clipIds, 'shorts', targetChannel, shortsLayout, mergedOverrides)
@@ -302,7 +386,7 @@ export function EditPage() {
       </div>
 
       {/* ── Main Panel ── */}
-      {currentClip && titleOv && (
+      {currentClip && titleOv && trimOv && (
         <div className="grid gap-5 lg:grid-cols-[1fr_380px]">
           {/* Left — Large thumbnail */}
           <div className="space-y-3">
@@ -429,6 +513,44 @@ export function EditPage() {
               />
             </div>
 
+            {/* Trim */}
+            <div className="rounded-xl border bg-card/50 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
+                  Trim
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Result: {formatDuration(trimmedDuration)}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <div className="text-[11px] text-muted-foreground">Start cut (s)</div>
+                  <Input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    max={Math.max(0, Number(currentClip.duration || 0) - trimOv.trimEnd - 0.2)}
+                    value={trimOv.trimStart}
+                    onChange={(e) => updateTrim(currentClip.id, 'trimStart', Number.parseFloat(e.target.value))}
+                    className="text-sm"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-[11px] text-muted-foreground">End cut (s)</div>
+                  <Input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    max={Math.max(0, Number(currentClip.duration || 0) - trimOv.trimStart - 0.2)}
+                    value={trimOv.trimEnd}
+                    onChange={(e) => updateTrim(currentClip.id, 'trimEnd', Number.parseFloat(e.target.value))}
+                    className="text-sm"
+                  />
+                </div>
+              </div>
+            </div>
+
             {/* Clip info */}
             <div className="rounded-xl border bg-card/50 p-4 space-y-2">
               <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground">
@@ -441,7 +563,8 @@ export function EditPage() {
                 </span>
                 <span className="text-muted-foreground">Duration</span>
                 <span className="text-right tabular-nums">
-                  {Math.floor(currentClip.duration / 60)}:{Math.floor(currentClip.duration % 60).toString().padStart(2, '0')}
+                  {formatDuration(Number(currentClip.duration || 0))}
+                  {(trimOv.trimStart > 0 || trimOv.trimEnd > 0) ? ` → ${formatDuration(trimmedDuration)}` : ''}
                 </span>
                 {currentClip._analysis?.category && (
                   <>

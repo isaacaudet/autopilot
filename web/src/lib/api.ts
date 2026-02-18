@@ -1,4 +1,4 @@
-import type { ClipMeta, ConfigData, FetchScoreResponse, Release } from './types'
+import type { BestPicksResponse, ClipMeta, ConfigData, FetchScoreResponse, Release } from './types'
 
 const BASE = ''
 
@@ -90,6 +90,25 @@ export async function fetchScore(
   return res.json()
 }
 
+export async function fetchBestPicks(
+  opts?: {
+    period?: '24h' | '3d' | '7d' | 'since_last_output'
+    game?: string
+    channel?: string
+    limit?: number
+  },
+): Promise<BestPicksResponse> {
+  const params = new URLSearchParams()
+  params.set('period', opts?.period ?? '24h')
+  params.set('limit', String(Math.max(1, Math.min(3, opts?.limit ?? 3))))
+  if (opts?.game) params.set('game', opts.game)
+  if (opts?.channel && opts.channel !== 'all') params.set('channel', opts.channel)
+
+  const res = await fetch(`${BASE}/api/insights/best-picks?${params}`)
+  if (!res.ok) throw new Error(`Best picks failed: ${res.status}`)
+  return res.json()
+}
+
 export async function approveProcess(
   clipIds: string[],
   recipe: string,
@@ -177,6 +196,16 @@ export async function updateClip(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
   })
+}
+
+export async function requeueClip(clipId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}/requeue`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Requeue failed: ${res.status}` }))
+    throw new Error(err.detail || `Requeue failed: ${res.status}`)
+  }
 }
 
 export async function updateClipMetadata(
@@ -316,6 +345,31 @@ export async function removeLayoutProfile(streamer: string): Promise<void> {
     method: 'DELETE',
   })
   if (!res.ok) throw new Error(`Delete failed: ${res.status}`)
+}
+
+export async function fetchLayoutPreviewFrame(
+  clipId: string,
+  profile: LayoutProfile,
+  opts?: {
+    source?: boolean
+    at?: number | null
+  },
+): Promise<Blob> {
+  const params = new URLSearchParams()
+  if (opts?.source ?? true) params.set('source', 'true')
+  if (opts?.at != null) params.set('at', String(opts.at))
+  const qs = params.toString()
+  const url = `${BASE}/api/clips/${encodeURIComponent(clipId)}/layout-preview${qs ? `?${qs}` : ''}`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Layout preview failed: ${res.status}` }))
+    throw new Error(err.detail || `Layout preview failed: ${res.status}`)
+  }
+  return res.blob()
 }
 
 export async function regenerateThumbnail(clipId: string): Promise<void> {
@@ -472,14 +526,28 @@ export async function startAutopilot(opts?: {
   count?: number
   min_score?: number
   channel?: string | null
+  auto_upload?: boolean
+  privacy?: 'unlisted' | 'private' | 'public'
+  game?: string
+  period?: string
+  scope?: 'gamewide' | 'configured' | 'selected'
+  streamers?: string[]
+  daily_limit?: number
 }): Promise<{ status: string }> {
   const res = await fetch(`${BASE}/api/autopilot/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      count: opts?.count ?? 5,
-      min_score: opts?.min_score ?? 40,
-      channel: opts?.channel ?? null,
+      count: opts?.count ?? 8,
+      min_score: opts?.min_score ?? 45,
+      channel: opts?.channel ?? 'default',
+      auto_upload: opts?.auto_upload ?? true,
+      privacy: opts?.privacy ?? 'private',
+      game: opts?.game ?? 'Deadlock',
+      period: opts?.period ?? '24h',
+      scope: opts?.scope ?? 'gamewide',
+      streamers: opts?.streamers ?? null,
+      daily_limit: opts?.daily_limit ?? null,
     }),
   })
   if (!res.ok) {

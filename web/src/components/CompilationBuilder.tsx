@@ -22,7 +22,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
-  fetchCompilations, fetchCompilationClips, buildCompilation,
+  fetchStudioClips, buildCompilation,
   uploadClip, publishVideos, updateClip, thumbnailUrl, videoUrl,
 } from '@/lib/api'
 import { usePipeline } from '@/hooks/usePipeline'
@@ -39,6 +39,22 @@ const DURATION_TIERS = [
 ]
 
 type Phase = 'select' | 'order' | 'building'
+
+const STUDIO_FETCH_LIMIT = 1000
+
+function isCompilationClip(clip: ClipMeta): boolean {
+  return Boolean((clip.clip_count ?? 0) > 0) || clip.id.startsWith('compilation_')
+}
+
+function isCompilationCandidate(clip: ClipMeta): boolean {
+  // Compilation requires landscape source + subtitle track.
+  return (
+    !isCompilationClip(clip)
+    && !clip.is_shorts
+    && Boolean(clip.processed_path)
+    && Boolean(clip._subtitle_path)
+  )
+}
 
 export function CompilationBuilder() {
   const [tab, setTab] = useState<'ready' | 'build'>('ready')
@@ -63,13 +79,37 @@ export function CompilationBuilder() {
 
 function CompilationReadyList() {
   const [compilations, setCompilations] = useState<ClipMeta[]>([])
+  const [fallbackAllChannels, setFallbackAllChannels] = useState(false)
   const [previewClip, setPreviewClip] = useState<ClipMeta | null>(null)
   const [editingClip, setEditingClip] = useState<ClipMeta | null>(null)
   const [uploadingIds, setUploadingIds] = useState<Set<string>>(new Set())
   const { channel: workspaceChannel } = useChannelScope()
 
-  function load() {
-    fetchCompilations(workspaceChannel).then(setCompilations).catch(() => {})
+  async function load() {
+    try {
+      const channelFilter = workspaceChannel !== 'all' ? workspaceChannel : undefined
+      const clips = await fetchStudioClips({
+        sort: 'recent',
+        limit: STUDIO_FETCH_LIMIT,
+        channel: channelFilter,
+      })
+      let comps = clips.filter(isCompilationClip)
+
+      if (comps.length === 0 && workspaceChannel !== 'all') {
+        const allClips = await fetchStudioClips({
+          sort: 'recent',
+          limit: STUDIO_FETCH_LIMIT,
+        })
+        comps = allClips.filter(isCompilationClip)
+        setFallbackAllChannels(comps.length > 0)
+      } else {
+        setFallbackAllChannels(false)
+      }
+
+      setCompilations(comps)
+    } catch {
+      // ignore fetch errors in list view
+    }
   }
 
   useEffect(() => { load() }, [workspaceChannel])
@@ -111,6 +151,11 @@ function CompilationReadyList() {
 
   return (
     <>
+      {fallbackAllChannels && (
+        <p className="text-xs text-muted-foreground mb-3">
+          No compilations found in this workspace channel. Showing latest compilations from all channels.
+        </p>
+      )}
       <div className="space-y-3">
         {compilations.map((comp) => {
           const isUploading = uploadingIds.has(comp.id)
@@ -439,6 +484,7 @@ function CompilationBuildFlow() {
   const [playingId, setPlayingId] = useState<string | null>(null)
   const [ordered, setOrdered] = useState<ClipMeta[]>([])
   const [title, setTitle] = useState('')
+  const [numberingMode, setNumberingMode] = useState<'countdown' | 'ascending'>('countdown')
   const [search, setSearch] = useState('')
   const [gameFilter, setGameFilter] = useState('')
   const [sortBy] = useState<'score' | 'date'>('score')
@@ -446,7 +492,17 @@ function CompilationBuildFlow() {
   const { channel: workspaceChannel } = useChannelScope()
 
   useEffect(() => {
-    fetchCompilationClips(workspaceChannel).then(setAvailable).catch(() => {})
+    fetchStudioClips({
+      sort: 'score',
+      limit: STUDIO_FETCH_LIMIT,
+      channel: workspaceChannel !== 'all' ? workspaceChannel : undefined,
+    })
+      .then((clips) => {
+        const candidates = clips.filter(isCompilationCandidate)
+        candidates.sort((a, b) => (b._score ?? 0) - (a._score ?? 0))
+        setAvailable(candidates)
+      })
+      .catch(() => {})
   }, [workspaceChannel])
 
   const approve = useCallback((id: string) => {
@@ -522,7 +578,12 @@ function CompilationBuildFlow() {
     setPhase('building')
     try {
       const targetChannel = workspaceChannel === 'all' ? null : workspaceChannel
-      await buildCompilation(ordered.map((c) => c.id), title || undefined, true, targetChannel)
+      await buildCompilation(
+        ordered.map((c) => c.id),
+        title || undefined,
+        numberingMode === 'countdown',
+        targetChannel,
+      )
       toast.success('Compilation build started')
     } catch {
       toast.error('Failed to start compilation')
@@ -662,6 +723,16 @@ function CompilationBuildFlow() {
             onChange={(e) => setTitle(e.target.value)}
             className="max-w-sm"
           />
+          <select
+            value={numberingMode}
+            onChange={(e) => setNumberingMode(e.target.value as 'countdown' | 'ascending')}
+            className="h-9 rounded-md border bg-background px-3 text-sm text-foreground"
+            aria-label="Numbering mode"
+            title="Numbering mode for streamer overlay labels"
+          >
+            <option value="countdown">Numbering: Countdown (#N to #1)</option>
+            <option value="ascending">Numbering: Ascending (#1 to #N)</option>
+          </select>
           <Button onClick={handleBuild} disabled={ordered.length < 2}>
             Build Compilation
           </Button>
@@ -673,6 +744,9 @@ function CompilationBuildFlow() {
   // Select phase
   return (
     <div className="space-y-4">
+      <div className="rounded-md border border-dashed bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+        Eligible clips: landscape output with subtitle tracks. Compilation render adds streamer + rank overlays.
+      </div>
       {/* Duration picker */}
       {filtered.length > 0 && (
         <div className="space-y-2">

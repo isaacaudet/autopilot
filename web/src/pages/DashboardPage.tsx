@@ -66,8 +66,8 @@ export function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [dialogRecipe, setDialogRecipe] = useState<string | undefined>()
-  const [autopilotCount, setAutopilotCount] = useState(5)
-  const [autopilotMinScore, setAutopilotMinScore] = useState(40)
+  const [autopilotCount, setAutopilotCount] = useState(8)
+  const [autopilotMinScore, setAutopilotMinScore] = useState(45)
   const [autopilotLoading, setAutopilotLoading] = useState(false)
   const [resyncing, setResyncing] = useState(false)
   const { state: pipeline } = usePipeline()
@@ -121,8 +121,15 @@ export function DashboardPage() {
   async function handleAutopilot() {
     setAutopilotLoading(true)
     try {
-      const targetChannel = channel === 'all' ? null : channel
-      await startAutopilot({ count: autopilotCount, min_score: autopilotMinScore, channel: targetChannel })
+      const targetChannel = channel === 'all' ? 'default' : channel
+      await startAutopilot({
+        count: autopilotCount,
+        min_score: autopilotMinScore,
+        channel: targetChannel,
+        game: 'Deadlock',
+        auto_upload: true,
+        privacy: 'private',
+      })
       toast.success('Autopilot started')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Autopilot failed to start')

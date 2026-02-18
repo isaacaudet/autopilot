@@ -368,6 +368,10 @@ def generate_hook_text(clip: dict) -> str:
     Returns short, punchy text like "INSANE ACE" or "WATCH THIS".
     Prefers LLM hook_text, falls back to best_quote, then keyword extraction.
     """
+    override = clip.get("_hook_text_override")
+    if override:
+        return override.upper()
+
     analysis = clip.get("_analysis", {})
 
     # LLM hook_text takes top priority (purpose-built for overlay)

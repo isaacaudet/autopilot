@@ -8,11 +8,13 @@ from rich.console import Console
 console = Console()
 
 DEFAULT_WEIGHTS = {
-    "duration": 25,
-    "velocity": 35,
-    "keywords": 15,
-    "recency": 5,
-    "audio": 20,
+    "duration": 18,
+    "velocity": 32,
+    "views": 22,
+    "keywords": 10,
+    "recency": 10,
+    "audio": 6,
+    "llm": 2,
 }
 
 _MIN_SAMPLES = 20
@@ -81,6 +83,9 @@ def collect_performance(config: dict, min_age_hours: float = 48) -> int:
         features = {
             "duration_sec": clip.get("duration", 0),
             "velocity": views / age_h,
+            "source_views": views,
+            "age_hours": age_h,
+            "streamer": clip.get("streamer", ""),
             "has_strong_keyword": has_strong,
             "has_moderate_keyword": has_moderate,
             "audio_energy_db": clip.get("_audio_energy_db", 0),
@@ -143,23 +148,53 @@ def train_weights(config: dict) -> dict | None:
         )
         return None
 
-    # Target: YouTube views at collection time
-    target = [e["youtube"]["views"] for e in perf_data]
+    # Target: log-transformed YouTube views at collection time.
+    # This reduces outlier domination from a few extreme hits.
+    target = [math.log1p(max(0.0, float((e.get("youtube") or {}).get("views", 0)))) for e in perf_data]
+
+    def _feature(entry: dict, key: str, default=0.0) -> float:
+        return float((entry.get("features") or {}).get(key, default) or default)
+
+    source_views: list[float] = []
+    age_hours: list[float] = []
+    velocities: list[float] = []
+
+    for e in perf_data:
+        vel = max(0.0, _feature(e, "velocity", 0.0))
+        age = max(0.0, _feature(e, "age_hours", 0.0))
+        src = max(0.0, _feature(e, "source_views", 0.0))
+
+        # Backfill historical entries collected before these fields existed.
+        if src <= 0 and vel > 0 and age > 0:
+            src = vel * age
+        if age <= 0 and vel > 0 and src > 0:
+            age = src / vel
+        if age <= 0:
+            age = 24.0
+
+        source_views.append(src)
+        age_hours.append(age)
+        velocities.append(vel)
 
     # Feature vectors
     features = {
-        "duration": [e["features"]["duration_sec"] for e in perf_data],
-        "velocity": [e["features"]["velocity"] for e in perf_data],
+        "duration": [_feature(e, "duration_sec", 0.0) for e in perf_data],
+        "velocity": velocities,
+        "views": source_views,
         "keywords": [
-            (1.0 if e["features"]["has_strong_keyword"] else 0.5 if e["features"]["has_moderate_keyword"] else 0.0)
+            (
+                1.0
+                if (e.get("features") or {}).get("has_strong_keyword")
+                else 0.5 if (e.get("features") or {}).get("has_moderate_keyword") else 0.0
+            )
             for e in perf_data
         ],
-        "recency": [1.0 / max(1.0, e["features"]["velocity"]) for e in perf_data],  # inverse proxy
-        "audio": [e["features"].get("audio_energy_db", 0) for e in perf_data],
+        "recency": [1.0 / max(1.0, age) for age in age_hours],
+        "audio": [_feature(e, "audio_energy_db", 0.0) for e in perf_data],
     }
 
     # Add LLM score if enough clips have it
-    llm_scores = [e["features"].get("llm_score", 0) for e in perf_data]
+    llm_scores = [_feature(e, "llm_score", 0.0) for e in perf_data]
     if sum(1 for s in llm_scores if s > 0) >= _MIN_SAMPLES * 0.5:
         features["llm"] = llm_scores
 

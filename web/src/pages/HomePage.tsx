@@ -15,17 +15,20 @@ import {
 import {
   Activity,
   Calendar,
+  ExternalLink,
   Film,
   ListChecks,
   ListVideo,
   Loader2,
   Play,
+  Sparkles,
   Upload,
   X,
   Zap,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  fetchBestPicks,
   fetchConfig,
   fetchQueue,
   fetchReleases,
@@ -71,7 +74,7 @@ export function HomePage() {
   // Shorts workflow state
   const [game, setGame] = useState('')
   const [fetchWindow, setFetchWindow] = useState('24h')
-  const [fetchScope, setFetchScope] = useState<'gamewide' | 'configured' | 'selected'>('configured')
+  const [fetchScope, setFetchScope] = useState<'gamewide' | 'configured' | 'selected'>('gamewide')
   const [selectedStreamers, setSelectedStreamers] = useState<string[]>([])
   const [fetching, setFetching] = useState(false)
 
@@ -79,9 +82,14 @@ export function HomePage() {
   const [compilationOpen, setCompilationOpen] = useState(false)
 
   // Autopilot
-  const [autopilotCount, setAutopilotCount] = useState(5)
-  const [autopilotMinScore, setAutopilotMinScore] = useState(40)
+  const [autopilotCount, setAutopilotCount] = useState(8)
+  const [autopilotMinScore, setAutopilotMinScore] = useState(45)
   const [autopilotLoading, setAutopilotLoading] = useState(false)
+  const [bestWindow, setBestWindow] = useState<'24h' | '3d' | '7d' | 'since_last_output'>('24h')
+  const [bestGame, setBestGame] = useState('__all__')
+  const [bestPicksLoading, setBestPicksLoading] = useState(false)
+  const [bestPicks, setBestPicks] = useState<ClipMeta[]>([])
+  const [bestCandidateCount, setBestCandidateCount] = useState(0)
 
   const isRunning = pipeline?.running === true
   const activeWorkers = useMemo(
@@ -130,6 +138,37 @@ export function HomePage() {
     load().catch(() => {})
   }, [channel])
 
+  useEffect(() => {
+    let cancelled = false
+    async function loadBestPicks() {
+      setBestPicksLoading(true)
+      try {
+        const channelKey = channel !== 'all' ? channel : undefined
+        const gameFilter = bestGame === '__all__' ? undefined : bestGame
+        const data = await fetchBestPicks({
+          period: bestWindow,
+          game: gameFilter,
+          channel: channelKey,
+          limit: 3,
+        })
+        if (cancelled) return
+        setBestPicks(data.picks ?? [])
+        setBestCandidateCount(data.candidate_count ?? 0)
+      } catch {
+        if (!cancelled) {
+          setBestPicks([])
+          setBestCandidateCount(0)
+        }
+      } finally {
+        if (!cancelled) setBestPicksLoading(false)
+      }
+    }
+    loadBestPicks().catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [channel, bestWindow, bestGame])
+
   async function handleFetchScore() {
     if (!game) return
     setFetching(true)
@@ -153,11 +192,14 @@ export function HomePage() {
   async function handleAutopilot() {
     setAutopilotLoading(true)
     try {
-      const targetChannel = channel === 'all' ? null : channel
+      const targetChannel = channel === 'all' ? 'default' : channel
       await startAutopilot({
         count: autopilotCount,
         min_score: autopilotMinScore,
         channel: targetChannel,
+        game: 'Deadlock',
+        auto_upload: true,
+        privacy: 'private',
       })
       toast.success('Autopilot started')
       navigate('/pipeline')
@@ -426,6 +468,105 @@ export function HomePage() {
                   Run Autopilot
                 </Button>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="hover:border-primary/20 transition-colors">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Sparkles className="size-4 text-primary" />
+                Best Clip Picks
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Top 1-3 predicted winners for this window.
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Window</label>
+                  <Select
+                    value={bestWindow}
+                    onValueChange={(v) => setBestWindow(v as '24h' | '3d' | '7d' | 'since_last_output')}
+                  >
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="24h">Last 24h</SelectItem>
+                      <SelectItem value="3d">Last 3 days</SelectItem>
+                      <SelectItem value="7d">Last 7 days</SelectItem>
+                      <SelectItem value="since_last_output">Since last output</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">Category</label>
+                  <Select value={bestGame} onValueChange={setBestGame}>
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__all__">All games</SelectItem>
+                      {games.map((g) => (
+                        <SelectItem key={g} value={g}>
+                          {g}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-muted-foreground">
+                {bestCandidateCount.toLocaleString()} candidate clips ranked
+              </div>
+
+              {bestPicksLoading ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  Ranking picks...
+                </div>
+              ) : bestPicks.length === 0 ? (
+                <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+                  No picks found for this window.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {bestPicks.map((clip, idx) => (
+                    <div key={clip.id} className="rounded-md border px-3 py-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-[11px] text-muted-foreground">
+                            #{idx + 1} · {clip.streamer} · {clip.view_count.toLocaleString()} views
+                          </div>
+                          <div className="text-sm leading-tight line-clamp-2">{clip.title}</div>
+                        </div>
+                        <Badge variant="outline" className="font-mono text-[11px]">
+                          {(clip._score ?? 0).toFixed(1)}
+                        </Badge>
+                      </div>
+                      {clip.url && (
+                        <div className="pt-1.5">
+                          <a
+                            href={clip.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline"
+                          >
+                            Open source clip
+                            <ExternalLink className="size-3" />
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <Button variant="outline" size="sm" onClick={() => navigate('/review')}>
+                Open Review
+              </Button>
             </CardContent>
           </Card>
         </div>

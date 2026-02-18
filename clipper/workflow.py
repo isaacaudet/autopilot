@@ -6,6 +6,7 @@ and the web API can import them without circular dependencies.
 
 import json
 import logging
+import math
 import re
 import threading
 from pathlib import Path
@@ -36,7 +37,7 @@ def _process_single_clip(
     from clipper.process.subtitles import transcribe
     from clipper.process.format import format_for_shorts
     from clipper.process.burn import burn_subtitles
-    from clipper.process.trim import trim_dead_air
+    from clipper.process.trim import get_video_duration, trim_dead_air, trim_manual_window
     from clipper.process.titles import generate_hook_text
     from clipper.db import update_clip
 
@@ -63,17 +64,40 @@ def _process_single_clip(
             update_clip(config, clip_name, status="skipped")
             return None
 
-        duration = clip.get("duration", 0)
         force_shorts = clip.get("force_shorts", False)
         shorts_threshold = config["settings"]["shorts_threshold"]
-        is_shorts = not for_compilation and (force_shorts or (duration > 0 and duration <= shorts_threshold))
+
+        trim_start = max(0.0, float(clip.get("_trim_start", 0.0) or 0.0))
+        trim_end = max(0.0, float(clip.get("_trim_end", 0.0) or 0.0))
+        if trim_start > 0.0 or trim_end > 0.0:
+            if state:
+                state.update_worker(worker_label, "trimming")
+            video_path = trim_manual_window(
+                video_path,
+                trim_start=trim_start,
+                trim_end=trim_end,
+                verbose=verbose,
+            )
 
         _TALKING = {"just chatting", "irl", "talk shows & podcasts", "asmr"}
         if clip.get("game", "").lower() in _TALKING:
             video_path = trim_dead_air(video_path, verbose=verbose)
 
+        try:
+            effective_duration = get_video_duration(video_path)
+        except Exception:
+            effective_duration = float(clip.get("duration", 0) or 0.0)
+        if effective_duration > 0:
+            clip["duration"] = round(effective_duration, 2)
+
+        layout = str(clip.get("_shorts_layout") or "").strip().lower()
+        layout_forces_shorts = layout in {"fill", "blur"}
+        is_shorts = not for_compilation and (
+            layout_forces_shorts or force_shorts or (effective_duration > 0 and effective_duration <= shorts_threshold)
+        )
+
         # Smart trim for Shorts clips >40s — trim around peak moment
-        if is_shorts and clip.get("duration", 0) > 40:
+        if is_shorts and effective_duration > 40:
             from clipper.process.trim import find_peak_moment, smart_trim
             if state:
                 state.update_worker(worker_label, "trimming")
@@ -87,7 +111,9 @@ def _process_single_clip(
         # Each thread needs its own config copy for _current_is_shorts
         thread_config = dict(config)
         thread_config["_current_is_shorts"] = is_shorts
-        subtitle_path, transcript_words = transcribe(video_path, thread_config, clip=clip, verbose=verbose)
+        subtitle_path, transcript_words, censor_ranges = transcribe(video_path, thread_config, clip=clip, verbose=verbose)
+        if censor_ranges:
+            clip["censor_ranges"] = censor_ranges
 
         # LLM analysis — gracefully degrades if no API key
         if transcript_words:
@@ -124,8 +150,8 @@ def _process_single_clip(
         output_name = f"{streamer_slug}_{game_slug}_{short_id}" if game_slug else f"{streamer_slug}_{short_id}"
 
         if subtitle_path:
+            clip["_subtitle_path"] = str(subtitle_path)
             if for_compilation:
-                clip["_subtitle_path"] = str(subtitle_path)
                 final_path = video_path
             else:
                 final_path = burn_subtitles(
@@ -133,6 +159,7 @@ def _process_single_clip(
                     clip=clip,
                     is_shorts=is_shorts, hook_text=hook_text, verbose=verbose,
                     output_name=output_name,
+                    censor_ranges=clip.get("censor_ranges"),
                 )
         else:
             final_path = video_path
@@ -204,13 +231,18 @@ def _process_clips(
     return processed
 
 
-def _load_and_score_pending(config: dict, game: str = "", use_game_multipliers: bool = False) -> list[dict]:
+def _load_and_score_pending(
+    config: dict,
+    game: str = "",
+    use_game_multipliers: bool = False,
+    persist: bool = True,
+) -> list[dict]:
     """Load pending clips from DB, filter by game + English, score, and sort by score desc.
 
     Uses learned weights from the database if available,
     otherwise falls back to hardcoded defaults.
     """
-    from clipper.process.score import score_clip
+    from clipper.process.score import rank_clips_v2
     from clipper.process.titles import is_english_clip
     from clipper.learn import get_learned_weights, get_game_multiplier
     from clipper.db import list_clips, update_clip
@@ -218,9 +250,12 @@ def _load_and_score_pending(config: dict, game: str = "", use_game_multipliers: 
     weights = get_learned_weights(config)
 
     pending = list_clips(config, status="pending", game=game if game else None, limit=2000)
-    clips = []
+    clips: list[dict] = []
     for clip in pending:
+        clip_id = clip.get("id")
         if not is_english_clip(clip):
+            if persist and clip_id:
+                update_clip(config, clip_id, status="skipped", score=0)
             continue
 
         mult = 1.0
@@ -228,14 +263,118 @@ def _load_and_score_pending(config: dict, game: str = "", use_game_multipliers: 
             mult = get_game_multiplier(clip.get("game", ""), config)
             clip["_game_multiplier"] = mult
 
-        clip["_score"] = score_clip(clip, weights=weights, game_multiplier=mult)
         clips.append(clip)
 
-    clips.sort(key=lambda c: c["_score"], reverse=True)
-    return clips
+    source_priors = _build_source_priors(config, clips)
+    ranked = rank_clips_v2(
+        clips,
+        weights=weights,
+        source_priors=source_priors,
+        diversify=True,
+    )
+
+    for clip in ranked:
+        clip_id = clip.get("id")
+        clip["_score"] = round(float(clip.get("_score", 0.0) or 0.0), 2)
+        if persist and clip_id:
+            update_clip(config, clip_id, score=clip["_score"])
+
+    return ranked
 
 
-def _approve_clips(clips: list[dict], count: int, config: dict, channel: str | None = None) -> int:
+def _build_source_priors(config: dict, clips: list[dict]) -> dict[str, float]:
+    """Build streamer/game priors from historical output performance (win-rate proxy)."""
+    from clipper.db import list_performance
+
+    if not clips:
+        return {}
+
+    perf = list_performance(config)
+    if not perf:
+        return {}
+
+    global_logs: list[float] = []
+    by_game: dict[str, list[float]] = {}
+    by_streamer_game: dict[str, list[float]] = {}
+
+    for row in perf:
+        youtube = row.get("youtube", {}) or {}
+        views = float(youtube.get("views", 0) or 0)
+        if views <= 0:
+            continue
+
+        lv = math.log1p(views)
+        global_logs.append(lv)
+
+        features = row.get("features", {}) or {}
+        game = str(features.get("game", "") or "").strip().lower()
+        streamer = str(features.get("streamer", "") or "").strip().lower()
+
+        if game:
+            by_game.setdefault(game, []).append(lv)
+        if streamer and game:
+            by_streamer_game.setdefault(f"{streamer}|{game}", []).append(lv)
+
+    if not global_logs:
+        return {}
+
+    global_mean = sum(global_logs) / len(global_logs)
+    priors: dict[str, float] = {}
+
+    def _prior_from_logs(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        avg = sum(values) / len(values)
+        delta = avg - global_mean
+        # Translate log-view delta into score points with sample-size shrinkage.
+        shrink = len(values) / (len(values) + 5.0)
+        return max(-6.0, min(8.0, (delta * 6.0) * shrink))
+
+    for game, logs in by_game.items():
+        priors[f"game::{game}"] = round(_prior_from_logs(logs), 3)
+    for key, logs in by_streamer_game.items():
+        priors[key] = round(_prior_from_logs(logs), 3)
+
+    return priors
+
+
+def _select_review_candidates(
+    clips: list[dict],
+    config: dict,
+    *,
+    min_score: float | None = None,
+    min_keep: int | None = None,
+    max_keep: int | None = None,
+) -> list[dict]:
+    """Select clips for manual review with a quality floor + backfill safety."""
+    if not clips:
+        return []
+
+    settings = config.get("settings", {}) or {}
+    floor = float(
+        min_score
+        if min_score is not None
+        else settings.get("review_min_score", settings.get("shorts_min_score", 42))
+    )
+    min_count = int(min_keep if min_keep is not None else settings.get("review_min_keep", 25))
+    max_count = int(max_keep if max_keep is not None else settings.get("review_max_keep", 120))
+
+    ranked = sorted(clips, key=lambda c: float(c.get("_score", 0.0) or 0.0), reverse=True)
+    selected = [c for c in ranked if float(c.get("_score", 0.0) or 0.0) >= floor]
+    if len(selected) < min_count:
+        selected = ranked[: max(1, min(min_count, len(ranked)))]
+    if max_count > 0:
+        selected = selected[:max_count]
+    return selected
+
+
+def _approve_clips(
+    clips: list[dict],
+    count: int,
+    config: dict,
+    channel: str | None = None,
+    min_score: float | None = None,
+) -> int:
     """Mark top `count` scored clips as approved, rest as skipped. Returns approved count."""
     from clipper.db import update_clip, get_db
 
@@ -250,18 +389,22 @@ def _approve_clips(clips: list[dict], count: int, config: dict, channel: str | N
         clip_id = clip.get("id")
         if not clip_id:
             continue
+        clip_score = float(clip.get("_score", 0.0) or 0.0)
+        if min_score is not None and clip_score < float(min_score):
+            update_clip(config, clip_id, status="skipped", score=clip_score)
+            continue
         if approved < count:
-            updates = {"status": "approved", "score": clip.get("_score", 0)}
+            updates = {"status": "approved", "score": clip_score}
             if channel:
                 updates["channel"] = channel
             update_clip(config, clip_id, **updates)
             console.print(
                 f"[green]  +[/green] {clip.get('streamer', '?')} — "
-                f"{clip.get('title', '?')[:40]} (score {clip['_score']:.0f})"
+                f"{clip.get('title', '?')[:40]} (score {clip_score:.0f})"
             )
             approved += 1
         else:
-            update_clip(config, clip_id, status="skipped")
+            update_clip(config, clip_id, status="skipped", score=clip_score)
 
     # Skip any remaining pending (non-English clips not in the scored list)
     conn.execute(
@@ -312,7 +455,21 @@ def _fetch_clips(
         if not fetch_config["targets"]["twitch"]["streamers"]:
             raise ValueError("Selected-streamer scope requires at least one streamer")
 
-    fetch_config["settings"]["min_views"] = 5
+    # Fetch with a wider net than the final quality floor.
+    # `min_views` is a quality floor for approval; discovery should stay broader.
+    settings_cfg = config.get("settings", {}) or {}
+    cfg_min_views = int(settings_cfg.get("min_views", 0) or 0)
+    raw_fetch_min = settings_cfg.get("fetch_min_views")
+    if raw_fetch_min is None:
+        # Adaptive default: if global floor is high (e.g. 100+), still pull a broader
+        # review candidate set and let scoring/ranking decide.
+        if cfg_min_views <= 0:
+            fetch_min_views = 20
+        else:
+            fetch_min_views = max(10, min(40, cfg_min_views // 4))
+    else:
+        fetch_min_views = max(0, int(raw_fetch_min))
+    fetch_config["settings"]["min_views"] = fetch_min_views
 
     if scope_key == "gamewide":
         scope_text = f"gamewide ({game})"
@@ -321,8 +478,330 @@ def _fetch_clips(
     else:
         scope_text = f"{len(fetch_config['targets']['twitch']['streamers'])} selected streamer(s)"
 
-    console.print(f"\n[bold]Fetching clips ({scope_text}, last {period_str})...[/bold]")
+    console.print(
+        f"\n[bold]Fetching clips ({scope_text}, last {period_str}, min {fetch_min_views} views)...[/bold]"
+    )
     return fetch_twitch_clips(fetch_config, verbose=verbose)
+
+
+def count_output_shorts_today(config: dict, *, channel: str | None = None) -> int:
+    """Return how many Shorts outputs were produced today (local day boundary)."""
+    from clipper.db import get_db
+
+    conn = get_db(config)
+    conditions = [
+        "status = 'output'",
+        "id NOT LIKE 'compilation_%'",
+        "is_shorts = 1",
+        "datetime(COALESCE(updated_at, fetched_at, created_at)) >= datetime('now', 'localtime', 'start of day')",
+    ]
+    params: list[str] = []
+    if channel:
+        conditions.append("channel = ?")
+        params.append(channel)
+
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM clips WHERE {' AND '.join(conditions)}",
+        params,
+    ).fetchone()
+    return int((row["n"] if row else 0) or 0)
+
+
+def _normalize_privacy(value: str | None) -> str:
+    v = str(value or "").strip().lower()
+    return v if v in {"unlisted", "private", "public"} else "unlisted"
+
+
+_PROFILE_TUNING_KEYS = (
+    "safe_top_ratio",
+    "safe_bottom_ratio",
+    "facecam_band_ratio",
+    "facecam_x_bias",
+    "facecam_y_bias",
+    "facecam_zoom",
+    "gameplay_zoom",
+    "gameplay_zoom_no_facecam",
+    "gameplay_x_bias",
+    "gameplay_y_bias",
+    "hud_height_ratio",
+    "hud_scale",
+    "hud_x_ratio",
+    "hud_y_ratio",
+    "title_y_ratio",
+    "subtitle_margin_ratio",
+)
+
+
+def _profile_calibration_score(profile: dict | None) -> float:
+    """Return 0..1 readiness score for a streamer layout profile."""
+    if not isinstance(profile, dict) or not profile:
+        return 0.0
+
+    facecam_enabled = bool(profile.get("facecam_enabled", True))
+    hud_enabled = bool(profile.get("hud_enabled", True))
+    facecam_ready = (not facecam_enabled) or isinstance(profile.get("facecam"), dict)
+    hud_ready = (not hud_enabled) or isinstance(profile.get("hud"), dict)
+
+    box_score = 0.0
+    if facecam_ready:
+        box_score += 0.5
+    if hud_ready:
+        box_score += 0.5
+
+    tuning_count = sum(1 for k in _PROFILE_TUNING_KEYS if profile.get(k) is not None)
+    tuning_score = min(1.0, tuning_count / 6.0)
+    return max(0.0, min(1.0, (0.7 * box_score) + (0.3 * tuning_score)))
+
+
+def _prioritize_calibrated_streamers(clips: list[dict], config: dict) -> list[dict]:
+    """Prefer clips from streamers with saved layout profiles in autopilot mode."""
+    autopilot_cfg = config.get("autopilot", {}) or {}
+    if autopilot_cfg.get("prefer_calibrated_streamers", True) is False:
+        return clips
+
+    from clipper.layout_profiles import load_facecam_profiles
+
+    profiles = load_facecam_profiles(config) or {}
+    bonus_points = float(autopilot_cfg.get("profile_bonus_points", 8.0) or 8.0)
+
+    prioritized: list[dict] = []
+    for clip in clips:
+        streamer_key = str(clip.get("streamer", "")).strip().lower()
+        profile = profiles.get(streamer_key) if streamer_key else None
+        readiness = _profile_calibration_score(profile)
+        rank_score = float(clip.get("_score", 0.0) or 0.0) + (readiness * bonus_points)
+        clip["_autopilot_profile_score"] = round(readiness, 3)
+        clip["_autopilot_rank_score"] = round(rank_score, 3)
+        prioritized.append(clip)
+
+    prioritized.sort(
+        key=lambda c: (
+            float(c.get("_autopilot_rank_score", 0.0) or 0.0),
+            float(c.get("_score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+    return prioritized
+
+
+def _upload_processed_clips(
+    processed: list[dict],
+    config: dict,
+    *,
+    channel: str | None = None,
+    privacy: str = "unlisted",
+    state=None,
+    verbose: bool = False,
+) -> dict:
+    """Upload processed clips and persist platform IDs to JSON + DB."""
+    from clipper.db import update_clip as db_update_clip
+    from clipper.upload.dispatcher import (
+        get_channel_platform,
+        platform_id_column,
+        upload_clip,
+    )
+
+    privacy_key = _normalize_privacy(privacy)
+    out_dir = config["_output_dir"]
+    uploaded = 0
+    failed = 0
+    uploaded_ids: list[str] = []
+
+    if state is not None:
+        state.uploads_total = len(processed)
+        state.uploads_done = 0
+        state.set_phase("uploading", f"Uploading {len(processed)} clips ({privacy_key})")
+
+    for clip in processed:
+        clip_id = str(clip.get("id", "")).strip()
+        if not clip_id:
+            failed += 1
+            continue
+
+        upload_id = upload_clip(clip, config, privacy=privacy_key, channel=channel, verbose=verbose)
+        if not upload_id:
+            failed += 1
+            if state is not None:
+                state.uploads_done += 1
+            continue
+
+        platform = get_channel_platform(channel, config)
+        id_col = platform_id_column(platform)
+        clip[id_col] = upload_id
+        if channel:
+            clip["channel"] = channel
+            clip["_target_channel"] = channel
+
+        # Keep output JSON in sync for studio/upload views.
+        meta_path = out_dir / f"{clip_id}.json"
+        if meta_path.exists():
+            try:
+                current = json.loads(meta_path.read_text())
+            except Exception:
+                current = {}
+        else:
+            current = {}
+        current.update(clip)
+        meta_path.write_text(json.dumps(current, indent=2))
+
+        db_update_clip(config, clip_id, **{id_col: upload_id, "channel": channel or ""})
+        uploaded += 1
+        uploaded_ids.append(upload_id)
+        if state is not None:
+            state.uploads_done += 1
+
+    return {
+        "uploaded": uploaded,
+        "failed_uploads": failed,
+        "uploaded_ids": uploaded_ids,
+        "privacy": privacy_key,
+    }
+
+
+def run_autopilot_workflow(
+    config: dict,
+    *,
+    count: int = 8,
+    min_score: float = 45.0,
+    channel: str | None = None,
+    game: str | None = None,
+    period: str = "24h",
+    scope: str = "configured",
+    streamers: list[str] | None = None,
+    auto_upload: bool = False,
+    privacy: str = "unlisted",
+    daily_limit: int | None = None,
+    verbose: bool = False,
+    state=None,
+) -> dict:
+    """Autopilot flow: learn -> fetch -> score -> approve -> process -> optional upload."""
+    from clipper.learn import collect_game_stats, collect_performance, train_weights
+
+    requested_count = max(1, int(count))
+    target_count = requested_count
+    daily_cap = int(daily_limit or 0)
+    if daily_cap > 0:
+        already = count_output_shorts_today(config, channel=channel)
+        remaining = max(0, daily_cap - already)
+        if remaining <= 0:
+            detail = f"Daily cap reached ({daily_cap}); already produced {already} short(s) today."
+            if state is not None:
+                state.set_phase("done", detail)
+            return {
+                "requested": requested_count,
+                "daily_limit": daily_cap,
+                "already_today": already,
+                "approved": 0,
+                "processed": 0,
+                "uploaded": 0,
+                "status": "daily_cap_reached",
+            }
+        target_count = min(target_count, remaining)
+
+    if state is not None:
+        state.set_phase("learning", "Refreshing game stats...")
+
+    # Best-effort learning refresh.
+    try:
+        collect_game_stats(config)
+    except Exception:
+        pass
+
+    if state is not None:
+        state.set_phase("learning", "Training scoring weights...")
+    try:
+        collect_performance(config)
+        train_weights(config)
+    except Exception:
+        pass
+
+    scope_key = str(scope or "configured").strip().lower()
+    if scope_key not in {"gamewide", "configured", "selected"}:
+        scope_key = "configured"
+
+    game_name = str(game or "").strip()
+    if not game_name:
+        configured_games = list(config.get("targets", {}).get("twitch", {}).get("games", []) or [])
+        game_name = configured_games[0] if configured_games else "Deadlock"
+
+    if state is not None:
+        state.set_phase("fetching", "Discovering clips...")
+    _fetch_clips(
+        config,
+        game_name,
+        period=period,
+        scope=scope_key,
+        streamers=streamers,
+        verbose=verbose,
+    )
+
+    if state is not None:
+        state.set_phase("scoring", "Scoring clip candidates...")
+    # Enforce game filtering whenever a game is specified, even for configured/selected scopes.
+    game_filter = game_name if game_name else ""
+    pending = _load_and_score_pending(config, game=game_filter, use_game_multipliers=True)
+    if not pending:
+        if state is not None:
+            state.set_phase("done", "No qualifying clips found")
+        return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "no_clips"}
+
+    qualifying = [c for c in pending if float(c.get("_score", 0.0) or 0.0) >= float(min_score)]
+    if not qualifying:
+        detail = f"No clips above score {float(min_score):.0f}"
+        if state is not None:
+            state.set_phase("done", detail)
+        return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "below_threshold"}
+
+    qualifying = _prioritize_calibrated_streamers(qualifying, config)
+
+    if state is not None:
+        state.set_phase("approving", f"Approving top {target_count} clips...")
+    approved = _approve_clips(
+        qualifying,
+        target_count,
+        config,
+        channel=channel,
+        min_score=min_score,
+    )
+    if approved <= 0:
+        if state is not None:
+            state.set_phase("done", "No clips approved")
+        return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "none_approved"}
+
+    if state is not None:
+        state.set_phase("processing", f"Processing {approved} clips...")
+    processed = _process_clips(config, verbose=verbose, state=state)
+
+    summary = {
+        "requested": requested_count,
+        "approved": approved,
+        "processed": len(processed),
+        "uploaded": 0,
+        "status": "processed",
+    }
+
+    if auto_upload and processed:
+        upload_summary = _upload_processed_clips(
+            processed,
+            config,
+            channel=channel,
+            privacy=privacy,
+            state=state,
+            verbose=verbose,
+        )
+        summary["uploaded"] = int(upload_summary.get("uploaded", 0) or 0)
+        summary["failed_uploads"] = int(upload_summary.get("failed_uploads", 0) or 0)
+        summary["privacy"] = upload_summary.get("privacy", "unlisted")
+        summary["status"] = "uploaded"
+
+    if state is not None and state.phase != "error":
+        detail = (
+            f"{summary['processed']} processed"
+            + (f", {summary['uploaded']} uploaded" if summary["uploaded"] else "")
+        )
+        state.set_phase("done", detail)
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +845,22 @@ def run_shorts_workflow(
 
     # 3. Approve
     clip_count = min(count, len(pending))
+    shorts_min_score = float(
+        (config.get("settings", {}) or {}).get(
+            "shorts_min_score",
+            (config.get("settings", {}) or {}).get("review_min_score", 40),
+        )
+    )
     if state:
         state.set_phase("approving", f"Approving top {clip_count} clips")
-    console.print(f"\n[bold]Approving top {clip_count} clips...[/bold]")
-    approved_count = _approve_clips(pending, clip_count, config, channel=channel)
+    console.print(f"\n[bold]Approving top {clip_count} clips (min score {shorts_min_score:.0f})...[/bold]")
+    approved_count = _approve_clips(
+        pending,
+        clip_count,
+        config,
+        channel=channel,
+        min_score=shorts_min_score,
+    )
 
     if approved_count == 0:
         console.print("[yellow]No clips approved.[/yellow]")
@@ -431,10 +922,19 @@ def run_compilation_workflow(
     clip_count = clips_for_duration(pending, duration or 12)
 
     # 4. Approve
+    compilation_min_score = float(
+        (config.get("settings", {}) or {}).get("compilation_min_score", 30)
+    )
     if state:
         state.set_phase("approving", f"Approving top {clip_count} clips")
-    console.print(f"\n[bold]Approving top {clip_count} clips...[/bold]")
-    approved_count = _approve_clips(pending, clip_count, config, channel=channel)
+    console.print(f"\n[bold]Approving top {clip_count} clips (min score {compilation_min_score:.0f})...[/bold]")
+    approved_count = _approve_clips(
+        pending,
+        clip_count,
+        config,
+        channel=channel,
+        min_score=compilation_min_score,
+    )
 
     if approved_count < 2:
         console.print(f"[yellow]Only {approved_count} clip(s) — need at least 2 for compilation.[/yellow]")

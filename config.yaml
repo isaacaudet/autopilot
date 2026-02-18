@@ -16,6 +16,18 @@ settings:
   shorts_threshold: 60
   language: en  # filters by broadcaster language (reliable, unlike clip language field)
 
+autopilot:
+  daily_count: 8
+  min_score: 45
+  game: Deadlock
+  scope: gamewide
+  period: 24h
+  channel: default
+  auto_upload: true
+  privacy: private
+  prefer_calibrated_streamers: true
+  profile_bonus_points: 8.0
+
 upload:
   title_template: "{title} | {streamer} {game}"
   description_template: |

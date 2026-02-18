@@ -12,10 +12,14 @@ import {
 import { Checkbox } from '@/components/ui/checkbox'
 import { Check, ChevronRight, ExternalLink, Loader2, SkipForward, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { batchReview, fetchQueue, thumbnailUrl } from '@/lib/api'
+import { approveProcess, batchReview, fetchQueue, thumbnailUrl } from '@/lib/api'
 import type { ClipMeta } from '@/lib/types'
+import { useChannelScope } from '@/hooks/useChannelScope'
 
 type SortKey = 'score' | 'views' | 'recent'
+type ReviewTarget = 'shorts' | 'compilation'
+const COMPILATION_TARGET_MINUTES = [8, 10, 12, 15] as const
+type CompilationTargetMinutes = (typeof COMPILATION_TARGET_MINUTES)[number]
 
 function scoreBadgeColor(score: number | undefined): string {
   if (score == null) return 'bg-muted text-muted-foreground'
@@ -30,16 +34,76 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
+function pickCompilationIds(clips: ClipMeta[], targetMinutes: number): string[] {
+  if (clips.length === 0) return []
+  const targetSeconds = Math.max(1, targetMinutes) * 60
+  const ids: string[] = []
+  let runtime = 0
+
+  for (const clip of clips) {
+    ids.push(clip.id)
+    runtime += clip.duration || 0
+    if (runtime >= targetSeconds && ids.length >= 2) break
+  }
+
+  if (ids.length < 2 && clips.length >= 2) {
+    return [clips[0].id, clips[1].id]
+  }
+  return ids
+}
+
 export function ReviewPage() {
   const navigate = useNavigate()
+  const { channel: workspaceChannel } = useChannelScope()
   const [clips, setClips] = useState<ClipMeta[]>([])
   const [loading, setLoading] = useState(true)
   const [sort, setSort] = useState<SortKey>('score')
   const [gameFilter, setGameFilter] = useState('__all__')
+  const [target, setTarget] = useState<ReviewTarget>(() => {
+    try {
+      const stored = localStorage.getItem('clipper.reviewTarget')
+      return stored === 'compilation' ? 'compilation' : 'shorts'
+    } catch {
+      return 'shorts'
+    }
+  })
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [actionLoading, setActionLoading] = useState(false)
+  const [processing, setProcessing] = useState(false)
   const [approvedCount, setApprovedCount] = useState(0)
   const [skippedCount, setSkippedCount] = useState(0)
+  const [compilationTargetMinutes, setCompilationTargetMinutes] = useState<CompilationTargetMinutes>(() => {
+    try {
+      const stored = Number(localStorage.getItem('clipper.compilationTargetMinutes') || 10)
+      return COMPILATION_TARGET_MINUTES.includes(stored as CompilationTargetMinutes)
+        ? (stored as CompilationTargetMinutes)
+        : 10
+    } catch {
+      return 10
+    }
+  })
+  const [compilationSelectionDirty, setCompilationSelectionDirty] = useState(false)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('clipper.reviewTarget', target)
+    } catch {
+      // ignore storage failures
+    }
+  }, [target])
+
+  useEffect(() => {
+    setSelectedIds(new Set())
+    if (target === 'compilation') setCompilationSelectionDirty(false)
+  }, [target])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('clipper.compilationTargetMinutes', String(compilationTargetMinutes))
+    } catch {
+      // ignore storage failures
+    }
+  }, [compilationTargetMinutes])
 
   // Pending clips don't have a channel assigned yet — don't filter by workspace channel.
   const load = useCallback(async () => {
@@ -48,6 +112,7 @@ export function ReviewPage() {
     setSelectedIds(new Set())
     setApprovedCount(0)
     setSkippedCount(0)
+    setCompilationSelectionDirty(false)
     setGameFilter('__all__')
     try {
       const data = await fetchQueue('pending', {
@@ -86,6 +151,25 @@ export function ReviewPage() {
   }, [clips, gameFilter, sort])
 
   const remaining = filteredClips.length
+  const selectedClipList = useMemo(
+    () => clips.filter((c) => selectedIds.has(c.id)),
+    [clips, selectedIds],
+  )
+  const selectedDurationSeconds = useMemo(
+    () => selectedClipList.reduce((sum, c) => sum + (c.duration || 0), 0),
+    [selectedClipList],
+  )
+  const allFilteredSelected = useMemo(
+    () => filteredClips.length > 0 && filteredClips.every((c) => selectedIds.has(c.id)),
+    [filteredClips, selectedIds],
+  )
+
+  useEffect(() => {
+    if (target !== 'compilation') return
+    if (compilationSelectionDirty) return
+    const ids = pickCompilationIds(filteredClips, compilationTargetMinutes)
+    setSelectedIds(new Set(ids))
+  }, [target, filteredClips, compilationTargetMinutes, compilationSelectionDirty])
 
   async function handleAction(clipIds: string[], action: 'approve' | 'skip') {
     setActionLoading(true)
@@ -123,7 +207,27 @@ export function ReviewPage() {
     handleAction(Array.from(selectedIds), action)
   }
 
+  async function handleProcessCompilation() {
+    const selected = Array.from(selectedIds).filter((id) => clips.some((c) => c.id === id))
+    if (selected.length < 2) {
+      toast.error('Select at least 2 clips for compilation processing')
+      return
+    }
+    setProcessing(true)
+    try {
+      const channel = workspaceChannel === 'all' ? null : workspaceChannel
+      await approveProcess(selected, 'compilation', channel)
+      toast.success('Compilation processing started')
+      navigate('/pipeline')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to start compilation processing')
+    } finally {
+      setProcessing(false)
+    }
+  }
+
   function toggleSelect(id: string) {
+    if (target === 'compilation') setCompilationSelectionDirty(true)
     setSelectedIds((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
@@ -133,11 +237,16 @@ export function ReviewPage() {
   }
 
   function toggleSelectAll() {
-    if (selectedIds.size === filteredClips.length) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(filteredClips.map((c) => c.id)))
-    }
+    if (target === 'compilation') setCompilationSelectionDirty(true)
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (allFilteredSelected) {
+        for (const clip of filteredClips) next.delete(clip.id)
+      } else {
+        for (const clip of filteredClips) next.add(clip.id)
+      }
+      return next
+    })
   }
 
   return (
@@ -146,7 +255,9 @@ export function ReviewPage() {
         <div className="space-y-1">
           <h1 className="text-xl font-semibold tracking-tight">Review</h1>
           <p className="text-sm text-muted-foreground">
-            Approve or skip pending clips.
+            {target === 'compilation'
+              ? 'Check clips for compilation, tune target runtime, then process.'
+              : 'Approve or skip pending clips for Shorts.'}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -156,17 +267,41 @@ export function ReviewPage() {
         </div>
       </div>
 
-      {/* Progress bar */}
-      <div className="text-sm text-muted-foreground">
-        <span className="text-green-400 font-medium">{approvedCount} approved</span>
-        {' · '}
-        <span>{skippedCount} skipped</span>
-        {' · '}
-        <span>{remaining} remaining</span>
-      </div>
+      {/* Progress / runtime */}
+      {target === 'compilation' ? (
+        <div className="rounded-md border bg-muted/15 px-3 py-2 text-sm">
+          <span className="font-medium">Runtime</span>
+          {' · '}
+          <span>{formatDuration(selectedDurationSeconds)}</span>
+          {' / '}
+          <span>{formatDuration(compilationTargetMinutes * 60)} target</span>
+          {' · '}
+          <span>{selectedIds.size} checked</span>
+          {' · '}
+          <span>{remaining} available</span>
+        </div>
+      ) : (
+        <div className="text-sm text-muted-foreground">
+          <span className="text-green-400 font-medium">{approvedCount} approved</span>
+          {' · '}
+          <span>{skippedCount} skipped</span>
+          {' · '}
+          <span>{remaining} remaining</span>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
+        <Select value={target} onValueChange={(v) => setTarget(v as ReviewTarget)}>
+          <SelectTrigger className="h-8 w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="shorts">Target: Shorts</SelectItem>
+            <SelectItem value="compilation">Target: Compilation</SelectItem>
+          </SelectContent>
+        </Select>
+
         <Select value={gameFilter} onValueChange={setGameFilter}>
           <SelectTrigger className="h-8 w-40">
             <SelectValue placeholder="All games" />
@@ -192,27 +327,73 @@ export function ReviewPage() {
           </SelectContent>
         </Select>
 
+        {target === 'compilation' && (
+          <Select
+            value={String(compilationTargetMinutes)}
+            onValueChange={(v) => {
+              const next = Number(v) as CompilationTargetMinutes
+              setCompilationTargetMinutes(next)
+              setCompilationSelectionDirty(false)
+            }}
+          >
+            <SelectTrigger className="h-8 w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {COMPILATION_TARGET_MINUTES.map((mins) => (
+                <SelectItem key={mins} value={String(mins)}>
+                  Target: {mins} min
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
         <div className="ml-auto flex items-center gap-2">
+          {target === 'compilation' && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setCompilationSelectionDirty(false)}
+              disabled={filteredClips.length === 0}
+            >
+              Auto-select
+            </Button>
+          )}
+          {target === 'compilation' && (
+            <Button
+              size="sm"
+              onClick={handleProcessCompilation}
+              disabled={processing || selectedIds.size < 2}
+            >
+              {processing ? <Loader2 className="size-3.5 animate-spin mr-1" /> : null}
+              Process checked ({selectedIds.size})
+            </Button>
+          )}
           <Button size="sm" variant="ghost" onClick={toggleSelectAll}>
-            {selectedIds.size === filteredClips.length ? 'Deselect all' : 'Select all'}
+            {allFilteredSelected ? 'Uncheck all' : 'Check all'}
           </Button>
-          <Button size="sm" variant="outline" onClick={() => handleApproveTopN(5)} disabled={filteredClips.length === 0}>
-            Approve top 5
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => handleApproveTopN(10)} disabled={filteredClips.length < 10}>
-            Approve top 10
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => handleApproveTopN(20)} disabled={filteredClips.length < 20}>
-            Approve top 20
-          </Button>
-          <Button size="sm" variant="ghost" onClick={handleSkipRemaining} disabled={filteredClips.length === 0}>
-            Skip remaining
-          </Button>
+          {target === 'shorts' && (
+            <>
+              <Button size="sm" variant="outline" onClick={() => handleApproveTopN(5)} disabled={filteredClips.length === 0}>
+                Approve top 5
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => handleApproveTopN(10)} disabled={filteredClips.length < 10}>
+                Approve top 10
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => handleApproveTopN(20)} disabled={filteredClips.length < 20}>
+                Approve top 20
+              </Button>
+              <Button size="sm" variant="ghost" onClick={handleSkipRemaining} disabled={filteredClips.length === 0}>
+                Skip remaining
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
       {/* Selection bar */}
-      {selectedIds.size > 0 && (
+      {target === 'shorts' && selectedIds.size > 0 && (
         <div className="sticky bottom-4 z-10 flex items-center gap-3 rounded-lg border bg-background/95 backdrop-blur px-4 py-3 shadow-lg">
           <span className="text-sm font-medium">{selectedIds.size} selected</span>
           <Button
@@ -246,11 +427,19 @@ export function ReviewPage() {
       {!loading && filteredClips.length === 0 && (
         <div className="py-16 text-center space-y-3">
           <p className="text-muted-foreground">No clips pending.</p>
-          {approvedCount > 0 ? (
-            <Button onClick={() => navigate('/edit')}>
-              Continue to Edit
-              <ChevronRight className="size-4 ml-1" />
-            </Button>
+          {(target === 'shorts' ? approvedCount > 0 : selectedIds.size > 0) ? (
+            target === 'compilation' ? (
+              <Button onClick={handleProcessCompilation} disabled={processing || selectedIds.size < 2}>
+                {processing ? <Loader2 className="size-4 animate-spin mr-1" /> : null}
+                Process for Compilation
+                <ChevronRight className="size-4 ml-1" />
+              </Button>
+            ) : (
+              <Button onClick={() => navigate('/edit')}>
+                Continue to Edit
+                <ChevronRight className="size-4 ml-1" />
+              </Button>
+            )
           ) : (
             <Button variant="outline" onClick={() => navigate('/')}>
               Fetch from Home
@@ -264,6 +453,7 @@ export function ReviewPage() {
         {filteredClips.map((clip) => (
           <ClipCard
             key={clip.id}
+            mode={target}
             clip={clip}
             selected={selectedIds.has(clip.id)}
             onToggleSelect={() => toggleSelect(clip.id)}
@@ -275,12 +465,20 @@ export function ReviewPage() {
       </div>
 
       {/* After all reviewed */}
-      {!loading && filteredClips.length === 0 && approvedCount > 0 && (
+      {!loading && filteredClips.length === 0 && (target === 'shorts' ? approvedCount > 0 : selectedIds.size > 1) && (
         <div className="flex justify-center pt-4">
-          <Button onClick={() => navigate('/edit')} size="lg">
-            Continue to Edit
-            <ChevronRight className="size-4 ml-1" />
-          </Button>
+          {target === 'compilation' ? (
+            <Button onClick={handleProcessCompilation} size="lg" disabled={processing || selectedIds.size < 2}>
+              {processing ? <Loader2 className="size-4 animate-spin mr-1" /> : null}
+              Process for Compilation
+              <ChevronRight className="size-4 ml-1" />
+            </Button>
+          ) : (
+            <Button onClick={() => navigate('/edit')} size="lg">
+              Continue to Edit
+              <ChevronRight className="size-4 ml-1" />
+            </Button>
+          )}
         </div>
       )}
     </div>
@@ -288,6 +486,7 @@ export function ReviewPage() {
 }
 
 function ClipCard({
+  mode,
   clip,
   selected,
   onToggleSelect,
@@ -295,6 +494,7 @@ function ClipCard({
   onSkip,
   disabled,
 }: {
+  mode: ReviewTarget
   clip: ClipMeta
   selected: boolean
   onToggleSelect: () => void
@@ -364,27 +564,39 @@ function ClipCard({
           </Badge>
         )}
 
-        <div className="flex items-center gap-2 pt-1">
+        {mode === 'compilation' ? (
           <Button
             size="sm"
-            className="flex-1 h-8"
-            onClick={onApprove}
-            disabled={disabled}
+            variant={selected ? 'default' : 'outline'}
+            className="w-full h-8"
+            onClick={onToggleSelect}
           >
             <Check className="size-3.5 mr-1" />
-            Approve
+            {selected ? 'Checked' : 'Check'}
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="flex-1 h-8"
-            onClick={onSkip}
-            disabled={disabled}
-          >
-            <X className="size-3.5 mr-1" />
-            Skip
-          </Button>
-        </div>
+        ) : (
+          <div className="flex items-center gap-2 pt-1">
+            <Button
+              size="sm"
+              className="flex-1 h-8"
+              onClick={onApprove}
+              disabled={disabled}
+            >
+              <Check className="size-3.5 mr-1" />
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="flex-1 h-8"
+              onClick={onSkip}
+              disabled={disabled}
+            >
+              <X className="size-3.5 mr-1" />
+              Skip
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   )

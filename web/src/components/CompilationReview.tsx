@@ -17,7 +17,7 @@ import {
   ChevronUp, ChevronDown, X, Loader2, Upload, CheckCircle2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { fetchCompilationClips, fetchCompilations, buildCompilation, uploadClip } from '@/lib/api'
+import { fetchCompilationClips, fetchCompilations, fetchStudioClips, buildCompilation, uploadClip } from '@/lib/api'
 import { usePipeline } from '@/hooks/usePipeline'
 import type { ClipMeta } from '@/lib/types'
 import { useChannelScope } from '@/hooks/useChannelScope'
@@ -36,6 +36,10 @@ function formatTemplate(template: string, game: string): string {
 }
 
 type Phase = 'review' | 'building' | 'done'
+
+function isCompilationClip(clip: ClipMeta): boolean {
+  return Boolean((clip.clip_count ?? 0) > 0) || clip.id.startsWith('compilation_')
+}
 
 export function CompilationReview() {
   const [clips, setClips] = useState<ClipMeta[]>([])
@@ -125,7 +129,19 @@ export function CompilationReview() {
     // Find the most recent compilation in output
     setUploading(true)
     try {
-      const comps = await fetchCompilations(workspaceChannel)
+      let comps = await fetchCompilations(workspaceChannel)
+
+      // Back-compat fallback: include output orphans if DB index is stale.
+      if (comps.length === 0) {
+        const channelFilter = workspaceChannel === 'all' ? undefined : workspaceChannel
+        const studio = await fetchStudioClips({ sort: 'recent', limit: 1000, channel: channelFilter })
+        comps = studio.filter(isCompilationClip)
+      }
+      if (comps.length === 0 && workspaceChannel !== 'all') {
+        const studioAll = await fetchStudioClips({ sort: 'recent', limit: 1000 })
+        comps = studioAll.filter(isCompilationClip)
+      }
+
       if (comps.length === 0) {
         toast.error('No compilation found')
         return

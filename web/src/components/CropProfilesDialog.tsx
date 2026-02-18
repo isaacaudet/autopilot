@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { toast } from 'sonner'
 import {
+  fetchLayoutPreviewFrame,
   fetchLayoutProfiles,
   removeLayoutProfile,
   saveLayoutProfile,
@@ -154,10 +155,10 @@ const TUNING_BOUNDS = {
   facecamXBias: [-1, 1],
   facecamYBias: [0, 0.5],
   facecamZoom: [0.5, 2],
-  gameplayZoom: [0.75, 1.6],
-  gameplayZoomNoFacecam: [0.75, 1.7],
+  gameplayZoom: [-1, 2.2],
+  gameplayZoomNoFacecam: [-1, 2.3],
   gameplayXBias: [-1, 1],
-  gameplayYBias: [-2, 2],
+  gameplayYBias: [-1, 1],
   hudHeightRatio: [0.05, 0.22],
   hudScale: [0.5, 2],
   hudXRatio: [0, 1],
@@ -212,217 +213,152 @@ function normalizeTuning(tuning: Partial<LayoutTuning> | null | undefined): Layo
   }
 }
 
-function drawCoverCrop(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
-  src: { x: number; y: number; w: number; h: number },
-  dst: { x: number; y: number; w: number; h: number },
-  opts?: { alignX?: 'left' | 'center' | 'right'; alignY?: 'top' | 'center' | 'bottom' },
-) {
-  const alignX = opts?.alignX ?? 'center'
-  const alignY = opts?.alignY ?? 'center'
-
-  const scale = Math.max(dst.w / src.w, dst.h / src.h)
-  const sampleW = dst.w / scale
-  const sampleH = dst.h / scale
-
-  const ox =
-    alignX === 'left' ? 0 : alignX === 'right' ? src.w - sampleW : (src.w - sampleW) / 2
-  const oy =
-    alignY === 'top' ? 0 : alignY === 'bottom' ? src.h - sampleH : (src.h - sampleH) / 2
-
-  const sx = src.x + ox
-  const sy = src.y + oy
-
-  ctx.drawImage(img, sx, sy, sampleW, sampleH, dst.x, dst.y, dst.w, dst.h)
-}
-
 function VerticalPreview({
-  imageSrc,
+  clipId,
+  thumbAt,
   facecam,
   hud,
   facecamEnabled,
   hudEnabled,
   tuning,
 }: {
-  imageSrc: string
+  clipId: string | null
+  thumbAt: number | null
   facecam: FacecamRect
   hud: FacecamRect
   facecamEnabled: boolean
   hudEnabled: boolean
   tuning: LayoutTuning
 }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const [img, setImg] = useState<HTMLImageElement | null>(null)
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const previewUrlRef = useRef<string>('')
+
+  const previewProfile = useMemo<LayoutProfile>(() => ({
+    facecam: normalizeRect(facecam),
+    hud: normalizeRect(hud),
+    facecam_enabled: facecamEnabled,
+    hud_enabled: hudEnabled,
+    safe_top_ratio: tuning.safeTopRatio,
+    safe_bottom_ratio: tuning.safeBottomRatio,
+    facecam_band_ratio: tuning.facecamBandRatio,
+    facecam_x_bias: tuning.facecamXBias,
+    facecam_y_bias: tuning.facecamYBias,
+    facecam_zoom: tuning.facecamZoom,
+    gameplay_zoom: tuning.gameplayZoom,
+    gameplay_zoom_no_facecam: tuning.gameplayZoomNoFacecam,
+    gameplay_x_bias: tuning.gameplayXBias,
+    gameplay_y_bias: tuning.gameplayYBias,
+    hud_height_ratio: tuning.hudHeightRatio,
+    hud_scale: tuning.hudScale,
+    hud_x_ratio: tuning.hudXRatio,
+    hud_y_ratio: tuning.hudYRatio,
+    title_y_ratio: tuning.titleYRatio,
+    subtitle_margin_ratio: tuning.subtitleMarginRatio,
+  }), [
+    facecam,
+    hud,
+    facecamEnabled,
+    hudEnabled,
+    tuning,
+  ])
+
+  function replacePreviewUrl(next: string) {
+    setPreviewUrl((prev) => {
+      if (prev && prev !== next) URL.revokeObjectURL(prev)
+      return next
+    })
+    previewUrlRef.current = next
+  }
 
   useEffect(() => {
-    if (!imageSrc) return
-    const i = new Image()
-    i.onload = () => setImg(i)
-    i.src = imageSrc
+    if (!clipId) {
+      replacePreviewUrl('')
+      setLoading(false)
+      setError(null)
+      return
+    }
+
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      setLoading(true)
+      fetchLayoutPreviewFrame(clipId, previewProfile, { source: true, at: thumbAt })
+        .then((blob) => {
+          if (cancelled) return
+          const next = URL.createObjectURL(blob)
+          replacePreviewUrl(next)
+          setError(null)
+        })
+        .catch((e) => {
+          if (cancelled) return
+          setError(e instanceof Error ? e.message : 'Failed to render preview frame')
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
+    }, 160)
+
     return () => {
-      // best-effort cleanup
-      setImg(null)
+      cancelled = true
+      window.clearTimeout(timer)
     }
-  }, [imageSrc])
+  }, [clipId, thumbAt, previewProfile])
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas || !img) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-
-    const outW = canvas.width
-    const outH = canvas.height
-
-    ctx.clearRect(0, 0, outW, outH)
-    ctx.fillStyle = '#000'
-    ctx.fillRect(0, 0, outW, outH)
-
-    const imgW = img.naturalWidth || img.width
-    const imgH = img.naturalHeight || img.height
-
-    // Background blur fills the entire 9:16 frame (even in Fill mode)
-    ctx.save()
-    ctx.filter = 'blur(26px)'
-    drawCoverCrop(ctx, img, { x: 0, y: 0, w: imgW, h: imgH }, { x: 0, y: 0, w: outW, h: outH })
-    ctx.restore()
-    ctx.fillStyle = 'rgba(0,0,0,0.24)'
-    ctx.fillRect(0, 0, outW, outH)
-
-    // Layout: facecam band at top, gameplay below, safe bottom for HUD.
-    const safeBottom = Math.round(outH * tuning.safeBottomRatio)
-    const faceH = facecamEnabled ? Math.round(outH * tuning.facecamBandRatio) : 0
-    const gameH = Math.max(1, outH - faceH - safeBottom)
-
-    // Facecam Y positions the band on the output frame (0 = top of screen).
-    const bandY = Math.round(outH * tuning.facecamYBias)
-    // Gameplay sits directly below the facecam band.
-    const gameTopY = bandY + faceH
-
-    if (facecamEnabled) {
-      // Facecam — crop source rect, scale to fill band, pan with X bias.
-      const faceSrc = {
-        x: facecam.x * imgW,
-        y: facecam.y * imgH,
-        w: facecam.w * imgW,
-        h: facecam.h * imgH,
+    return () => {
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current)
       }
-      const fZoom = Math.max(0.5, tuning.facecamZoom)
-      const fBaseScale = Math.max(outW / faceSrc.w, faceH / faceSrc.h)
-      const fScale = fBaseScale * fZoom
-      const fDrawW = faceSrc.w * fScale
-      const fDrawH = faceSrc.h * fScale
-      const fPanXNorm = clamp((tuning.facecamXBias + 1) / 2, 0, 1)
-      const fDrawX = (outW - fDrawW) * fPanXNorm
-      const fDrawY = bandY + (faceH - fDrawH) / 2
-
-      ctx.save()
-      ctx.beginPath()
-      ctx.rect(0, bandY, outW, faceH)
-      ctx.clip()
-      ctx.drawImage(img, faceSrc.x, faceSrc.y, faceSrc.w, faceSrc.h, fDrawX, fDrawY, fDrawW, fDrawH)
-      ctx.restore()
     }
+  }, [])
 
-    // Gameplay — full source frame, zoom + pan. Pan just shifts visible area.
-    const zoom = Math.max(0.1, facecamEnabled ? tuning.gameplayZoom : tuning.gameplayZoomNoFacecam)
-    const panXNorm = clamp((tuning.gameplayXBias + 1) / 2, 0, 1)
-    const panYNorm = clamp((tuning.gameplayYBias + 1) / 2, 0, 1)
-    const gBaseScale = Math.max(outW / imgW, gameH / imgH) * zoom
-    const gDrawW = imgW * gBaseScale
-    const gDrawH = imgH * gBaseScale
-    const gDrawX = (outW - gDrawW) * panXNorm
-    const gDrawY = gameTopY + (gameH - gDrawH) * panYNorm
-
-    ctx.save()
-    ctx.beginPath()
-    ctx.rect(0, gameTopY, outW, gameH)
-    ctx.clip()
-    ctx.drawImage(img, 0, 0, imgW, imgH, gDrawX, gDrawY, gDrawW, gDrawH)
-    ctx.restore()
-
-    if (hudEnabled) {
-      // HUD overlay — crop, contain-scale into the hud box, overlay near bottom (centered).
-      const hudBoxH = Math.round(outH * tuning.hudHeightRatio)
-      const hudSrc = {
-        x: hud.x * imgW,
-        y: hud.y * imgH,
-        w: hud.w * imgW,
-        h: hud.h * imgH,
-      }
-      const contain = Math.min((outW * tuning.hudScale) / hudSrc.w, (hudBoxH * tuning.hudScale) / hudSrc.h)
-      const hudW = hudSrc.w * contain
-      const hudH = hudSrc.h * contain
-
-      const hudX = Math.round((outW - hudW) * tuning.hudXRatio)
-      const hudY = Math.round((outH - hudH) * tuning.hudYRatio)
-
-      // subtle shadow for readability
-      ctx.save()
-      ctx.shadowColor = 'rgba(0,0,0,0.55)'
-      ctx.shadowBlur = 12
-      ctx.shadowOffsetX = 0
-      ctx.shadowOffsetY = 6
-      ctx.drawImage(img, hudSrc.x, hudSrc.y, hudSrc.w, hudSrc.h, hudX, hudY, hudW, hudH)
-      ctx.restore()
-
-      // thin border hinting the HUD tile (helps users reason about placement)
-      ctx.save()
-      ctx.strokeStyle = 'rgba(16,185,129,0.65)' // emerald
-      ctx.lineWidth = 2
-      ctx.strokeRect(hudX, hudY, hudW, hudH)
-      ctx.restore()
-    }
-
-    // Title preview line in top safe band.
-    const titleY = Math.round(outH * tuning.titleYRatio)
-    const titleH = Math.round(outH * 0.06)
-    ctx.save()
-    ctx.fillStyle = 'rgba(0,0,0,0.58)'
-    ctx.fillRect(24, titleY, outW - 48, titleH)
-    ctx.strokeStyle = 'rgba(255,255,255,0.2)'
-    ctx.strokeRect(24, titleY, outW - 48, titleH)
-    ctx.fillStyle = 'rgba(255,255,255,0.9)'
-    ctx.font = 'bold 22px sans-serif'
-    ctx.textBaseline = 'middle'
-    ctx.fillText('TITLE PREVIEW', 36, titleY + titleH / 2)
-    ctx.restore()
-
-    // Subtitle preview line. This should sit on gameplay (or upper safe-bottom).
-    const subtitleY = Math.round(outH - outH * tuning.subtitleMarginRatio)
-    const subtitleH = Math.round(outH * 0.05)
-    const subtitleTop = Math.max(0, Math.min(outH - subtitleH - 4, subtitleY - subtitleH))
-    ctx.save()
-    ctx.fillStyle = 'rgba(0,0,0,0.65)'
-    ctx.fillRect(24, subtitleTop, outW - 48, subtitleH)
-    ctx.strokeStyle = 'rgba(250,204,21,0.75)'
-    ctx.strokeRect(24, subtitleTop, outW - 48, subtitleH)
-    ctx.fillStyle = 'rgba(255,255,255,0.92)'
-    ctx.font = 'bold 20px sans-serif'
-    ctx.textBaseline = 'middle'
-    ctx.fillText('SUBTITLE PREVIEW', 36, subtitleTop + subtitleH / 2)
-    ctx.restore()
-  }, [img, facecam, hud, facecamEnabled, hudEnabled, tuning])
+  const subtitleTopRatio = clamp(1 - tuning.subtitleMarginRatio - 0.05, 0, 0.95)
 
   return (
     <div className="rounded-xl border bg-muted/10 p-3">
       <div className="flex items-center justify-between">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Vertical Preview</div>
         <div className="text-[11px] text-muted-foreground">
-          {facecamEnabled ? 'Facecam + gameplay + title/subtitle guides' : 'Gameplay-only + title/subtitle guides'}
+          {loading ? 'Updating from FFmpeg…' : 'Rendered with export filter chain'}
         </div>
       </div>
 
       <div className="mt-3 flex justify-center">
         <div className="relative rounded-[38px] border bg-gradient-to-b from-neutral-950 to-neutral-900 p-3 shadow-[0_24px_80px_rgba(0,0,0,0.65)]">
           <div className="pointer-events-none absolute left-1/2 top-3 h-6 w-28 -translate-x-1/2 rounded-full border border-white/10 bg-black/70" />
-          <canvas
-            ref={canvasRef}
-            width={360}
-            height={640}
-            className="rounded-[30px] border bg-black"
-          />
+          <div className="relative h-[640px] w-[360px] overflow-hidden rounded-[30px] border bg-black">
+            {previewUrl ? (
+              <img src={previewUrl} alt="Vertical preview" className="h-full w-full object-cover" />
+            ) : (
+              <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+                {clipId ? 'Generating preview…' : 'Select a clip to preview'}
+              </div>
+            )}
+
+            <div className="pointer-events-none absolute inset-0">
+              <div
+                className="absolute left-6 right-6 border border-white/35 bg-black/35"
+                style={{ top: `${tuning.titleYRatio * 100}%`, height: '6%' }}
+              />
+              <div
+                className="absolute left-6 right-6 border border-amber-300/90 bg-black/45"
+                style={{ top: `${subtitleTopRatio * 100}%`, height: '5%' }}
+              />
+            </div>
+
+            {loading && (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/28 text-xs text-white/85">
+                Updating preview…
+              </div>
+            )}
+
+            {error && (
+              <div className="pointer-events-none absolute inset-x-4 bottom-4 rounded border border-amber-300/40 bg-black/65 px-3 py-2 text-xs text-amber-200">
+                {error}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -904,17 +840,18 @@ export function CropProfilesDialog({
     }
   }, [open, currentReviewClip, selectedStreamer, sampleClipId, isReviewMode])
 
-  useEffect(() => {
-    if (!open) return
-    if (!isReviewMode) return
-    if (!sampleClipId) return
-    const idx = reviewClips.findIndex((c) => c.id === sampleClipId)
-    if (idx >= 0 && idx !== reviewIndex) {
-      setReviewIndex(idx)
-    }
-  }, [open, sampleClipId, reviewClips, reviewIndex, isReviewMode])
+  const activeClipId = isReviewMode ? (currentReviewClip?.id ?? reviewClips[0]?.id ?? sampleClipId) : sampleClipId
 
-  const activeClipId = isReviewMode ? (currentReviewClip?.id ?? sampleClipId) : sampleClipId
+  const facecamXBounds = useMemo(() => {
+    const w = clamp(facecamRect.w, 0.05, 1)
+    const x = clamp(facecamRect.x, 0, 1 - w)
+    const span = Math.max(1e-6, 1 - w)
+    const base = x / span
+    return {
+      min: Math.round((-base) * 100) / 100,
+      max: Math.round((1 - base) * 100) / 100,
+    }
+  }, [facecamRect.x, facecamRect.w])
 
   const imageSrc = activeClipId
     ? `/api/clips/${encodeURIComponent(activeClipId)}/thumbnail?source=true${thumbAt === null ? '' : `&at=${thumbAt}`}`
@@ -928,6 +865,14 @@ export function CropProfilesDialog({
       .catch((e) => toast.error(e instanceof Error ? e.message : 'Failed to load crop profiles'))
       .finally(() => setLoading(false))
   }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const clamped = clamp(tuning.facecamXBias, facecamXBounds.min, facecamXBounds.max)
+    if (clamped !== tuning.facecamXBias) {
+      setTuning((prev) => normalizeTuning({ ...prev, facecamXBias: clamped }))
+    }
+  }, [open, tuning.facecamXBias, facecamXBounds.min, facecamXBounds.max])
 
   useEffect(() => {
     if (!open) return
@@ -1096,10 +1041,36 @@ export function CropProfilesDialog({
     setLocalConfirmedClipIds((prev) => (prev.includes(currentReviewClip.id) ? prev : [...prev, currentReviewClip.id]))
   }
 
+  function goToReviewIndex(nextIndex: number) {
+    if (reviewClips.length === 0) return
+    const bounded = Math.max(0, Math.min(nextIndex, reviewClips.length - 1))
+    const nextClip = reviewClips[bounded]
+    setReviewIndex(bounded)
+    if (nextClip) {
+      if (nextClip.id !== sampleClipId) setSampleClipId(nextClip.id)
+      if (nextClip.streamer && nextClip.streamer !== selectedStreamer) {
+        setSelectedStreamer(nextClip.streamer)
+      }
+    }
+  }
+
+  function handleSampleClipChange(nextClipId: string) {
+    if (!isReviewMode) {
+      setSampleClipId(nextClipId)
+      return
+    }
+    const idx = reviewClips.findIndex((c) => c.id === nextClipId)
+    if (idx >= 0) {
+      goToReviewIndex(idx)
+      return
+    }
+    setSampleClipId(nextClipId)
+  }
+
   function confirmAndNext() {
     markCurrentClipConfirmed()
     if (reviewClips.length > 0 && reviewIndex < reviewClips.length - 1) {
-      setReviewIndex((prev) => Math.min(prev + 1, reviewClips.length - 1))
+      goToReviewIndex(reviewIndex + 1)
     }
   }
 
@@ -1271,7 +1242,7 @@ export function CropProfilesDialog({
             <div className="rounded-lg border p-3 space-y-3">
               <div className="text-xs uppercase tracking-wider text-muted-foreground">Facecam</div>
               <div className="space-y-3">
-                <RangeField label="X" value={tuning.facecamXBias} min={-1} max={1} step={0.01} onChange={(v) => updateTuningField('facecamXBias', v)} />
+                <RangeField label="X" value={tuning.facecamXBias} min={facecamXBounds.min} max={facecamXBounds.max} step={0.01} onChange={(v) => updateTuningField('facecamXBias', v)} />
                 <RangeField label="Y" value={tuning.facecamYBias} min={0} max={0.5} step={0.005} onChange={(v) => updateTuningField('facecamYBias', v)} format={(v) => `${Math.round(v * 100)}%`} />
                 <RangeField label="Zoom" value={tuning.facecamZoom} min={0.5} max={2} step={0.01} onChange={(v) => updateTuningField('facecamZoom', v)} />
                 <RangeField label="Band height" value={tuning.facecamBandRatio} min={0.16} max={0.5} step={0.01} onChange={(v) => updateTuningField('facecamBandRatio', v)} format={(v) => `${Math.round(v * 100)}%`} />
@@ -1281,10 +1252,10 @@ export function CropProfilesDialog({
             <div className="rounded-lg border p-3 space-y-3">
               <div className="text-xs uppercase tracking-wider text-muted-foreground">Gameplay</div>
               <div className="space-y-3">
-                <RangeField label="Zoom (with facecam)" value={tuning.gameplayZoom} min={0.75} max={1.6} step={0.01} onChange={(v) => updateTuningField('gameplayZoom', v)} />
-                <RangeField label="Zoom (no facecam)" value={tuning.gameplayZoomNoFacecam} min={0.75} max={1.7} step={0.01} onChange={(v) => updateTuningField('gameplayZoomNoFacecam', v)} />
+                <RangeField label="Zoom (with facecam)" value={tuning.gameplayZoom} min={-1} max={2.2} step={0.01} onChange={(v) => updateTuningField('gameplayZoom', v)} />
+                <RangeField label="Zoom (no facecam)" value={tuning.gameplayZoomNoFacecam} min={-1} max={2.3} step={0.01} onChange={(v) => updateTuningField('gameplayZoomNoFacecam', v)} />
                 <RangeField label="X" value={tuning.gameplayXBias} min={-1} max={1} step={0.01} onChange={(v) => updateTuningField('gameplayXBias', v)} />
-                <RangeField label="Y" value={tuning.gameplayYBias} min={-2} max={2} step={0.01} onChange={(v) => updateTuningField('gameplayYBias', v)} />
+                <RangeField label="Y" value={tuning.gameplayYBias} min={-1} max={1} step={0.01} onChange={(v) => updateTuningField('gameplayYBias', v)} />
               </div>
             </div>
 
@@ -1328,7 +1299,7 @@ export function CropProfilesDialog({
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => setReviewIndex((i) => Math.max(0, i - 1))}
+                          onClick={() => goToReviewIndex(reviewIndex - 1)}
                           disabled={reviewIndex <= 0}
                         >
                           Previous
@@ -1336,7 +1307,7 @@ export function CropProfilesDialog({
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => setReviewIndex((i) => Math.min(reviewClips.length - 1, i + 1))}
+                          onClick={() => goToReviewIndex(reviewIndex + 1)}
                           disabled={reviewIndex >= reviewClips.length - 1}
                         >
                           Next
@@ -1383,7 +1354,7 @@ export function CropProfilesDialog({
                           </Select>
                           <Select
                             value={activeClipId ?? ''}
-                            onValueChange={(v) => setSampleClipId(v)}
+                            onValueChange={handleSampleClipChange}
                             disabled={sampleClips.length === 0}
                           >
                             <SelectTrigger className="h-8 w-[min(520px,42vw)]">
@@ -1426,7 +1397,8 @@ export function CropProfilesDialog({
                         </div>
                         <div className="space-y-3 2xl:sticky 2xl:top-0 self-start">
                           <VerticalPreview
-                            imageSrc={imageSrc}
+                            clipId={activeClipId}
+                            thumbAt={thumbAt}
                             facecam={facecamRect}
                             hud={hudRect}
                             facecamEnabled={facecamEnabled}
@@ -1469,7 +1441,7 @@ export function CropProfilesDialog({
                           </Select>
                           <Select
                             value={activeClipId ?? ''}
-                            onValueChange={(v) => setSampleClipId(v)}
+                            onValueChange={handleSampleClipChange}
                             disabled={sampleClips.length === 0}
                           >
                             <SelectTrigger className="h-8 w-[min(520px,42vw)]">
@@ -1491,7 +1463,8 @@ export function CropProfilesDialog({
                       </div>
                       <div className="grid gap-3 xl:grid-cols-[420px_1fr]">
                         <VerticalPreview
-                          imageSrc={imageSrc}
+                          clipId={activeClipId}
+                          thumbAt={thumbAt}
                           facecam={facecamRect}
                           hud={hudRect}
                           facecamEnabled={facecamEnabled}

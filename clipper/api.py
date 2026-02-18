@@ -1,6 +1,7 @@
 """FastAPI backend for the Clipper web dashboard."""
 
 import json
+import hashlib
 import logging
 import re
 import shutil
@@ -90,10 +91,37 @@ class LayoutProfileRequest(BaseModel):
     h: float | None = None
 
 
+_LAYOUT_TUNING_KEYS = (
+    "safe_top_ratio",
+    "safe_bottom_ratio",
+    "facecam_band_ratio",
+    "facecam_x_bias",
+    "facecam_y_bias",
+    "facecam_zoom",
+    "gameplay_zoom",
+    "gameplay_zoom_no_facecam",
+    "gameplay_x_bias",
+    "gameplay_y_bias",
+    "hud_height_ratio",
+    "hud_scale",
+    "hud_x_ratio",
+    "hud_y_ratio",
+    "title_y_ratio",
+    "subtitle_margin_ratio",
+)
+
+
 class AutopilotStartRequest(BaseModel):
-    count: int = 5
-    min_score: int = 40
-    channel: str | None = None
+    count: int = 8
+    min_score: float = 45
+    channel: str | None = "default"
+    auto_upload: bool = True
+    privacy: str = "private"
+    game: str | None = "Deadlock"
+    period: str = "24h"
+    scope: str = "gamewide"
+    streamers: list[str] | None = None
+    daily_limit: int | None = None
 
 
 class FetchScoreRequest(BaseModel):
@@ -127,6 +155,14 @@ class ReleaseRequest(BaseModel):
     clip_id: str
     channel: str
     scheduled_at: str  # ISO datetime
+
+
+_ALLOWED_PRIVACY = {"unlisted", "private", "public"}
+
+
+def _normalize_privacy(value: str | None) -> str:
+    v = str(value or "").strip().lower()
+    return v if v in _ALLOWED_PRIVACY else "unlisted"
 
 
 # -- App factory --
@@ -320,6 +356,41 @@ def create_app(config: dict | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    def _coerce_layout_override(raw: dict | None) -> dict:
+        """Normalize request payload into the per-clip _layout_override shape."""
+        from clipper.layout_profiles import normalize_layout_tuning, normalize_rect
+
+        if not isinstance(raw, dict):
+            return {}
+
+        override: dict = {}
+        facecam = raw.get("facecam")
+        hud = raw.get("hud")
+        if isinstance(facecam, dict):
+            override["facecam"] = normalize_rect(facecam)
+        if isinstance(hud, dict):
+            override["hud"] = normalize_rect(hud)
+
+        if raw.get("facecam_enabled") is not None:
+            override["facecam_enabled"] = bool(raw.get("facecam_enabled"))
+        if raw.get("hud_enabled") is not None:
+            override["hud_enabled"] = bool(raw.get("hud_enabled"))
+
+        tuning = {
+            key: raw.get(key)
+            for key in _LAYOUT_TUNING_KEYS
+            if key in raw and raw.get(key) is not None
+        }
+        override.update(normalize_layout_tuning(tuning))
+
+        # Back-compat payload shape: {x,y,w,h} as facecam crop.
+        if "facecam" not in override and all(raw.get(k) is not None for k in ("x", "y", "w", "h")):
+            override["facecam"] = normalize_rect(
+                {"x": raw.get("x"), "y": raw.get("y"), "w": raw.get("w"), "h": raw.get("h")}
+            )
+
+        return override
+
     # -- Endpoints --
 
     @app.get("/api/config")
@@ -489,6 +560,145 @@ def create_app(config: dict | None = None) -> FastAPI:
 
         return {"clips": clips, "limit": limit}
 
+    @app.get("/api/insights/best-picks")
+    def get_best_picks(
+        period: str = Query("24h"),
+        game: str = Query(""),
+        channel: str = Query("all"),
+        limit: int = Query(3, ge=1, le=3),
+    ):
+        """Return top predicted clips for a selected time window."""
+        from clipper.db import get_db, _row_to_clip
+        from clipper.learn import get_learned_weights
+        from clipper.process.score import rank_clips_v2
+        from clipper.workflow import _build_source_priors
+
+        channel_key = str(channel or "").strip()
+        if channel_key.lower() in ("", "all", "*"):
+            channel_key = ""
+
+        period_key = str(period or "24h").strip().lower()
+        period_modifiers = {
+            "24h": "-24 hours",
+            "3d": "-3 days",
+            "7d": "-7 days",
+            "since_last_output": None,
+        }
+        if period_key not in period_modifiers:
+            raise HTTPException(400, f"Unknown period: {period_key}")
+
+        game_key = str(game or "").strip().lower()
+        conn = get_db(config)
+
+        since_cutoff: str | None = None
+        cutoff_params: list[str] = []
+        if period_key == "since_last_output":
+            output_where = ["status = 'output'"]
+            output_params: list[str] = []
+            if channel_key:
+                output_where.append("channel = ?")
+                output_params.append(channel_key)
+            if game_key:
+                output_where.append("LOWER(game) LIKE ?")
+                output_params.append(f"%{game_key}%")
+            last_row = conn.execute(
+                f"SELECT MAX(datetime(COALESCE(updated_at, fetched_at, created_at))) AS last_ts FROM clips "
+                f"WHERE {' AND '.join(output_where)}",
+                output_params,
+            ).fetchone()
+            since_cutoff = last_row["last_ts"] if last_row and last_row["last_ts"] else None
+
+            # Fallback to 24h when there's no prior output anchor.
+            if since_cutoff:
+                cutoff_sql = "datetime(COALESCE(fetched_at, created_at, updated_at)) >= datetime(?)"
+                cutoff_params = [since_cutoff]
+            else:
+                period_key = "24h"
+
+        if period_key != "since_last_output":
+            cutoff_sql = "datetime(COALESCE(fetched_at, created_at, updated_at)) >= datetime('now', ?)"
+            cutoff_params = [period_modifiers[period_key] or "-24 hours"]
+
+        where = [
+            "status IN ('pending', 'approved', 'skipped')",
+            cutoff_sql,
+        ]
+        params: list[str] = list(cutoff_params)
+
+        if game_key:
+            where.append("LOWER(game) LIKE ?")
+            params.append(f"%{game_key}%")
+        if channel_key:
+            where.append("(channel = ? OR channel IS NULL OR channel = '')")
+            params.append(channel_key)
+
+        query = (
+            "SELECT * FROM clips "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY datetime(COALESCE(fetched_at, created_at, updated_at)) DESC "
+            "LIMIT 3000"
+        )
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            return {
+                "requested_period": str(period or "24h"),
+                "period": period_key,
+                "game": game_key,
+                "candidate_count": 0,
+                "limit": limit,
+                "cutoff": since_cutoff,
+                "picks": [],
+            }
+
+        weights = get_learned_weights(config)
+        candidates: list[dict] = []
+        for row in rows:
+            clip = _row_to_clip(row)
+            candidates.append(clip)
+
+        source_priors = _build_source_priors(config, candidates)
+        scored = rank_clips_v2(
+            candidates,
+            weights=weights,
+            source_priors=source_priors,
+            diversify=True,
+        )
+
+        picks: list[dict] = []
+        seen_ids: set[str] = set()
+        for clip in scored:
+            clip_id = str(clip.get("id", "")).strip()
+            if not clip_id or clip_id in seen_ids:
+                continue
+            seen_ids.add(clip_id)
+            picks.append(
+                {
+                    "id": clip_id,
+                    "title": clip.get("title", ""),
+                    "streamer": clip.get("streamer", ""),
+                    "game": clip.get("game", ""),
+                    "platform": clip.get("platform", "twitch"),
+                    "url": clip.get("url", ""),
+                    "duration": float(clip.get("duration", 0) or 0),
+                    "view_count": int(clip.get("view_count", 0) or 0),
+                    "_score": float(clip.get("_score", 0) or 0),
+                    "thumbnail_url": clip.get("thumbnail_url"),
+                    "created_at": clip.get("created_at"),
+                }
+            )
+            if len(picks) >= limit:
+                break
+
+        return {
+            "requested_period": str(period or "24h"),
+            "period": period_key,
+            "game": game_key,
+            "candidate_count": len(scored),
+            "limit": limit,
+            "cutoff": since_cutoff,
+            "picks": picks,
+        }
+
     @app.post("/api/output/resync")
     def resync_output(limit: int = Query(200, ge=1, le=1000)):
         """Create metadata JSON records for publishable orphan output videos."""
@@ -583,8 +793,8 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.post("/api/workflow/fetch-score")
     def workflow_fetch_score(req: FetchScoreRequest):
         """Synchronous: fetch clips for a game, score them, return tiers."""
-        from clipper.workflow import _fetch_clips, _load_and_score_pending
-        from clipper.db import get_db
+        from clipper.workflow import _fetch_clips, _load_and_score_pending, _select_review_candidates
+        from clipper.db import get_db, update_clip as db_update_clip
 
         try:
             fetched = _fetch_clips(
@@ -608,7 +818,8 @@ def create_app(config: dict | None = None) -> FastAPI:
             id_list = list(fetched_ids)
             placeholders = ",".join("?" for _ in id_list)
             conn.execute(
-                f"UPDATE clips SET status = 'pending' WHERE id IN ({placeholders}) AND status = 'skipped'",
+                # Re-activate fetched clips unless they've already been processed to output.
+                f"UPDATE clips SET status = 'pending' WHERE id IN ({placeholders}) AND status != 'output'",
                 id_list,
             )
         conn.commit()
@@ -637,6 +848,22 @@ def create_app(config: dict | None = None) -> FastAPI:
 
         if not pending:
             return {"clips": [], "tiers": [], "clip_count": 0}
+
+        review_pool = _select_review_candidates(pending, config)
+        selected_ids = {str(c.get("id", "")).strip() for c in review_pool if c.get("id")}
+        for clip in pending:
+            clip_id = str(clip.get("id", "")).strip()
+            if not clip_id:
+                continue
+            clip_score = float(clip.get("_score", 0.0) or 0.0)
+            db_update_clip(
+                config,
+                clip_id,
+                status=("pending" if clip_id in selected_ids else "skipped"),
+                score=clip_score,
+            )
+
+        pending = review_pool
 
         from clipper.process.tiers import compute_duration_tiers
         tiers = compute_duration_tiers(pending)
@@ -688,6 +915,40 @@ def create_app(config: dict | None = None) -> FastAPI:
                 updates["channel"] = channel_key
             if layout_key:
                 updates["_shorts_layout"] = layout_key
+            if layout_key == "fill":
+                # Avoid stale per-clip crop state from previous runs.
+                updates["_layout_override"] = None
+
+            clip_override_raw = layout_overrides.get(clip_id)
+            if isinstance(clip_override_raw, dict):
+                # Metadata overrides (Edit page sends these alongside layout values).
+                scalar_pairs = (
+                    ("_title_override", "_title_override"),
+                    ("title_override", "_title_override"),
+                    ("_description_override", "_description_override"),
+                    ("description_override", "_description_override"),
+                    ("_hook_text_override", "_hook_text_override"),
+                    ("hook_text_override", "_hook_text_override"),
+                    ("_hook_duration", "_hook_duration"),
+                    ("hook_duration", "_hook_duration"),
+                    ("_trim_start", "_trim_start"),
+                    ("trim_start", "_trim_start"),
+                    ("_trim_end", "_trim_end"),
+                    ("trim_end", "_trim_end"),
+                    ("_tags_override", "_tags_override"),
+                    ("tags_override", "_tags_override"),
+                )
+                for raw_key, target_key in scalar_pairs:
+                    if raw_key in clip_override_raw:
+                        updates[target_key] = clip_override_raw.get(raw_key)
+
+                layout_source = clip_override_raw.get("_layout_override")
+                if not isinstance(layout_source, dict):
+                    layout_source = clip_override_raw
+                layout_override = _coerce_layout_override(layout_source)
+                if layout_override:
+                    updates["_layout_override"] = layout_override
+
             db_update_clip(config, clip_id, **updates)
             approved_count += 1
 
@@ -772,6 +1033,7 @@ def create_app(config: dict | None = None) -> FastAPI:
 
         output_dir = config["_output_dir"]
         meta_path = _resolve_clip_meta(output_dir, req.clip_id)
+        privacy = _normalize_privacy(req.privacy)
 
         clip = json.loads(meta_path.read_text())
         clip = _merge_db_overrides(clip, req.clip_id)
@@ -794,7 +1056,7 @@ def create_app(config: dict | None = None) -> FastAPI:
         used_platform = "youtube"
         attempts: list[dict] = []
         for channel_name in channel_order:
-            video_id = upload_clip(clip, config, privacy=req.privacy, channel=channel_name)
+            video_id = upload_clip(clip, config, privacy=privacy, channel=channel_name)
             reason = clip.pop("_upload_error_reason", None)
             message = clip.pop("_upload_error_message", None)
             status_code = clip.pop("_upload_error_status", None)
@@ -838,6 +1100,7 @@ def create_app(config: dict | None = None) -> FastAPI:
         from clipper.upload.dispatcher import upload_clip, get_channel_platform, platform_id_column
 
         output_dir = config["_output_dir"]
+        privacy = _normalize_privacy(req.privacy)
         channels_cfg = config.get("channels", {}) or {}
         if req.channel and req.channel not in channels_cfg:
             raise HTTPException(400, f"Unknown channel: {req.channel}")
@@ -866,7 +1129,7 @@ def create_app(config: dict | None = None) -> FastAPI:
             used_platform = "youtube"
             attempts: list[dict] = []
             for channel_name in channel_order:
-                video_id = upload_clip(clip, config, privacy=req.privacy, channel=channel_name)
+                video_id = upload_clip(clip, config, privacy=privacy, channel=channel_name)
                 reason = clip.pop("_upload_error_reason", None)
                 message = clip.pop("_upload_error_message", None)
                 status_code = clip.pop("_upload_error_status", None)
@@ -957,6 +1220,31 @@ def create_app(config: dict | None = None) -> FastAPI:
                 raise HTTPException(502, "Saved locally but YouTube sync failed")
 
         return {"ok": True}
+
+    @app.post("/api/clips/{clip_id}/requeue")
+    def requeue_clip(clip_id: str):
+        """Move an output clip back to pending so it can be reviewed/reprocessed."""
+        from clipper.db import get_clip as db_get_clip, update_clip as db_update_clip
+
+        clip = db_get_clip(config, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+        if bool(clip.get("clip_count")):
+            raise HTTPException(400, "Compilation clips cannot be requeued to pending review")
+
+        db_update_clip(config, clip_id, status="pending")
+
+        output_dir = config["_output_dir"]
+        meta_path = output_dir / f"{clip_id}.json"
+        if meta_path.exists():
+            try:
+                payload = json.loads(meta_path.read_text())
+                payload["status"] = "pending"
+                meta_path.write_text(json.dumps(payload, indent=2))
+            except Exception:
+                pass
+
+        return {"ok": True, "clip_id": clip_id, "status": "pending"}
 
     @app.get("/api/clips/{clip_id}/subtitles")
     def get_subtitles(clip_id: str):
@@ -1286,70 +1574,27 @@ def create_app(config: dict | None = None) -> FastAPI:
         channels_cfg = config.get("channels", {}) or {}
         if channel_key and channel_key not in channels_cfg:
             raise HTTPException(400, f"Unknown channel: {channel_key}")
-
-        state.reset(recipe="autopilot", phase="learning", detail="Refreshing game stats...")
+        privacy = _normalize_privacy(req.privacy)
+        state.reset(recipe="autopilot", phase="starting", detail="Starting autopilot...")
 
         def _run():
-            import copy
-            from clipper.learn import collect_game_stats, collect_performance, train_weights
-            from clipper.fetch.twitch import fetch_twitch_clips
-            from clipper.workflow import _load_and_score_pending, _approve_clips, _process_clips
+            from clipper.workflow import run_autopilot_workflow
 
             try:
-                # Step 1: Refresh game stats
-                try:
-                    game_stats = collect_game_stats(config)
-                except Exception:
-                    game_stats = {"games": {}}
-
-                # Step 2: Train weights
-                state.set_phase("learning", "Training scoring weights...")
-                try:
-                    collect_performance(config)
-                    train_weights(config)
-                except Exception:
-                    pass  # continue with defaults
-
-                # Step 3: Fetch trending clips
-                state.set_phase("fetching", "Discovering trending clips...")
-                fetch_config = copy.deepcopy(config)
-                fetch_config["targets"]["twitch"]["clips_per_source"] = 100
-
-                game_priorities = {}
-                for game, stats in game_stats.get("games", {}).items():
-                    game_priorities[game] = stats.get("multiplier", 1.0)
-
-                fetch_twitch_clips(
-                    fetch_config, discover_mode=True,
-                    game_priorities=game_priorities,
+                run_autopilot_workflow(
+                    config,
+                    count=req.count,
+                    min_score=req.min_score,
+                    channel=channel_key,
+                    game=req.game,
+                    period=req.period,
+                    scope=req.scope,
+                    streamers=req.streamers,
+                    auto_upload=req.auto_upload,
+                    privacy=privacy,
+                    daily_limit=req.daily_limit,
+                    state=state,
                 )
-
-                # Step 4: Score with game multipliers
-                state.set_phase("scoring", "Scoring with game multipliers...")
-                pending = _load_and_score_pending(config, use_game_multipliers=True)
-
-                if not pending:
-                    state.set_phase("done", "No qualifying clips found")
-                    return
-
-                qualifying = [c for c in pending if c["_score"] >= req.min_score]
-                if not qualifying:
-                    state.set_phase("done", f"No clips above score {req.min_score}")
-                    return
-
-                # Step 5: Approve & process
-                to_approve = qualifying[:req.count]
-                approved = _approve_clips(to_approve, req.count, config, channel=channel_key)
-
-                if approved == 0:
-                    state.set_phase("done", "No clips approved")
-                    return
-
-                state.set_phase("processing", f"Processing {approved} clips...")
-                _process_clips(config, state=state)
-
-                if state.phase != "error":
-                    state.set_phase("done", f"{state.completed} clips processed")
             except Exception as e:
                 state.set_error(str(e))
 
@@ -1364,7 +1609,7 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.get("/api/compilations")
     def get_compilations(channel: str = Query("all")):
         """Return built compilations from output/ (ready to upload/publish)."""
-        from clipper.db import get_db
+        from clipper.db import get_db, save_clip
 
         channel_key = str(channel or "").strip()
         if channel_key.lower() in ("", "all", "*"):
@@ -1381,13 +1626,58 @@ def create_app(config: dict | None = None) -> FastAPI:
         rows = conn.execute(f"SELECT * FROM clips {where} ORDER BY updated_at DESC", params).fetchall()
 
         from clipper.db import _row_to_clip
-        comps = []
+        comps: list[dict] = []
+        seen_ids: set[str] = set()
         for r in rows:
             data = _row_to_clip(r)
             if not data.get("processed_path") or not Path(data["processed_path"]).exists():
                 continue
+            cid = str(data.get("id", "")).strip()
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
             comps.append(data)
 
+        # Backfill from output JSON for compilations that exist on disk but were never indexed.
+        output_dir = config["_output_dir"]
+        if output_dir.exists():
+            for json_path in sorted(output_dir.glob("compilation_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    data = json.loads(json_path.read_text())
+                except Exception:
+                    continue
+
+                cid = str(data.get("id") or json_path.stem).strip()
+                if not cid or cid in seen_ids:
+                    continue
+
+                clip_channel = str(data.get("channel") or data.get("_target_channel") or "").strip()
+                if channel_key and clip_channel != channel_key:
+                    continue
+
+                processed = str(data.get("processed_path") or (output_dir / f"{cid}.mp4")).strip()
+                if not processed or not Path(processed).exists():
+                    continue
+
+                data["id"] = cid
+                data["processed_path"] = processed
+                if clip_channel:
+                    data["channel"] = clip_channel
+                    data["_target_channel"] = clip_channel
+
+                comps.append(data)
+                seen_ids.add(cid)
+
+                # Heal DB so future lookups are channel-aware and fast.
+                try:
+                    save_clip(config, data, status="output")
+                except Exception:
+                    pass
+
+        comps.sort(
+            key=lambda c: c.get("updated_at") or c.get("fetched_at") or c.get("created_at") or "",
+            reverse=True,
+        )
         return {"compilations": comps}
 
     @app.get("/api/compilation/clips")
@@ -1444,6 +1734,28 @@ def create_app(config: dict | None = None) -> FastAPI:
             meta_path = _resolve_clip_meta(output_dir, clip_id)
             ordered_clips.append(json.loads(meta_path.read_text()))
 
+        invalid_shorts: list[str] = []
+        missing_subtitles: list[str] = []
+        for clip in ordered_clips:
+            clip_id = str(clip.get("id", "") or "").strip() or "unknown"
+            if bool(clip.get("is_shorts")):
+                invalid_shorts.append(clip_id)
+            sub_path = str(clip.get("_subtitle_path") or clip.get("subtitle_path") or "").strip()
+            if not sub_path or not Path(sub_path).exists():
+                missing_subtitles.append(clip_id)
+
+        if invalid_shorts:
+            preview = ", ".join(invalid_shorts[:5])
+            if len(invalid_shorts) > 5:
+                preview += f" (+{len(invalid_shorts) - 5} more)"
+            raise HTTPException(400, f"Compilation requires landscape clips. Shorts found: {preview}")
+
+        if missing_subtitles:
+            preview = ", ".join(missing_subtitles[:5])
+            if len(missing_subtitles) > 5:
+                preview += f" (+{len(missing_subtitles) - 5} more)"
+            raise HTTPException(400, f"Compilation requires subtitle files. Missing subtitles for: {preview}")
+
         # Reset state
         state.compile_step = ""
         state.compile_progress = 0.0
@@ -1452,6 +1764,7 @@ def create_app(config: dict | None = None) -> FastAPI:
         def _run():
             from clipper.process.compile import compile_clips, build_thumbnail, build_description
             from datetime import datetime as dt
+            from clipper.db import save_clip
 
             date_str = dt.now().strftime("%Y%m%d")
             game = ordered_clips[0].get("game", "mixed")
@@ -1496,8 +1809,10 @@ def create_app(config: dict | None = None) -> FastAPI:
             inferred = channel_key or ordered_clips[0].get("_target_channel") or ordered_clips[0].get("channel")
             if inferred:
                 comp_meta["_target_channel"] = inferred
+                comp_meta["channel"] = inferred
             meta_out = comp_path.with_suffix(".json")
             meta_out.write_text(json.dumps(comp_meta, indent=2))
+            save_clip(config, comp_meta, status="output")
 
             state.compile_step = ""
             state.compile_progress = 1.0
@@ -1714,6 +2029,106 @@ def create_app(config: dict | None = None) -> FastAPI:
             raise HTTPException(500, "Thumbnail extraction failed")
 
         return {"ok": True}
+
+    @app.post("/api/clips/{clip_id}/layout-preview")
+    def get_layout_preview(
+        clip_id: str,
+        profile: LayoutProfileRequest | None = None,
+        source: bool = Query(True),
+        at: float | None = Query(None, ge=0.0, le=0.95),
+    ):
+        """Render a single 9:16 preview frame using the exact FFmpeg fill filter chain."""
+        from clipper.config import get_ffmpeg
+        from clipper.process.format import (
+            _build_fill_filter,
+            _get_layout_tuning,
+            _is_approximately_vertical,
+            _get_video_dimensions,
+        )
+
+        thumb_response = get_thumbnail(clip_id, source=source, at=at)
+        thumb_path_str = getattr(thumb_response, "path", "") if isinstance(thumb_response, FileResponse) else ""
+        if not thumb_path_str:
+            raise HTTPException(500, "Failed to resolve preview source frame")
+        thumb_path = Path(str(thumb_path_str))
+        if not thumb_path.exists():
+            raise HTTPException(404, "Preview source frame not found")
+
+        layout_override: dict = _coerce_layout_override(profile.model_dump(exclude_none=True) if profile is not None else {})
+
+        shorts_cfg = config.get("shorts", {}) or {}
+        out_w = int(shorts_cfg.get("width", 1080) or 1080)
+        out_h = int(shorts_cfg.get("height", 1920) or 1920)
+
+        cache_dir = config["_queue_dir"] / "thumb_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_payload = {
+            "renderer_version": 6,
+            "clip_id": clip_id,
+            "source": bool(source),
+            "at": at,
+            "thumb": str(thumb_path),
+            "thumb_mtime_ns": thumb_path.stat().st_mtime_ns,
+            "override": layout_override,
+            "out_w": out_w,
+            "out_h": out_h,
+        }
+        cache_key = hashlib.sha1(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        preview_path = cache_dir / f"{clip_id}.layout.{cache_key}.jpg"
+
+        if not preview_path.exists():
+            clip_stub = {"_shorts_layout": "fill"}
+            if layout_override:
+                clip_stub["_layout_override"] = layout_override
+
+            in_w, in_h = _get_video_dimensions(thumb_path)
+            if _is_approximately_vertical(in_w, in_h):
+                vf = (
+                    f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2"
+                )
+                cmd = [
+                    get_ffmpeg(),
+                    "-y",
+                    "-i",
+                    str(thumb_path),
+                    "-vf",
+                    vf,
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(preview_path),
+                ]
+            else:
+                tuning_resolved = _get_layout_tuning(clip_stub, config)
+                facecam_ratio = float(tuning_resolved.get("facecam_band_ratio", 0.20) or 0.20)
+                facecam_h = int(round(out_h * facecam_ratio))
+                vf = _build_fill_filter(w=out_w, h=out_h, facecam_h=facecam_h, clip=clip_stub, config=config)
+                cmd = [
+                    get_ffmpeg(),
+                    "-y",
+                    "-i",
+                    str(thumb_path),
+                    "-filter_complex",
+                    vf,
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(preview_path),
+                ]
+
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=True)
+            except subprocess.CalledProcessError as e:
+                logger.warning("Layout preview render failed for %s: %s", clip_id, e.stderr.strip())
+                return FileResponse(str(thumb_path), media_type="image/jpeg")
+            except Exception as e:
+                logger.warning("Layout preview render failed for %s: %s", clip_id, e)
+                return FileResponse(str(thumb_path), media_type="image/jpeg")
+
+        return FileResponse(str(preview_path), media_type="image/jpeg")
 
     # -- Static files / SPA fallback (production) --
     web_dist = Path(__file__).resolve().parent.parent / "web" / "dist"

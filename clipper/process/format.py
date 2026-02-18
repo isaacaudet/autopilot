@@ -257,104 +257,40 @@ def _build_fill_filter(
     face_rect = _get_facecam_rect(clip, config, prof)
     hud_rect = _get_hud_rect(clip, config, prof)
 
-    # By default, crop the gameplay source so the HUD/abilities are removed from
-    # the main gameplay band, then re-add them crisply in the safe-bottom region.
-    # Use the calibrated HUD rect's top edge as the crop boundary.
+    # Gameplay source crop. Keep this explicit-only:
+    # we do not auto-derive crop bounds from HUD/facecam rects because that
+    # makes zoom/pan feel inconsistent between clips.
     bottom_crop = float(gameplay_cfg.get("bottom_crop", 0.0) or 0.0)
     bottom_crop = max(0.0, min(0.35, bottom_crop))
+    top_crop = float(gameplay_cfg.get("top_crop", 0.0) or 0.0)
+    top_crop = max(0.0, min(0.45, top_crop))
+
     hud_rect_configured = isinstance(prof, dict) and isinstance((prof or {}).get("hud"), dict)
     if hud_enabled and not hud_rect_configured:
         # Safety net: don't crop the gameplay or attempt a HUD overlay if the HUD
         # rect was never calibrated for this streamer.
         hud_enabled = False
         bottom_crop = 0.0
-    elif hud_enabled:
-        if bottom_crop <= 0.0:
-            # Derived crop boundary: slightly BELOW the HUD top edge so we don't
-            # accidentally cut off health bars that sit just above the HUD.
-            pad = float(gameplay_cfg.get("hud_crop_pad", 0.01) or 0.0)
-            pad = max(0.0, min(0.08, pad))
-            hud_x = float(hud_rect.get("x", 0.0) or 0.0)
-            hud_y = float(hud_rect.get("y", 0.0) or 0.0)
-            hud_w = float(hud_rect.get("w", 0.0) or 0.0)
-            hud_h = float(hud_rect.get("h", 0.0) or 0.0)
-
-            # Only treat HUD rect as a bottom HUD bar when it *looks* like one.
-            # This prevents a bad calibration (e.g., selecting the minimap) from
-            # nuking the gameplay region (cutting off abilities/health).
-            hud_bar_min_y = float(gameplay_cfg.get("hud_bar_min_y", 0.75) or 0.75)
-            hud_bar_min_y = max(0.55, min(0.9, hud_bar_min_y))
-            hud_bar_min_w = float(gameplay_cfg.get("hud_bar_min_w", 0.18) or 0.18)
-            hud_bar_min_w = max(0.1, min(0.9, hud_bar_min_w))
-            hud_bar_min_aspect = float(gameplay_cfg.get("hud_bar_min_aspect", 1.35) or 1.35)
-            hud_bar_min_aspect = max(1.0, min(6.0, hud_bar_min_aspect))
-            hud_cutout_min_w = float(gameplay_cfg.get("hud_cutout_min_w", 0.30) or 0.30)
-            hud_cutout_min_w = max(0.12, min(0.95, hud_cutout_min_w))
-
-            hud_aspect = (hud_w / hud_h) if hud_h > 1e-6 else 0.0
-            hud_is_bar = (
-                hud_y >= hud_bar_min_y
-                and hud_w >= hud_bar_min_w
-                and hud_aspect >= hud_bar_min_aspect
-                and hud_x <= 0.7  # a minimap crop is usually far-right; keep this permissive
-            )
-
-            # Only crop away the bottom of gameplay if the HUD crop is wide enough
-            # to represent the full "bottom bar". Otherwise we'd risk removing
-            # abilities/health without re-adding them in the overlay.
-            if hud_is_bar and hud_w >= hud_cutout_min_w:
-                bottom_crop = 1.0 - min(1.0, hud_y + pad)
-            else:
-                bottom_crop = 0.0
-        # Cap derived crop so a slightly-off calibration doesn't nuke gameplay.
-        bottom_crop = max(0.0, min(0.14, bottom_crop))
-    else:
-        # If we are NOT overlaying HUD separately, don't crop away the bottom UI.
-        bottom_crop = 0.0
-
-    # Derive a top cutout to remove the original facecam from gameplay when we
-    # are stacking facecam + gameplay. This prevents duplicated facecam.
-    top_crop = float(gameplay_cfg.get("top_crop", 0.0) or 0.0)
-    top_crop = max(0.0, min(0.45, top_crop))
-    if facecam_enabled and top_crop <= 0.0:
-        pad = float(gameplay_cfg.get("facecam_crop_pad", 0.02) or 0.0)
-        pad = max(0.0, min(0.12, pad))
-        min_center_x = float(gameplay_cfg.get("facecam_crop_min_center_x", 0.33) or 0.33)
-        max_center_x = float(gameplay_cfg.get("facecam_crop_max_center_x", 0.67) or 0.67)
-        min_center_x = max(0.0, min(1.0, min_center_x))
-        max_center_x = max(0.0, min(1.0, max_center_x))
-        max_start = float(gameplay_cfg.get("facecam_crop_max_start_y", 0.45) or 0.45)
-        max_start = max(0.2, min(0.8, max_start))
-        max_end = float(gameplay_cfg.get("facecam_crop_max_end_y", 0.75) or 0.75)
-        max_end = max(0.35, min(0.98, max_end))
-        max_crop = float(gameplay_cfg.get("facecam_crop_max", 0.36) or 0.36)
-        max_crop = max(0.18, min(0.6, max_crop))
-
-        face_x = float(face_rect.get("x", 0.0) or 0.0)
-        face_w = float(face_rect.get("w", 0.0) or 0.0)
-        face_center_x = face_x + face_w / 2.0
-
-        face_y = float(face_rect.get("y", 0.0) or 0.0)
-        face_y2 = face_y + float(face_rect.get("h", 0.0) or 0.0)
-
-        # Only apply the vertical cutout when the facecam is near the center.
-        # For corner facecams, center-cropping usually removes the facecam anyway,
-        # and a top cutout would unnecessarily remove the top HUD row/scoreboard.
-        if face_y <= max_start and face_y2 <= max_end and (min_center_x <= face_center_x <= max_center_x):
-            top_crop = min(max_crop, max(0.0, face_y2 + pad))
 
     # Keep gameplay mostly centered and readable; no-facecam can zoom harder.
-    zoom = float(tuning.get("gameplay_zoom", 1.02))
+    # Backward-compatible zoom semantics:
+    # - positive values are absolute scale (legacy behavior)
+    # - zero/negative values are zoom-out offsets from 1.0 (e.g. -0.3 -> 0.7x)
+    raw_zoom = float(tuning.get("gameplay_zoom", 1.02))
+    zoom = max(0.2, (1.0 + raw_zoom) if raw_zoom <= 0.0 else raw_zoom)
     if not facecam_enabled:
         # Game-only layout can zoom more to fill the screen.
-        zoom_no_facecam = float(tuning.get("gameplay_zoom_no_facecam", 1.12))
+        raw_zoom_no_facecam = float(tuning.get("gameplay_zoom_no_facecam", 1.12))
+        zoom_no_facecam = max(0.2, (1.0 + raw_zoom_no_facecam) if raw_zoom_no_facecam <= 0.0 else raw_zoom_no_facecam)
         zoom = zoom_no_facecam
 
-    # Game band height depends on whether we have a facecam band.
+    # Game band height: fill from facecam bottom (or safe_top) to the
+    # frame bottom.  No safe_bottom gap — the HUD overlays on gameplay
+    # directly, which looks cleaner than a blurred dark band.
     if facecam_enabled:
-        game_h = max(1, content_h - facecam_h)
+        game_h = max(1, h - facecam_h)
     else:
-        game_h = max(1, content_h)
+        game_h = max(1, h - safe_top)
 
     # Slightly compress the facecam band when it is wide (full-width stack).
     # The user's preference is "mostly gameplay"; keep facecam <= ~1/3 by default.
@@ -366,42 +302,46 @@ def _build_fill_filter(
     hud_pad_y = int(hud_cfg.get("pad_y", 18) or 0)
     hud_target_h = int(round(h * hud_ratio))
 
-    # Fit HUD into the bottom safe region.
-    hud_max_h = max(60, safe_bottom - max(0, hud_pad_y) - 8) if safe_bottom > 0 else hud_target_h
-    hud_h = max(1, min(hud_target_h, hud_max_h))
+    # HUD overlay height — sized by hud_height_ratio, capped at 20% of frame.
+    hud_h = max(1, min(hud_target_h, int(round(h * 0.20))))
 
     pan_x = float(tuning.get("gameplay_x_bias", 0.0))
-    default_pan_y = 0.0 if hud_enabled else 1.0
-    pan_y = float(tuning.get("gameplay_y_bias", default_pan_y))
+    # Gameplay Y is handled as output-plane translation (not crop zoom/pan).
+    gameplay_y_bias = float(tuning.get("gameplay_y_bias", 0.0))
     pan_x_n = max(0.0, min(1.0, (pan_x + 1.0) / 2.0))
-    pan_y_n = max(0.0, min(1.0, (pan_y + 1.0) / 2.0))
-    scaled_w = int(round(w * zoom))
-    scaled_h = int(round(game_h * zoom))
-    crop_x_expr = f"max(0,min(iw-ow,(iw-ow)*{pan_x_n:.4f}))"
-    crop_y_expr = f"max(0,min(ih-oh,(ih-oh)*{pan_y_n:.4f}))"
+    scale_target_w = max(2, int(round(w * zoom)))
+    scale_target_h = max(2, int(round(game_h * zoom)))
 
     # Facecam crop -> scale/crop to top band, with optional pan + zoom.
     facecam_x_bias = float(tuning.get("facecam_x_bias", 0.0))
     facecam_zoom = float(tuning.get("facecam_zoom", 1.0))
     facecam_zoom = max(0.5, min(2.0, facecam_zoom))
-    facecam_x_n = max(0.0, min(1.0, (facecam_x_bias + 1.0) / 2.0))
+    face_w = max(0.05, float(face_rect.get("w", 0.30) or 0.30))
+    face_h_ratio = max(0.05, float(face_rect.get("h", 0.34) or 0.34))
+    face_y_ratio = max(0.0, min(1.0 - face_h_ratio, float(face_rect.get("y", 0.18) or 0.18)))
+    face_base_x = max(0.0, min(1.0 - face_w, float(face_rect.get("x", 0.0) or 0.0)))
+    face_span = max(1e-6, 1.0 - face_w)
+    face_base_n = max(0.0, min(1.0, face_base_x / face_span))
+    # Bias nudges the sampled source window relative to the calibrated base rect.
+    face_src_x_n = max(0.0, min(1.0, face_base_n + facecam_x_bias))
     if facecam_enabled:
         face_scale_w = max(1, int(round(w * facecam_zoom)))
         face_scale_h = max(1, int(round(facecam_h * facecam_zoom)))
-        face_crop_x = f"max(0,min(iw-ow,(iw-ow)*{facecam_x_n:.4f}))"
+        face_src_x = f"max(0,min(iw-(iw*{face_w:.4f}),(iw-(iw*{face_w:.4f}))*{face_src_x_n:.4f}))"
         face = (
             f"[face_src]crop="
-            f"w=iw*{face_rect['w']}:h=ih*{face_rect['h']}:"
-            f"x=iw*{face_rect['x']}:y=ih*{face_rect['y']},"
+            f"w=iw*{face_w:.4f}:h=ih*{face_h_ratio:.4f}:"
+            f"x='{face_src_x}':y=ih*{face_y_ratio:.4f},"
             f"scale={face_scale_w}:{face_scale_h}:force_original_aspect_ratio=increase,setsar=1,"
-            f"crop={w}:{facecam_h}:x='{face_crop_x}':y=(ih-oh)/2"
+            f"crop={w}:{facecam_h}:x=(iw-ow)/2:y=(ih-oh)/2"
             f"[face]"
         )
 
-    # Gameplay crop:
-    # 1) Optionally crop out the bottom HUD slice (so platform UI doesn't cover it)
-    # 2) Scale up (zoom) and crop to bottom band size, anchored bottom-left by default.
-    # Keep within bounds.
+    # Gameplay transform:
+    # 1) Optionally crop explicit top/bottom source slices.
+    # 2) Scale from source using zoom.
+    # 3) Keep gameplay as a free layer (no fixed-size pre-crop canvas);
+    #    final clipping only happens against the output frame edges.
     if top_crop + bottom_crop >= 0.9:
         top_crop = max(0.0, min(top_crop, 0.45))
         bottom_crop = max(0.0, min(bottom_crop, 0.14))
@@ -409,36 +349,19 @@ def _build_fill_filter(
             top_crop = 0.0
             bottom_crop = 0.0
 
-    if zoom >= 1.0:
-        game = (
-            f"[game_src]crop=w=iw:h=ih*(1-{top_crop}-{bottom_crop}):x=0:y=ih*{top_crop},"
-            f"scale={scaled_w}:{scaled_h}:force_original_aspect_ratio=increase,setsar=1,"
-            f"crop={w}:{game_h}:x='{crop_x_expr}':y='{crop_y_expr}'"
-            f"[game]"
-        )
-    else:
-        # Keep zoom-out smooth around 1.0 by first building the same filled crop,
-        # then shrinking that composed gameplay plane into the band.
-        base_scaled_w = max(1, int(round(w)))
-        base_scaled_h = max(1, int(round(game_h)))
-        fit_w = max(1, int(round(w * zoom)))
-        fit_h = max(1, int(round(game_h * zoom)))
-        pad_x_expr = f"max(0,min(ow-iw,(ow-iw)*{pan_x_n:.4f}))"
-        pad_y_expr = f"max(0,min(oh-ih,(oh-ih)*{pan_y_n:.4f}))"
-        game = (
-            f"[game_src]crop=w=iw:h=ih*(1-{top_crop}-{bottom_crop}):x=0:y=ih*{top_crop},"
-            f"scale={base_scaled_w}:{base_scaled_h}:force_original_aspect_ratio=increase,setsar=1,"
-            f"crop={w}:{game_h}:x='{crop_x_expr}':y='{crop_y_expr}',"
-            f"scale={fit_w}:{fit_h}:flags=lanczos,"
-            f"pad={w}:{game_h}:x='{pad_x_expr}':y='{pad_y_expr}':color=black"
-            f"[game]"
-        )
+    game_overlay_x_expr = f"if(gte(W,w),(W-w)*{pan_x_n:.4f},-(w-W)*{pan_x_n:.4f})"
+    # Center gameplay relative to the gameplay band height, then apply plane Y.
+    game_overlay_y_center_expr = f"({game_h}-h)/2"
+    game = (
+        f"[game_src]crop=w=iw:h=ih*(1-{top_crop}-{bottom_crop}):x=0:y=ih*{top_crop},"
+        f"scale={scale_target_w}:{scale_target_h}:force_original_aspect_ratio=increase,setsar=1"
+        f"[game]"
+    )
 
-    # Background blur fills the full 9:16 frame, while the stacked content
-    # is shorter (content_h), leaving safe blurred top/bottom regions.
+    # Background blur fills the full 9:16 frame (safety net behind the stack).
     bg = (
         f"[bg_src]scale={w}:{h}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{h},boxblur=30:5"
+        f"crop={w}:{h},setsar=1,boxblur=30:5"
         f"[bg]"
     )
 
@@ -460,14 +383,15 @@ def _build_fill_filter(
             f"[hud]"
         )
 
-    # Compose stack: face+game if facecam is present, otherwise game-only.
-    if facecam_enabled:
-        stack = "[face][game]vstack=inputs=2[stack]"
-    else:
-        stack = "[game]null[stack]"
-
+    # Wider travel so gameplay Y behaves like a true layout-position control.
+    gameplay_shift_limit = int(round(h * 0.35))
+    gameplay_shift = int(round(gameplay_shift_limit * max(-1.0, min(1.0, gameplay_y_bias))))
     facecam_y_bias = float(tuning.get("facecam_y_bias", 0.0))
-    stack_y = max(0, int(round(h * facecam_y_bias))) if facecam_enabled else max(0, safe_top)
+    face_y = max(0, int(round(h * facecam_y_bias))) if facecam_enabled else 0
+    game_y_base = (face_y + facecam_h) if facecam_enabled else max(0, safe_top)
+    game_y = game_y_base + gameplay_shift
+
+    game_overlay_y_expr = f"{game_y}+{game_overlay_y_center_expr}"
 
     # Place HUD in user-controlled location (defaults near safe-bottom center).
     hud_overlay_x_expr = f"max(0,min(W-w,(W-w)*{hud_x_ratio:.4f}))"
@@ -480,8 +404,8 @@ def _build_fill_filter(
             f"{game};"
             f"{hud};"
             f"{bg};"
-            f"{stack};"
-            f"[bg][stack]overlay=x=0:y={stack_y}[base];"
+            f"[bg][face]overlay=x=0:y={face_y}[lay1];"
+            f"[lay1][game]overlay=x='{game_overlay_x_expr}':y='{game_overlay_y_expr}'[base];"
             f"[base][hud]overlay=x='{hud_overlay_x_expr}':y='{hud_overlay_y_expr}'"
         )
 
@@ -491,8 +415,8 @@ def _build_fill_filter(
             f"{face};"
             f"{game};"
             f"{bg};"
-            f"{stack};"
-            f"[bg][stack]overlay=x=0:y={stack_y}"
+            f"[bg][face]overlay=x=0:y={face_y}[lay1];"
+            f"[lay1][game]overlay=x='{game_overlay_x_expr}':y='{game_overlay_y_expr}'"
         )
 
     if not facecam_enabled and hud_enabled:
@@ -501,8 +425,7 @@ def _build_fill_filter(
             f"{game};"
             f"{hud};"
             f"{bg};"
-            f"{stack};"
-            f"[bg][stack]overlay=x=0:y={stack_y}[base];"
+            f"[bg][game]overlay=x='{game_overlay_x_expr}':y='{game_overlay_y_expr}'[base];"
             f"[base][hud]overlay=x='{hud_overlay_x_expr}':y='{hud_overlay_y_expr}'"
         )
 
@@ -511,8 +434,7 @@ def _build_fill_filter(
         "[0:v]split=2[game_src][bg_src];"
         f"{game};"
         f"{bg};"
-        f"{stack};"
-        f"[bg][stack]overlay=x=0:y={stack_y}"
+        f"[bg][game]overlay=x='{game_overlay_x_expr}':y='{game_overlay_y_expr}'"
     )
 
 
@@ -557,14 +479,14 @@ def format_for_shorts(video_path: Path, config: dict, clip: dict | None = None, 
                 content_h = h
 
             ratio = float(tuning.get("facecam_band_ratio", 0.20))
-            facecam_h = int(round(content_h * ratio))
+            facecam_h = int(round(h * ratio))
             vf = _build_fill_filter(w=w, h=h, facecam_h=facecam_h, clip=clip, config=config)
             if verbose:
-                gameplay_h = max(0, content_h - facecam_h)
+                gameplay_h = max(0, h - facecam_h)
                 console.print(
                     "  Landscape detected, fill layout: "
                     f"facecam_h={facecam_h}px, gameplay_h={gameplay_h}px, "
-                    f"safe_top={safe_top}px, safe_bottom={safe_bottom}px"
+                    f"safe_top={safe_top}px"
                 )
         else:
             # Landscape — blurred background + gameplay filling ~60% of vertical frame
