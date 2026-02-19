@@ -313,26 +313,38 @@ def _build_fill_filter(
     scale_target_h = max(2, int(round(game_h * zoom)))
 
     # Facecam crop -> scale/crop to top band, with optional pan + zoom.
+    # Important: for zoom < 1 we "zoom out" by sampling a larger source window.
+    # This avoids invalid crop sizes (where output crop > scaled input) that can
+    # make the facecam disappear.
     facecam_x_bias = float(tuning.get("facecam_x_bias", 0.0))
     facecam_zoom = float(tuning.get("facecam_zoom", 1.0))
     facecam_zoom = max(0.5, min(2.0, facecam_zoom))
-    face_w = max(0.05, float(face_rect.get("w", 0.30) or 0.30))
-    face_h_ratio = max(0.05, float(face_rect.get("h", 0.34) or 0.34))
-    face_y_ratio = max(0.0, min(1.0 - face_h_ratio, float(face_rect.get("y", 0.18) or 0.18)))
-    face_base_x = max(0.0, min(1.0 - face_w, float(face_rect.get("x", 0.0) or 0.0)))
+    face_w_base = max(0.05, float(face_rect.get("w", 0.30) or 0.30))
+    face_h_base = max(0.05, float(face_rect.get("h", 0.34) or 0.34))
+    face_x_base = max(0.0, min(1.0 - face_w_base, float(face_rect.get("x", 0.0) or 0.0)))
+    face_y_base = max(0.0, min(1.0 - face_h_base, float(face_rect.get("y", 0.18) or 0.18)))
+
+    zoom_inv = 1.0 / max(0.01, facecam_zoom)
+    face_w = max(0.05, min(1.0, face_w_base * zoom_inv))
+    face_h_ratio = max(0.05, min(1.0, face_h_base * zoom_inv))
+
+    # Keep the calibrated rect center stable as zoom changes.
+    base_center_x = face_x_base + (face_w_base / 2.0)
+    base_center_y = face_y_base + (face_h_base / 2.0)
+    face_x_centered = max(0.0, min(1.0 - face_w, base_center_x - (face_w / 2.0)))
+    face_y_ratio = max(0.0, min(1.0 - face_h_ratio, base_center_y - (face_h_ratio / 2.0)))
+
     face_span = max(1e-6, 1.0 - face_w)
-    face_base_n = max(0.0, min(1.0, face_base_x / face_span))
+    face_base_n = max(0.0, min(1.0, face_x_centered / face_span))
     # Bias nudges the sampled source window relative to the calibrated base rect.
     face_src_x_n = max(0.0, min(1.0, face_base_n + facecam_x_bias))
     if facecam_enabled:
-        face_scale_w = max(1, int(round(w * facecam_zoom)))
-        face_scale_h = max(1, int(round(facecam_h * facecam_zoom)))
         face_src_x = f"max(0,min(iw-(iw*{face_w:.4f}),(iw-(iw*{face_w:.4f}))*{face_src_x_n:.4f}))"
         face = (
             f"[face_src]crop="
             f"w=iw*{face_w:.4f}:h=ih*{face_h_ratio:.4f}:"
             f"x='{face_src_x}':y=ih*{face_y_ratio:.4f},"
-            f"scale={face_scale_w}:{face_scale_h}:force_original_aspect_ratio=increase,setsar=1,"
+            f"scale={w}:{facecam_h}:force_original_aspect_ratio=increase,setsar=1,"
             f"crop={w}:{facecam_h}:x=(iw-ow)/2:y=(ih-oh)/2"
             f"[face]"
         )
@@ -373,15 +385,20 @@ def _build_fill_filter(
     hud_y_ratio = max(0.0, min(1.0, hud_y_ratio))
     hud_target_w = max(1, int(round(w * hud_scale)))
     hud_target_h = max(1, int(round(hud_h * hud_scale)))
+    hud_border_px = int(hud_cfg.get("border_px", 4) or 0)
+    hud_border_px = max(0, min(hud_border_px, 24))
+    hud_border_color = str(hud_cfg.get("border_color", "white@0.95") or "white@0.95").strip()
+    hud_border_color = hud_border_color.replace(";", "").replace(",", "") or "white@0.95"
 
     if hud_enabled:
-        hud = (
-            f"[hud_src]crop="
-            f"w=iw*{hud_rect['w']}:h=ih*{hud_rect['h']}:"
+        hud_filter = (
+            f"crop=w=iw*{hud_rect['w']}:h=ih*{hud_rect['h']}:"
             f"x=iw*{hud_rect['x']}:y=ih*{hud_rect['y']},"
             f"scale={hud_target_w}:{hud_target_h}:force_original_aspect_ratio=decrease,setsar=1"
-            f"[hud]"
         )
+        if hud_border_px > 0:
+            hud_filter += f",drawbox=x=0:y=0:w=iw:h=ih:color={hud_border_color}:t={hud_border_px}"
+        hud = f"[hud_src]{hud_filter}[hud]"
 
     # Wider travel so gameplay Y behaves like a true layout-position control.
     gameplay_shift_limit = int(round(h * 0.35))

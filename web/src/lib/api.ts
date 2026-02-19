@@ -545,7 +545,7 @@ export async function startAutopilot(opts?: {
       privacy: opts?.privacy ?? 'private',
       game: opts?.game ?? 'Deadlock',
       period: opts?.period ?? '24h',
-      scope: opts?.scope ?? 'gamewide',
+      scope: opts?.scope ?? 'configured',
       streamers: opts?.streamers ?? null,
       daily_limit: opts?.daily_limit ?? null,
     }),

@@ -1,0 +1,432 @@
+{
+  "updated_at": "2026-02-16T07:45:48.407665+00:00",
+  "profiles": {
+    "xqc": {
+      "facecam_enabled": false,
+      "hud_enabled": true,
+      "hud": {
+        "x": 0.01,
+        "y": 0.875,
+        "w": 0.22,
+        "h": 0.105
+      },
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "xera": {
+      "facecam_enabled": false,
+      "hud_enabled": true,
+      "hud": {
+        "x": 0.01,
+        "y": 0.875,
+        "w": 0.22,
+        "h": 0.105
+      },
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "eido": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.3432,
+        "w": 0.1811,
+        "h": 0.1983
+      },
+      "facecam_enabled": true,
+      "hud_enabled": true,
+      "hud": {
+        "x": 0.0103,
+        "y": 0.8851,
+        "w": 0.2251,
+        "h": 0.0989
+      },
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.33,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.15,
+      "gameplay_x_bias": -0.06,
+      "gameplay_y_bias": -0.32,
+      "hud_height_ratio": 0.08,
+      "hud_scale": 0.92,
+      "hud_x_ratio": 0.5,
+      "hud_y_ratio": 0.96,
+      "title_y_ratio": 0.05,
+      "subtitle_margin_ratio": 0.205
+    },
+    "chromehag": {
+      "facecam": {
+        "x": 0.0196,
+        "y": 0.0855,
+        "w": 0.1964,
+        "h": 0.251
+      },
+      "hud": {
+        "x": 0.0122,
+        "y": 0.8787,
+        "w": 0.2206,
+        "h": 0.1074
+      }
+    },
+    "silverssn": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.6532,
+        "w": 0.2597,
+        "h": 0.3468
+      },
+      "hud": {
+        "x": 0.7882,
+        "y": 0.6805,
+        "w": 0.2043,
+        "h": 0.1988
+      },
+      "facecam_enabled": true,
+      "hud_enabled": true
+    },
+    "zerggyyyy": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.2793,
+        "w": 0.2243,
+        "h": 0.2558
+      },
+      "hud": {
+        "x": 0.0128,
+        "y": 0.8808,
+        "w": 0.2189,
+        "h": 0.1062
+      }
+    },
+    "de_rebecca": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0,
+        "y": 0.78,
+        "w": 0.44,
+        "h": 0.22
+      },
+      "facecam_enabled": false,
+      "hud_enabled": false
+    },
+    "lazarusdl": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0142,
+        "y": 0.8798,
+        "w": 0.2633,
+        "h": 0.1083
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "vegas": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0129,
+        "y": 0.88,
+        "w": 0.2184,
+        "h": 0.1038
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "us_plus_one": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.3317,
+        "w": 0.2288,
+        "h": 0.2836
+      },
+      "hud": {
+        "x": 0.011,
+        "y": 0.8821,
+        "w": 0.2167,
+        "h": 0.1035
+      },
+      "facecam_enabled": true,
+      "hud_enabled": true
+    },
+    "vespernestia": {
+      "facecam": {
+        "x": 0.5396,
+        "y": 0.3408,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0121,
+        "y": 0.8799,
+        "w": 0.2183,
+        "h": 0.1034
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "divisiondl": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0,
+        "y": 0.78,
+        "w": 0.44,
+        "h": 0.22
+      },
+      "facecam_enabled": false,
+      "hud_enabled": false
+    },
+    "chazm": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0136,
+        "y": 0.8737,
+        "w": 0.2163,
+        "h": 0.112
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "dewamoon": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0107,
+        "y": 0.8824,
+        "w": 0.244,
+        "h": 0.1037
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "guardkiller6": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.0,
+        "w": 0.46,
+        "h": 0.46
+      },
+      "hud": {
+        "x": 0.0119,
+        "y": 0.8319,
+        "w": 0.2239,
+        "h": 0.1058
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "baaulp": {
+      "facecam": {
+        "x": 0.8423,
+        "y": 0.4794,
+        "w": 0.1577,
+        "h": 0.2485
+      },
+      "hud": {
+        "x": 0.0144,
+        "y": 0.8824,
+        "w": 0.219,
+        "h": 0.0998
+      },
+      "facecam_enabled": true,
+      "hud_enabled": true
+    },
+    "benasdl": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.18,
+        "w": 0.3,
+        "h": 0.34
+      },
+      "hud": {
+        "x": 0.0129,
+        "y": 0.8787,
+        "w": 0.2224,
+        "h": 0.1135
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true
+    },
+    "ziews": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.3881,
+        "w": 0.2134,
+        "h": 0.2138
+      },
+      "hud": {
+        "x": 0.0124,
+        "y": 0.8806,
+        "w": 0.2195,
+        "h": 0.1054
+      },
+      "facecam_enabled": true,
+      "hud_enabled": true
+    },
+    "aboo_dl": {
+      "facecam": {
+        "x": 0.0171,
+        "y": 0.425,
+        "w": 0.3,
+        "h": 0.34
+      },
+      "hud": {
+        "x": 0.0136,
+        "y": 0.8824,
+        "w": 0.214,
+        "h": 0.1041
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "dygalusiun": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.18,
+        "w": 0.3,
+        "h": 0.34
+      },
+      "hud": {
+        "x": 0.0143,
+        "y": 0.8201,
+        "w": 0.58,
+        "h": 0.16
+      },
+      "facecam_enabled": false,
+      "hud_enabled": false,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "dudasop": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.18,
+        "w": 0.3,
+        "h": 0.34
+      },
+      "hud": {
+        "x": 0.0114,
+        "y": 0.8816,
+        "w": 0.2213,
+        "h": 0.1057
+      },
+      "facecam_enabled": false,
+      "hud_enabled": true,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "buds": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.18,
+        "w": 0.3,
+        "h": 0.34
+      },
+      "hud": {
+        "x": 0.0119,
+        "y": 0.8223,
+        "w": 0.58,
+        "h": 0.16
+      },
+      "facecam_enabled": false,
+      "hud_enabled": false,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    },
+    "fredthefinch": {
+      "facecam": {
+        "x": 0.0,
+        "y": 0.2887,
+        "w": 0.189,
+        "h": 0.3158
+      },
+      "hud": {
+        "x": 0.0,
+        "y": 0.84,
+        "w": 0.58,
+        "h": 0.16
+      },
+      "facecam_enabled": true,
+      "hud_enabled": false,
+      "safe_top_ratio": 0.08,
+      "safe_bottom_ratio": 0.13,
+      "facecam_band_ratio": 0.2,
+      "gameplay_zoom": 1.02,
+      "gameplay_zoom_no_facecam": 1.12,
+      "hud_height_ratio": 0.08,
+      "title_y_ratio": 0.03,
+      "subtitle_margin_ratio": 0.2344
+    }
+  }
+}

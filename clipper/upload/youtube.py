@@ -19,19 +19,25 @@ console = Console()
 
 # Common game name → tag expansions for search volume
 GAME_TAG_EXPANSIONS = {
-    "Deadlock": ["deadlock", "deadlock game", "valve deadlock", "deadlock clips", "deadlock gameplay"],
-    "ARC Raiders": ["arc raiders", "arc raiders clips", "arc raiders gameplay"],
-    "League of Legends": ["league of legends", "lol", "league", "riot games"],
-    "Valorant": ["valorant", "valo", "valorant clips"],
+    "Deadlock": ["deadlock", "deadlock game", "valve deadlock", "deadlock clips", "deadlock gameplay", "deadlock highlights", "deadlock ranked", "deadlock moments", "deadlock best plays"],
+    "ARC Raiders": ["arc raiders", "arc raiders clips", "arc raiders gameplay", "arc raiders highlights"],
+    "League of Legends": ["league of legends", "lol", "league", "riot games", "league clips"],
+    "Valorant": ["valorant", "valo", "valorant clips", "valorant highlights", "valorant ranked", "val clips"],
     "Just Chatting": ["just chatting", "irl", "react"],
-    "Fortnite": ["fortnite", "fortnite clips", "battle royale"],
-    "GTA V": ["gta", "gta 5", "gta rp", "grand theft auto"],
-    "Minecraft": ["minecraft", "mc"],
-    "Overwatch 2": ["overwatch", "overwatch 2", "ow2"],
-    "Call of Duty": ["cod", "call of duty", "warzone"],
-    "Apex Legends": ["apex", "apex legends"],
-    "Counter-Strike": ["cs2", "counter strike", "csgo"],
+    "Fortnite": ["fortnite", "fortnite clips", "fortnite highlights", "battle royale", "fortnite wins"],
+    "GTA V": ["gta", "gta 5", "gta rp", "grand theft auto", "gta clips"],
+    "Minecraft": ["minecraft", "mc", "minecraft clips", "minecraft highlights"],
+    "Overwatch 2": ["overwatch", "overwatch 2", "ow2", "ow2 clips", "overwatch highlights"],
+    "Call of Duty": ["cod", "call of duty", "warzone", "cod clips", "warzone clips"],
+    "Apex Legends": ["apex", "apex legends", "apex clips", "apex highlights", "apex ranked"],
+    "Counter-Strike": ["cs2", "counter strike", "csgo", "cs2 clips", "cs2 highlights", "cs2 ranked"],
 }
+
+# Moment-specific keywords — searched individually when found in the clip title
+_MOMENT_KEYWORDS = [
+    "1v5", "1v4", "1v3", "ace", "clutch", "insane", "godlike", "flick",
+    "outplay", "solo", "carry", "wipe", "snipe", "combo", "broken", "win",
+]
 
 
 def _slugify(text: str) -> str:
@@ -89,12 +95,19 @@ def _build_tags(clip: dict, config: dict) -> list[str]:
             expansions = GAME_TAG_EXPANSIONS.get(game, [game.lower()])
             tags.extend(expansions)
             tags.append(f"{game} clips")
+            tags.append(f"{game} highlights")
             tags.append(f"{game} funny moments")
 
-        # Title keywords (strip short words)
-        title_words = [w for w in title.split() if len(w) > 3]
-        if title_words:
-            tags.append(" ".join(title_words[:5]))
+        # Moment-specific keywords from title (individual searchable tags)
+        if title:
+            title_lower = title.lower()
+            for kw in _MOMENT_KEYWORDS:
+                if kw in title_lower:
+                    tags.append(kw)
+
+        # Individual title keywords (words >3 chars, not combined into one tag)
+        title_words = [w.lower() for w in title.split() if len(w) > 3 and w.isalpha()]
+        tags.extend(title_words[:4])
 
         # Platform
         platform = _normalize_text(clip.get("platform", ""))

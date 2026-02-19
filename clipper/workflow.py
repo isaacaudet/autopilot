@@ -374,6 +374,7 @@ def _approve_clips(
     config: dict,
     channel: str | None = None,
     min_score: float | None = None,
+    shorts_layout: str | None = None,
 ) -> int:
     """Mark top `count` scored clips as approved, rest as skipped. Returns approved count."""
     from clipper.db import update_clip, get_db
@@ -397,6 +398,12 @@ def _approve_clips(
             updates = {"status": "approved", "score": clip_score}
             if channel:
                 updates["channel"] = channel
+            layout_key = str(shorts_layout or "").strip().lower()
+            if layout_key in {"fill", "blur"}:
+                updates["_shorts_layout"] = layout_key
+                if layout_key == "fill":
+                    # Ensure streamer defaults are used in autopilot, not stale per-clip overrides.
+                    updates["_layout_override"] = None
             update_clip(config, clip_id, **updates)
             console.print(
                 f"[green]  +[/green] {clip.get('streamer', '?')} — "
@@ -584,6 +591,48 @@ def _prioritize_calibrated_streamers(clips: list[dict], config: dict) -> list[di
     return prioritized
 
 
+def _revive_skipped_candidates(
+    config: dict,
+    *,
+    game: str = "",
+    min_score: float = 45.0,
+    limit: int = 40,
+) -> int:
+    """Promote top skipped clips back to pending when discovery is sparse."""
+    from clipper.db import list_clips, update_clip
+
+    max_promote = max(1, int(limit))
+    skipped = list_clips(
+        config,
+        status="skipped",
+        game=game if game else None,
+        sort="score",
+        limit=2000,
+    )
+
+    promoted = 0
+    for clip in skipped:
+        if promoted >= max_promote:
+            break
+        clip_id = str(clip.get("id", "")).strip()
+        if not clip_id:
+            continue
+        if clip.get("video_id"):
+            continue
+        if bool(clip.get("clip_count")):
+            continue
+        if not str(clip.get("url", "")).strip():
+            continue
+        score = float(clip.get("_score", clip.get("score", 0.0)) or 0.0)
+        if score < float(min_score):
+            continue
+
+        update_clip(config, clip_id, status="pending", score=score)
+        promoted += 1
+
+    return promoted
+
+
 def _upload_processed_clips(
     processed: list[dict],
     config: dict,
@@ -677,6 +726,8 @@ def run_autopilot_workflow(
     """Autopilot flow: learn -> fetch -> score -> approve -> process -> optional upload."""
     from clipper.learn import collect_game_stats, collect_performance, train_weights
 
+    autopilot_cfg = config.get("autopilot", {}) or {}
+
     requested_count = max(1, int(count))
     target_count = requested_count
     daily_cap = int(daily_limit or 0)
@@ -735,17 +786,73 @@ def run_autopilot_workflow(
         verbose=verbose,
     )
 
-    if state is not None:
-        state.set_phase("scoring", "Scoring clip candidates...")
     # Enforce game filtering whenever a game is specified, even for configured/selected scopes.
     game_filter = game_name if game_name else ""
-    pending = _load_and_score_pending(config, game=game_filter, use_game_multipliers=True)
+
+    def _score_candidates() -> tuple[list[dict], list[dict]]:
+        scored_pending = _load_and_score_pending(config, game=game_filter, use_game_multipliers=True)
+        scored_qualifying = [
+            c for c in scored_pending if float(c.get("_score", 0.0) or 0.0) >= float(min_score)
+        ]
+        return scored_pending, scored_qualifying
+
+    if state is not None:
+        state.set_phase("scoring", "Scoring clip candidates...")
+    pending, qualifying = _score_candidates()
+
+    fallback_used = False
+    fallback_to_gamewide = bool(autopilot_cfg.get("fallback_to_gamewide", True))
+    revive_skipped = bool(autopilot_cfg.get("revive_skipped_candidates", True))
+    revived_count = 0
+    if (
+        fallback_to_gamewide
+        and scope_key != "gamewide"
+        and len(qualifying) < target_count
+    ):
+        fallback_used = True
+        if state is not None:
+            state.set_phase("fetching", "Expanding search to game-wide fallback...")
+        _fetch_clips(
+            config,
+            game_name,
+            period=period,
+            scope="gamewide",
+            streamers=None,
+            verbose=verbose,
+        )
+        if state is not None:
+            state.set_phase("scoring", "Scoring fallback candidates...")
+        pending, qualifying = _score_candidates()
+
+    if not pending and revive_skipped:
+        if state is not None:
+            state.set_phase("scoring", "Recycling skipped candidates...")
+        revived_count = _revive_skipped_candidates(
+            config,
+            game=game_filter,
+            min_score=min_score,
+            limit=max(target_count * 8, 30),
+        )
+        if revived_count > 0:
+            pending, qualifying = _score_candidates()
+
     if not pending:
         if state is not None:
             state.set_phase("done", "No qualifying clips found")
         return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "no_clips"}
 
-    qualifying = [c for c in pending if float(c.get("_score", 0.0) or 0.0) >= float(min_score)]
+    if not qualifying and revive_skipped:
+        if state is not None:
+            state.set_phase("scoring", "Recycling top skipped candidates...")
+        revived_count = _revive_skipped_candidates(
+            config,
+            game=game_filter,
+            min_score=min_score,
+            limit=max(target_count * 6, 25),
+        )
+        if revived_count > 0:
+            pending, qualifying = _score_candidates()
+
     if not qualifying:
         detail = f"No clips above score {float(min_score):.0f}"
         if state is not None:
@@ -753,6 +860,48 @@ def run_autopilot_workflow(
         return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "below_threshold"}
 
     qualifying = _prioritize_calibrated_streamers(qualifying, config)
+    used_uncalibrated_fallback = False
+    require_calibrated = bool(autopilot_cfg.get("require_calibrated_streamers", True))
+    if require_calibrated:
+        calibrated = [c for c in qualifying if float(c.get("_autopilot_profile_score", 0.0) or 0.0) > 0.0]
+        if not calibrated and revive_skipped:
+            if state is not None:
+                state.set_phase("scoring", "Recycling calibrated skipped candidates...")
+            promoted_more = _revive_skipped_candidates(
+                config,
+                game=game_filter,
+                min_score=min_score,
+                limit=max(target_count * 8, 30),
+            )
+            revived_count += promoted_more
+            if promoted_more > 0:
+                pending, qualifying = _score_candidates()
+                qualifying = _prioritize_calibrated_streamers(qualifying, config)
+                calibrated = [
+                    c for c in qualifying if float(c.get("_autopilot_profile_score", 0.0) or 0.0) > 0.0
+                ]
+        if calibrated:
+            qualifying = calibrated
+        else:
+            if bool(autopilot_cfg.get("allow_uncalibrated_fallback", True)):
+                used_uncalibrated_fallback = True
+            else:
+                detail = "No clips from streamers with saved layout profiles"
+                if state is not None:
+                    state.set_phase("done", detail)
+                return {
+                    "requested": requested_count,
+                    "approved": 0,
+                    "processed": 0,
+                    "uploaded": 0,
+                    "status": "no_calibrated_clips",
+                }
+
+    autopilot_layout = str(
+        autopilot_cfg.get("shorts_layout", (config.get("shorts", {}) or {}).get("layout", "fill"))
+    ).strip().lower()
+    if autopilot_layout not in {"fill", "blur"}:
+        autopilot_layout = "fill"
 
     if state is not None:
         state.set_phase("approving", f"Approving top {target_count} clips...")
@@ -762,6 +911,7 @@ def run_autopilot_workflow(
         config,
         channel=channel,
         min_score=min_score,
+        shorts_layout=autopilot_layout,
     )
     if approved <= 0:
         if state is not None:
@@ -777,6 +927,9 @@ def run_autopilot_workflow(
         "approved": approved,
         "processed": len(processed),
         "uploaded": 0,
+        "fallback_used": fallback_used,
+        "revived_candidates": revived_count,
+        "used_uncalibrated_fallback": used_uncalibrated_fallback,
         "status": "processed",
     }
 
@@ -814,10 +967,12 @@ def run_shorts_workflow(
     game: str | None = None,
     count: int = 5,
     channel: str | None = None,
+    auto: bool = False,
+    privacy: str = "unlisted",
     verbose: bool = False,
     state=None,
 ):
-    """Shorts flow: fetch -> rank -> approve -> process."""
+    """Shorts flow: fetch -> rank -> approve -> process -> optional upload."""
     if not game:
         raise ValueError("game is required")
 
@@ -882,16 +1037,31 @@ def run_shorts_workflow(
 
     console.print(f"\n[bold green]{len(processed)} clips ready![/bold green]")
 
+    if auto and processed:
+        if state:
+            state.set_phase("uploading", f"Uploading {len(processed)} clips ({_normalize_privacy(privacy)})")
+        _upload_processed_clips(
+            processed, config,
+            channel=channel,
+            privacy=_normalize_privacy(privacy),
+            state=state,
+            verbose=verbose,
+        )
+        if state and state.phase != "error":
+            state.set_phase("done", f"{state.completed} clips processed")
+
 
 def run_compilation_workflow(
     config: dict,
     game: str | None = None,
     duration: int | None = None,
     channel: str | None = None,
+    auto: bool = False,
+    privacy: str = "unlisted",
     verbose: bool = False,
     state=None,
 ):
-    """Compilation flow: fetch -> rank -> approve -> process -> compile."""
+    """Compilation flow: fetch -> rank -> approve -> process -> compile -> optional upload."""
     if not game:
         raise ValueError("game is required")
 
@@ -1014,3 +1184,16 @@ def run_compilation_workflow(
         json.dump(comp_clip, f, indent=2)
 
     console.print(f"\n[bold green]Done![/bold green] Compilation ready: {comp_path}")
+
+    if auto:
+        if state:
+            state.set_phase("uploading", f"Uploading compilation ({_normalize_privacy(privacy)})")
+        _upload_processed_clips(
+            [comp_clip], config,
+            channel=channel,
+            privacy=_normalize_privacy(privacy),
+            state=state,
+            verbose=verbose,
+        )
+        if state and state.phase != "error":
+            state.set_phase("done", "Compilation uploaded")

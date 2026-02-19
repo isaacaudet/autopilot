@@ -74,7 +74,7 @@ export function HomePage() {
   // Shorts workflow state
   const [game, setGame] = useState('')
   const [fetchWindow, setFetchWindow] = useState('24h')
-  const [fetchScope, setFetchScope] = useState<'gamewide' | 'configured' | 'selected'>('gamewide')
+  const [fetchScope, setFetchScope] = useState<'gamewide' | 'configured' | 'selected'>('configured')
   const [selectedStreamers, setSelectedStreamers] = useState<string[]>([])
   const [fetching, setFetching] = useState(false)
 

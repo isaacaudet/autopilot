@@ -1,6 +1,17 @@
 targets:
   twitch:
-    streamers: [EIDO, summit1g, theburntpeanut, prod]
+    streamers: [
+      # Tier 1 — highest viewership / proven performers
+      supertf, singsing, aimbotcalvin, deathydl,
+      # Big names (intermittent Deadlock)
+      xqc, shroud,
+      # Skilled / Deadlock-native
+      surefour, eido, draskyl,
+      # Personality / clip-friendly
+      boxaroni, fredthefinch, thes1tuation,
+      # Proven on this channel
+      noxtism, goober70,
+    ]
     games: [Deadlock, ARC Raiders, Valorant]
     clips_per_source: 100
     period: 24h
@@ -20,12 +31,17 @@ autopilot:
   daily_count: 8
   min_score: 45
   game: Deadlock
-  scope: gamewide
+  scope: configured
+  fallback_to_gamewide: true
+  revive_skipped_candidates: true
+  shorts_layout: fill
   period: 24h
   channel: default
   auto_upload: true
   privacy: private
   prefer_calibrated_streamers: true
+  require_calibrated_streamers: true
+  allow_uncalibrated_fallback: true
   profile_bonus_points: 8.0
 
 upload:
@@ -45,11 +61,14 @@ upload:
   # Extra tags appended to every upload (high-volume search terms)
   global_tags:
     - gaming
+    - gaming highlights
     - funny moments
     - best clips
     - twitch clips
     - stream highlights
+    - streamer clips
     - viral clips
+    - highlight
 
   # Set a custom thumbnail from the clip (scene detection + saturation boost)
   extract_thumbnail: true
@@ -63,7 +82,15 @@ subtitles:
 shorts:
   width: 1080
   height: 1920
+  layout: fill              # fill = facecam+gameplay stack with HUD overlay; blur = blurred background
   subtitle_margin_v: 450    # bumped from 80 — places text in lower-center safe zone
+  fill:
+    gameplay:
+      zoom: 1.0             # 1.0 = show full source height (no bottom crop); >1.0 clips HP bars
+      zoom_no_facecam: 1.08 # slightly tighter when no facecam, still leaves breathing room
+    hud:
+      border_px: 4
+      border_color: "white@0.95"
 
 channels:
   default:

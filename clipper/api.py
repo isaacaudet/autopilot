@@ -119,7 +119,7 @@ class AutopilotStartRequest(BaseModel):
     privacy: str = "private"
     game: str | None = "Deadlock"
     period: str = "24h"
-    scope: str = "gamewide"
+    scope: str = "configured"
     streamers: list[str] | None = None
     daily_limit: int | None = None
 
@@ -886,7 +886,8 @@ def create_app(config: dict | None = None) -> FastAPI:
         if workflow_thread["current"] and workflow_thread["current"].is_alive():
             raise HTTPException(409, "A workflow is already running")
 
-        from clipper.db import get_db, update_clip as db_update_clip
+        from clipper.db import get_db, update_clip as db_update_clip, get_clip as db_get_clip
+        from clipper.layout_profiles import upsert_layout_profile
 
         channel_key = (req.channel or "").strip() or None
         channels_cfg = config.get("channels", {}) or {}
@@ -948,6 +949,40 @@ def create_app(config: dict | None = None) -> FastAPI:
                 layout_override = _coerce_layout_override(layout_source)
                 if layout_override:
                     updates["_layout_override"] = layout_override
+                    # Persist confirmed edits as the streamer's default profile so
+                    # future clips (including autopilot) reuse the same layout.
+                    try:
+                        clip_row = db_get_clip(config, clip_id) or {}
+                        streamer_name = str(clip_row.get("streamer") or "").strip()
+                        if streamer_name:
+                            tuning_payload = {
+                                k: layout_override.get(k)
+                                for k in _LAYOUT_TUNING_KEYS
+                                if layout_override.get(k) is not None
+                            }
+                            upsert_layout_profile(
+                                config,
+                                streamer_name,
+                                facecam=layout_override.get("facecam")
+                                if isinstance(layout_override.get("facecam"), dict)
+                                else None,
+                                hud=layout_override.get("hud")
+                                if isinstance(layout_override.get("hud"), dict)
+                                else None,
+                                facecam_enabled=layout_override.get("facecam_enabled")
+                                if layout_override.get("facecam_enabled") is not None
+                                else None,
+                                hud_enabled=layout_override.get("hud_enabled")
+                                if layout_override.get("hud_enabled") is not None
+                                else None,
+                                layout_tuning=tuning_payload or None,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to persist auto profile for clip %s: %s",
+                            clip_id,
+                            e,
+                        )
 
             db_update_clip(config, clip_id, **updates)
             approved_count += 1

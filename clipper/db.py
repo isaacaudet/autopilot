@@ -329,7 +329,13 @@ def _row_to_clip(row: sqlite3.Row) -> dict:
     if clip.get("tags_override"):
         clip["_tags_override"] = clip["tags_override"]
     if clip.get("analysis"):
-        clip["_analysis"] = clip["analysis"]
+        raw_analysis = clip["analysis"]
+        if isinstance(raw_analysis, str):
+            try:
+                raw_analysis = json.loads(raw_analysis)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        clip["_analysis"] = raw_analysis
     if clip.get("hook_duration") is not None:
         clip["_hook_duration"] = clip["hook_duration"]
     if clip.get("hook_text_override"):
