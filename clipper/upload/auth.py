@@ -257,17 +257,94 @@ def setup_tiktok_auth(channel_name: str, config: dict):
 # ---------------------------------------------------------------------------
 
 _META_SCOPES = {
-    # instagram_basic deprecated Dec 2024; instagram_content_publish = Facebook Login for Business scope
-    # pages_show_list needed to find linked Instagram Business Account via Facebook Page
-    "instagram": "instagram_content_publish,pages_show_list",
     "facebook": "pages_manage_posts,publish_video,pages_show_list",
 }
 
 
-def setup_meta_auth(channel_name: str, config: dict, platform: str = "instagram"):
-    """Run Facebook/Instagram OAuth flow — opens browser, saves token file."""
+def setup_instagram_auth(channel_name: str, config: dict):
+    """Run Instagram Login (Business Login) OAuth flow — opens browser, saves token file.
+
+    Uses api.instagram.com (Instagram Login), NOT Facebook Login for Business.
+    Requires INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET in .env
+    (found in Meta App Dashboard → Instagram product → Settings).
+    """
     from rich.console import Console
     console = Console()
+
+    channels = config.get("channels", {})
+    ch_config = channels.get(channel_name, {})
+    token_file = ch_config.get("token_file", f".clipper_instagram_{channel_name}.json")
+
+    root = get_project_root()
+    token_path = root / token_file
+    app_id = require_env("INSTAGRAM_APP_ID")
+    app_secret = require_env("INSTAGRAM_APP_SECRET")
+
+    redirect_uri = f"http://localhost:{_REDIRECT_PORT}/"
+    auth_url = "https://api.instagram.com/oauth/authorize?" + urlencode({
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": "instagram_business_basic,instagram_business_content_publish",
+        "response_type": "code",
+    })
+
+    console.print(f"[bold]Setting up Instagram auth for channel '{channel_name}'[/bold]")
+    console.print("Opening browser for authorization (log in with Instagram)...")
+    webbrowser.open(auth_url)
+
+    code = _wait_for_auth_code()
+
+    # Exchange code for short-lived token
+    resp = requests.post(
+        "https://api.instagram.com/oauth/access_token",
+        data={
+            "client_id": app_id,
+            "client_secret": app_secret,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "code": code,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    short_data = resp.json()
+    short_token = short_data["access_token"]
+    ig_user_id = str(short_data["user_id"])
+
+    # Exchange for long-lived token (60 days)
+    resp2 = requests.get(
+        "https://graph.instagram.com/access_token",
+        params={
+            "grant_type": "ig_exchange_token",
+            "client_secret": app_secret,
+            "access_token": short_token,
+        },
+        timeout=15,
+    )
+    resp2.raise_for_status()
+    long_data = resp2.json()
+
+    token_data = {
+        "access_token": long_data["access_token"],
+        "expires_at": time.time() + long_data.get("expires_in", 5184000),
+        "ig_user_id": ig_user_id,
+        "platform": "instagram",
+        "login_type": "instagram_login",
+    }
+
+    console.print(f"  Instagram user ID: {ig_user_id}")
+    token_path.write_text(json.dumps(token_data, indent=2))
+    console.print(f"[green]Instagram auth complete![/green] Token saved to {token_path}")
+
+
+def setup_meta_auth(channel_name: str, config: dict, platform: str = "instagram"):
+    """Run Facebook OAuth flow for Facebook Pages — opens browser, saves token file."""
+    from rich.console import Console
+    console = Console()
+
+    if platform == "instagram":
+        # Instagram now uses Instagram Login, not Facebook Login for Business
+        return setup_instagram_auth(channel_name, config)
 
     channels = config.get("channels", {})
     ch_config = channels.get(channel_name, {})
@@ -279,9 +356,9 @@ def setup_meta_auth(channel_name: str, config: dict, platform: str = "instagram"
     app_secret = require_env("META_APP_SECRET")
 
     redirect_uri = f"http://localhost:{_REDIRECT_PORT}/"
-    scopes = _META_SCOPES.get(platform, _META_SCOPES["instagram"])
+    scopes = _META_SCOPES.get(platform, "pages_manage_posts,publish_video,pages_show_list")
 
-    auth_url = f"https://www.facebook.com/v21.0/dialog/oauth?" + urlencode({
+    auth_url = "https://www.facebook.com/v21.0/dialog/oauth?" + urlencode({
         "client_id": app_id,
         "redirect_uri": redirect_uri,
         "scope": scopes,
@@ -340,32 +417,13 @@ def setup_meta_auth(channel_name: str, config: dict, platform: str = "instagram"
     pages = pages_resp.json().get("data", [])
 
     if not pages:
-        raise RuntimeError("No Facebook Pages found. Link a Page to your account first.")
+        raise RuntimeError("No Facebook Pages found.")
 
-    page = pages[0]  # Use first page
+    page = pages[0]
     console.print(f"  Using page: {page.get('name')} (id: {page['id']})")
     token_data["page_id"] = page["id"]
     token_data["page_access_token"] = page["access_token"]
     token_data["page_name"] = page.get("name", "")
-
-    if platform == "instagram":
-        # Find linked Instagram Business Account
-        ig_resp = requests.get(
-            f"https://graph.facebook.com/v21.0/{page['id']}",
-            params={"fields": "instagram_business_account", "access_token": page["access_token"]},
-            timeout=15,
-        )
-        ig_resp.raise_for_status()
-        ig_account = ig_resp.json().get("instagram_business_account")
-
-        if not ig_account:
-            raise RuntimeError(
-                f"Page '{page.get('name')}' has no linked Instagram Business Account. "
-                "Link an IG Business/Creator account to the Facebook Page first."
-            )
-
-        token_data["ig_user_id"] = ig_account["id"]
-        console.print(f"  Instagram Business Account ID: {ig_account['id']}")
 
     token_path.write_text(json.dumps(token_data, indent=2))
     console.print(f"[green]{platform.title()} auth complete![/green] Token saved to {token_path}")

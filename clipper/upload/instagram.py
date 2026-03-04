@@ -26,7 +26,8 @@ from clipper.config import get_project_root, require_env
 logger = logging.getLogger(__name__)
 console = Console()
 
-GRAPH_API = "https://graph.facebook.com/v21.0"
+GRAPH_API_FB = "https://graph.facebook.com/v21.0"   # Facebook Login for Business (legacy)
+GRAPH_API_IG = "https://graph.instagram.com/v21.0"  # Instagram Login (current)
 
 
 def _token_path_for_channel(channel: str | None, config: dict) -> Path:
@@ -45,24 +46,42 @@ def _load_token(token_path: Path) -> dict:
     return json.loads(token_path.read_text())
 
 
+def _api_base(token_data: dict) -> str:
+    """Return the correct Graph API base URL for this token's login type."""
+    if token_data.get("login_type") == "instagram_login":
+        return GRAPH_API_IG
+    return GRAPH_API_FB
+
+
 def _refresh_token_if_needed(token_data: dict, token_path: Path) -> str:
     """Return a valid access token, refreshing long-lived token if near expiry."""
     expires_at = token_data.get("expires_at", 0)
     if time.time() < expires_at - 86400:  # refresh if <1 day left
         return token_data["access_token"]
 
-    # Long-lived tokens can be refreshed before they expire
     try:
-        resp = requests.get(
-            f"{GRAPH_API}/oauth/access_token",
-            params={
-                "grant_type": "fb_exchange_token",
-                "client_id": require_env("META_APP_ID"),
-                "client_secret": require_env("META_APP_SECRET"),
-                "fb_exchange_token": token_data["access_token"],
-            },
-            timeout=15,
-        )
+        if token_data.get("login_type") == "instagram_login":
+            # Instagram Login: refresh via graph.instagram.com
+            resp = requests.get(
+                "https://graph.instagram.com/refresh_access_token",
+                params={
+                    "grant_type": "ig_refresh_token",
+                    "access_token": token_data["access_token"],
+                },
+                timeout=15,
+            )
+        else:
+            # Facebook Login for Business (legacy)
+            resp = requests.get(
+                f"{GRAPH_API_FB}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": require_env("META_APP_ID"),
+                    "client_secret": require_env("META_APP_SECRET"),
+                    "fb_exchange_token": token_data["access_token"],
+                },
+                timeout=15,
+            )
         resp.raise_for_status()
         data = resp.json()
         token_data["access_token"] = data["access_token"]
@@ -111,12 +130,12 @@ def _get_video_url(clip: dict, config: dict) -> str:
     return f"{base_url.rstrip('/')}/api/video/{clip_id}"
 
 
-def _poll_container_status(access_token: str, container_id: str, max_wait: int = 600) -> bool:
+def _poll_container_status(access_token: str, container_id: str, max_wait: int = 600, api: str = GRAPH_API_FB) -> bool:
     """Poll container status until FINISHED or ERROR. Returns True on success."""
     start = time.time()
     while time.time() - start < max_wait:
         resp = requests.get(
-            f"{GRAPH_API}/{container_id}",
+            f"{api}/{container_id}",
             params={"fields": "status_code", "access_token": access_token},
             timeout=15,
         )
@@ -157,6 +176,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
 
     video_url = _get_video_url(clip, config)
     caption = clip.get("_description_override") or _build_caption(clip, config)
+    api = _api_base(token_data)
 
     # Convert UTC ISO8601 → Unix timestamp for Meta API
     unix_ts: int | None = None
@@ -180,7 +200,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
             container_params["scheduled_publish_time"] = str(unix_ts)
 
         create_resp = requests.post(
-            f"{GRAPH_API}/{ig_user_id}/media",
+            f"{api}/{ig_user_id}/media",
             params=container_params,
             timeout=30,
         )
@@ -193,7 +213,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
 
         # Step 2: Poll until container is ready (FINISHED = ready to publish / scheduled)
         console.print("  [dim]Waiting for Instagram processing...[/dim]")
-        if not _poll_container_status(access_token, container_id):
+        if not _poll_container_status(access_token, container_id, api=api):
             console.print("[red]Instagram container failed or timed out.[/red]")
             return None
 
@@ -204,7 +224,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
             return container_id
 
         publish_resp = requests.post(
-            f"{GRAPH_API}/{ig_user_id}/media_publish",
+            f"{api}/{ig_user_id}/media_publish",
             params={
                 "creation_id": container_id,
                 "access_token": access_token,
