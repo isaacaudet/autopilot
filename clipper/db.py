@@ -98,6 +98,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE clips ADD COLUMN {col} TEXT")
     conn.commit()
 
+    if "pre_score" not in clip_columns:
+        conn.execute("ALTER TABLE clips ADD COLUMN pre_score INTEGER")
+        conn.commit()
+
     rel_cols = {r[1] for r in conn.execute("PRAGMA table_info(releases)").fetchall()}
     if "platform" not in rel_cols:
         conn.execute("ALTER TABLE releases ADD COLUMN platform TEXT DEFAULT 'youtube'")
@@ -237,7 +241,7 @@ _CLIP_COLUMNS = {
     "audio_energy_db", "video_id", "privacy", "title_override",
     "description_override", "tags_override", "hook_duration",
     "hook_text_override", "tiktok_id", "instagram_id", "facebook_id",
-    "meta_json", "updated_at",
+    "pre_score", "meta_json", "updated_at",
 }
 
 # Mapping from clip dict underscore-prefixed keys to column names
@@ -257,6 +261,7 @@ _KEY_REMAP = {
     "_tiktok_id": "tiktok_id",
     "_instagram_id": "instagram_id",
     "_facebook_id": "facebook_id",
+    "_pre_score": "pre_score",
 }
 
 
@@ -346,6 +351,8 @@ def _row_to_clip(row: sqlite3.Row) -> dict:
         clip["_instagram_id"] = clip["instagram_id"]
     if clip.get("facebook_id"):
         clip["_facebook_id"] = clip["facebook_id"]
+    if clip.get("pre_score") is not None:
+        clip["_pre_score"] = clip["pre_score"]
 
     # Convert is_shorts back to bool
     clip["is_shorts"] = bool(clip.get("is_shorts"))
@@ -577,10 +584,11 @@ def list_performance(config: dict) -> list[dict]:
     return result
 
 
-def performance_ids(config: dict) -> set[str]:
+def performance_ids(config: dict) -> dict[str, str]:
+    """Return {clip_id: collected_at} for all performance entries."""
     conn = get_db(config)
-    rows = conn.execute("SELECT clip_id FROM performance").fetchall()
-    return {r["clip_id"] for r in rows}
+    rows = conn.execute("SELECT clip_id, collected_at FROM performance").fetchall()
+    return {r["clip_id"]: r["collected_at"] for r in rows}
 
 
 # ---------------------------------------------------------------------------

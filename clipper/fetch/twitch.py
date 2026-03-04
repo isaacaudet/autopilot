@@ -388,11 +388,22 @@ def fetch_twitch_clips(
 
     # -- Configured mode: fetch by streamer --
     streamers = twitch_cfg.get("streamers", [])
+    game_filter = str(twitch_cfg.get("game_filter", "") or "").strip()
+    filter_game_id = ""
+    if game_filter:
+        gid_map = _resolve_game_ids([game_filter], headers)
+        filter_game_id = gid_map.get(game_filter, "")
+        if filter_game_id:
+            console.print(f"[dim]  Game filter: '{game_filter}' → game_id={filter_game_id}[/dim]")
+        else:
+            console.print(f"[yellow]  Warning: could not resolve game '{game_filter}' — no game filter applied[/yellow]")
+
     if streamers:
         if verbose:
             console.print(f"[dim]Resolving {len(streamers)} streamer(s)...[/dim]")
         user_ids = _resolve_user_ids([str(s) for s in streamers], headers)
 
+        game_filtered = 0
         for name, uid in user_ids.items():
             if verbose:
                 console.print(f"[dim]  Fetching clips for {name}...[/dim]")
@@ -404,10 +415,19 @@ def fetch_twitch_clips(
             )
             total_fetched += len(raw_clips)
             for clip in raw_clips:
+                if filter_game_id and clip.get("game_id") != filter_game_id:
+                    game_filtered += 1
+                    continue
                 if not _passes_filters(clip):
                     continue
                 seen_ids.add(clip["id"])
-                all_clips.append(_standardize_clip(clip))
+                std = _standardize_clip(clip)
+                if game_filter:
+                    std["game"] = game_filter
+                all_clips.append(std)
+
+        if filter_game_id and game_filtered > 0:
+            console.print(f"[dim]  Game filter: {game_filtered} non-{game_filter} clips dropped[/dim]")
 
     # -- Fetch by game --
     games = twitch_cfg.get("games", [])

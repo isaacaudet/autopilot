@@ -22,6 +22,7 @@ import {
   Loader2,
   Play,
   Sparkles,
+  Trash2,
   Upload,
   X,
   Zap,
@@ -33,6 +34,7 @@ import {
   fetchQueue,
   fetchReleases,
   fetchScore,
+  resetQueue,
   startAutopilot,
 } from '@/lib/api'
 import type { ClipMeta, ConfigData, Release } from '@/lib/types'
@@ -77,6 +79,7 @@ export function HomePage() {
   const [fetchScope, setFetchScope] = useState<'gamewide' | 'configured' | 'selected'>('configured')
   const [selectedStreamers, setSelectedStreamers] = useState<string[]>([])
   const [fetching, setFetching] = useState(false)
+  const [resetting, setResetting] = useState(false)
 
   // Compilation dialog
   const [compilationOpen, setCompilationOpen] = useState(false)
@@ -168,6 +171,19 @@ export function HomePage() {
       cancelled = true
     }
   }, [channel, bestWindow, bestGame])
+
+  async function handleResetQueue() {
+    setResetting(true)
+    try {
+      const result = await resetQueue('pending')
+      setPending([])
+      toast.success(`Queue cleared — ${result.deleted} clips removed`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Reset failed')
+    } finally {
+      setResetting(false)
+    }
+  }
 
   async function handleFetchScore() {
     if (!game) return
@@ -366,16 +382,29 @@ export function HomePage() {
               </div>
             )}
 
-            <Button onClick={handleFetchScore} disabled={!game || fetching || (fetchScope === 'selected' && selectedStreamers.length === 0)} className="w-full">
-              {fetching ? (
-                <>
-                  <Loader2 className="size-4 animate-spin mr-1.5" />
-                  Fetching...
-                </>
-              ) : (
-                'Fetch & Score'
+            <div className="flex gap-2">
+              <Button onClick={handleFetchScore} disabled={!game || fetching || (fetchScope === 'selected' && selectedStreamers.length === 0)} className="flex-1">
+                {fetching ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin mr-1.5" />
+                    Fetching...
+                  </>
+                ) : (
+                  'Fetch & Score'
+                )}
+              </Button>
+              {pending.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={handleResetQueue}
+                  disabled={resetting}
+                  title="Clear pending queue (clips can be re-fetched)"
+                >
+                  {resetting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                </Button>
               )}
-            </Button>
+            </div>
 
             {pending.length > 0 && (
               <Button

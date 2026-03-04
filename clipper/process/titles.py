@@ -294,19 +294,31 @@ def generate_title(clip: dict) -> str:
         return base
 
     # Try LLM title variants first
+    # LLM titles are already YouTube-safe — only check blocklist, skip gaming word replacements.
+    # Preserve Gemini's intended casing (don't convert all-caps to title case).
     analysis = clip.get("_analysis", {})
     variants = analysis.get("title_variants", [])
     if variants:
-        # Prefer variant containing a viral keyword (higher click-through)
         for v in variants:
-            if _find_keyword(v):
-                candidate = sanitize_title(_add_context(v))
-                if candidate and len(candidate) <= 90:
-                    return candidate
-        # Otherwise use the first valid variant
-        candidate = sanitize_title(_add_context(variants[0]))
-        if candidate and len(candidate) <= 90:
-            return candidate
+            v = v.strip().strip('"\'')
+            if not v:
+                continue
+            lower = v.lower()
+            if any(re.search(rf"\b{re.escape(w)}", lower) for w in _BLOCKLIST):
+                continue
+            # Append streamer/game context if not already present and it fits
+            parts = []
+            if streamer and streamer.lower() not in lower:
+                parts.append(streamer)
+            if game and game.lower() not in lower and game.lower() != "just chatting":
+                parts.append(game)
+            candidate = v
+            if parts:
+                with_ctx = f"{v} | {' '.join(parts)}"
+                if len(with_ctx) <= 90:
+                    candidate = with_ctx
+            if len(candidate) <= 90:
+                return candidate
 
     raw_title = _clean_title(clip.get("title", ""))
     clip_id = clip.get("id", raw_title)

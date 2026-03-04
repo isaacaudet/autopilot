@@ -79,6 +79,7 @@ SUPPORTED_FEATURES = (
     "audio",
     "llm",
     "retention",
+    "pre_score",
 )
 
 # Views-first default objective.
@@ -90,6 +91,7 @@ DEFAULT_WEIGHTS = {
     "recency": 14,
     "audio": 4,
     "llm": 2,
+    "pre_score": 0,
 }
 
 _TITLE_STOPWORDS = {
@@ -101,6 +103,45 @@ _TITLE_STOPWORDS = {
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def apply_view_floor(clips: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split clips into (passing, disqualified) based on view traction floors.
+
+    Rules:
+    - age < 2h  → pass (Twitch API shows 0 views for fresh clips)
+    - 2h ≤ age < 24h → require ≥ 150 views
+    - age ≥ 24h → require ≥ 300 views
+    """
+    passing: list[dict] = []
+    disqualified: list[dict] = []
+    for clip in clips:
+        age = _age_hours(clip)
+        views = _to_float(clip.get("view_count"), 0.0)
+        if age < 2.0:
+            passing.append(clip)
+        elif age < 24.0:
+            if views >= 150:
+                passing.append(clip)
+            else:
+                disqualified.append(clip)
+        else:
+            if views >= 300:
+                passing.append(clip)
+            else:
+                disqualified.append(clip)
+    return passing, disqualified
+
+
+def _pre_score_quality(clip: dict) -> float | None:
+    """Return pre-screen quality 0..1 or None if no pre_score available."""
+    ps = clip.get("_pre_score") if clip.get("_pre_score") is not None else clip.get("pre_score")
+    if ps is None:
+        return None
+    try:
+        return _clamp(float(ps) / 10.0, 0.0, 1.0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -133,16 +174,18 @@ def _age_hours(clip: dict) -> float:
 
 
 def _duration_quality(duration: float) -> float:
+    """Score clip duration. Data shows 15-30s is the YouTube Shorts sweet spot
+    (avg 1,673 views vs 505 for <15s and 694 for 30-60s)."""
     if duration <= 0:
         return 0.0
-    if 12 <= duration <= 38:
-        return 1.0
-    if 8 <= duration <= 55:
-        return 0.75
-    if 6 <= duration <= 75:
-        return 0.45
-    if duration <= 95:
-        return 0.2
+    if 15 <= duration <= 30:
+        return 1.0   # sweet spot — 2.4x better than other ranges
+    if 10 <= duration <= 45:
+        return 0.7
+    if 6 <= duration <= 60:
+        return 0.4
+    if duration <= 90:
+        return 0.15
     return 0.05
 
 
@@ -234,6 +277,12 @@ def _title_penalty_and_keyword_scale(title: str) -> tuple[float, float]:
         penalty += 20.0
     elif len(t) < 8:
         penalty += 6.0
+
+    # Stream title spam: repeated emoji separators like "🍔LIVE🍔HERE🍔DRAMA🍔"
+    # These are stream titles clipped verbatim, not real clip names.
+    emoji_count = sum(1 for c in t if ord(c) > 0x2000)
+    if emoji_count >= 4 and "live" in tl:
+        penalty += 40.0  # hard disqualify
 
     ascii_chars = sum(1 for c in t if ord(c) < 128)
     ascii_ratio = ascii_chars / max(1, len(t))
@@ -417,6 +466,7 @@ def score_clip(
         "audio": None if math.isnan(audio_dr) else _audio_quality(audio_dr),
         "llm": _llm_quality(clip),
         "retention": _retention_quality(clip),
+        "pre_score": _pre_score_quality(clip),
     }
 
     # Per-game normalization in context: score clips relative to their own game's baseline.

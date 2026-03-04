@@ -125,7 +125,7 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Impact,36,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,4,2,2,20,20,50,1
+Style: Default,Impact,56,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,2,0,1,5,2,2,20,20,80,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -479,9 +479,15 @@ def transcribe(
                 word_timestamps=True,
                 language="en",
                 condition_on_previous_text=False,
-                no_speech_threshold=0.7,
+                no_speech_threshold=0.6,
                 compression_ratio_threshold=2.8,
                 initial_prompt="Gaming stream clip with voice commentary.",
+                vad_filter=True,
+                vad_parameters={
+                    "min_speech_duration_ms": 200,
+                    "min_silence_duration_ms": 400,
+                    "speech_pad_ms": 300,
+                },
             )
             segments = list(segments_iter)
         except Exception as e:
@@ -557,20 +563,37 @@ def transcribe(
                 if not (w.get("start", 0) >= start and w.get("end", 0) <= end)
             ]
 
-    # Safety net: don't nuke all speech — gaming audio triggers false positives
+    # Safety net: don't nuke all speech — gaming audio triggers false positives.
+    # Exception: if ALL segments were flagged, trust the filter (it's a real hallucination).
     if filtered_words and len(filtered_words) >= words_before * 0.3:
         all_words = filtered_words
         removed = words_before - len(all_words)
         if removed > 0 and verbose:
             console.print(f"  [dim]Filtered {removed} suspicious words, kept {len(all_words)}[/dim]")
     elif words_before > 0 and not filtered_words:
-        if verbose:
-            console.print(f"  [dim]Filter would remove all {words_before} words — keeping original[/dim]")
-        # keep all_words as-is
+        # Every segment was flagged — blanket hallucination, suppress subtitles.
+        console.print("[yellow]All transcription segments flagged as hallucinations — suppressing subtitles.[/yellow]")
+        return None, None, []
     elif words_before > 0:
         if verbose:
             console.print(f"  [dim]Filter too aggressive ({len(filtered_words)}/{words_before} remaining) — keeping original[/dim]")
         # keep all_words as-is
+
+    # Clip-level repetition check: ≤2 unique words across 4+ total words is a
+    # hallucination (e.g. "cancel cancel cancel..."). Individual segments may look
+    # fine but the whole transcript is just one word repeated.
+    if len(all_words) >= 4:
+        unique_words = {
+            re.sub(r'\W+', '', w.get('word', '')).lower()
+            for w in all_words
+            if re.sub(r'\W+', '', w.get('word', '')).strip()
+        }
+        if len(unique_words) <= 2:
+            console.print(
+                f"[yellow]Suppressing subtitles: only {len(unique_words)} unique word(s) "
+                f"across {len(all_words)} tokens {unique_words} — likely hallucination.[/yellow]"
+            )
+            return None, None, []
 
     all_words, censor_ranges = _censor_words(all_words)
 

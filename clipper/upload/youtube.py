@@ -506,7 +506,7 @@ def publish_video(
         return False
 
 
-def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None):
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, publish_at=None):
     """Upload a processed clip to YouTube with optimized metadata.
 
     Args:
@@ -515,6 +515,8 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None):
         privacy: YouTube privacy status (unlisted, public, private).
         verbose: Whether to print extra info.
         channel: Optional channel name — uses channel-specific OAuth token if provided.
+        publish_at: ISO 8601 datetime string. If set, video is uploaded as private and
+                    scheduled to go public at this time (YouTube native scheduling).
 
     Returns:
         Video ID string on success, None on failure.
@@ -528,6 +530,14 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None):
     description = clip.get("_description_override") or _build_description(clip, config)
     tags = _build_tags(clip, config)
 
+    status_body: dict = {"selfDeclaredMadeForKids": False}
+    if publish_at:
+        # YouTube native scheduling: must be private during waiting period
+        status_body["privacyStatus"] = "private"
+        status_body["publishAt"] = publish_at
+    else:
+        status_body["privacyStatus"] = privacy
+
     body = {
         "snippet": {
             "title": title,
@@ -535,10 +545,7 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None):
             "tags": tags,
             "categoryId": "20",  # Gaming
         },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status_body,
     }
 
     media = MediaFileUpload(processed_path, resumable=True)

@@ -45,11 +45,15 @@ def _get_module(platform: str):
     return importlib.import_module(mod_name)
 
 
-def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -> str | None:
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, publish_at=None) -> str | None:
     """Upload a clip via the platform module for the given channel."""
     platform = get_channel_platform(channel, config)
     mod = _get_module(platform)
-    return mod.upload_clip(clip, config, privacy=privacy, verbose=verbose, channel=channel)
+    fn = mod.upload_clip
+    import inspect
+    if "publish_at" in inspect.signature(fn).parameters:
+        return fn(clip, config, privacy=privacy, verbose=verbose, channel=channel, publish_at=publish_at)
+    return fn(clip, config, privacy=privacy, verbose=verbose, channel=channel)
 
 
 def publish_video(video_id, verbose=False, *, channel=None, config=None) -> bool:

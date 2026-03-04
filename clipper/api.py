@@ -14,7 +14,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -51,6 +51,7 @@ class ClipUpdateRequest(BaseModel):
     tags_override: list[str] | None = None
     hook_text_override: str | None = None
     hook_duration: float | None = None
+    subtitle_margin_v: int | None = None
     sync_youtube: bool = False
 
 
@@ -347,6 +348,7 @@ def create_app(config: dict | None = None) -> FastAPI:
     state = PipelineState()
     workflow_thread: dict[str, threading.Thread | None] = {"current": None}
     shutdown_event = threading.Event()
+    _ingest_status: dict[str, dict] = {}
 
     app.add_middleware(
         CORSMiddleware,
@@ -559,6 +561,29 @@ def create_app(config: dict | None = None) -> FastAPI:
                     continue
 
         return {"clips": clips, "limit": limit}
+
+    @app.delete("/api/queue")
+    def reset_queue(
+        status: str = Query("pending"),
+        also_remove_history: bool = Query(True),
+    ):
+        """Delete clips by status. By default also removes them from history
+        so the next fetch can pull them in again."""
+        if status not in ("pending", "approved"):
+            raise HTTPException(400, "Only 'pending' or 'approved' clips can be reset")
+
+        from clipper.db import get_db
+
+        conn = get_db(config)
+        rows = conn.execute("SELECT id FROM clips WHERE status = ?", (status,)).fetchall()
+        clip_ids = [r["id"] for r in rows]
+
+        conn.execute("DELETE FROM clips WHERE status = ?", (status,))
+        if also_remove_history and clip_ids:
+            conn.executemany("DELETE FROM history WHERE clip_id = ?", [(cid,) for cid in clip_ids])
+        conn.commit()
+
+        return {"deleted": len(clip_ids), "history_cleared": also_remove_history and len(clip_ids)}
 
     @app.get("/api/insights/best-picks")
     def get_best_picks(
@@ -1218,6 +1243,8 @@ def create_app(config: dict | None = None) -> FastAPI:
             updates["hook_text_override"] = req.hook_text_override
         if req.hook_duration is not None:
             updates["hook_duration"] = req.hook_duration
+        if req.subtitle_margin_v is not None:
+            updates["subtitle_margin_v"] = req.subtitle_margin_v
 
         if updates:
             db_update_clip(config, clip_id, **updates)
@@ -2162,6 +2189,135 @@ def create_app(config: dict | None = None) -> FastAPI:
             except Exception as e:
                 logger.warning("Layout preview render failed for %s: %s", clip_id, e)
                 return FileResponse(str(thumb_path), media_type="image/jpeg")
+
+        return FileResponse(str(preview_path), media_type="image/jpeg")
+
+    # -- Manual video ingest --
+
+    @app.post("/api/ingest")
+    async def ingest_video(
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        title: str | None = Form(None),
+    ):
+        """Accept a manually uploaded video, save it, and run transcription in the background."""
+        import uuid
+        from clipper.db import save_clip as db_save_clip, update_clip as db_update_clip
+
+        # Generate a unique clip ID
+        clip_id = f"ingest_{uuid.uuid4().hex[:12]}"
+        output_dir = Path(config["_output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine file extension
+        original_name = file.filename or "upload.mp4"
+        ext = Path(original_name).suffix or ".mp4"
+        dest_path = output_dir / f"{clip_id}{ext}"
+
+        # Stream the upload to disk
+        contents = await file.read()
+        dest_path.write_bytes(contents)
+
+        # Probe duration
+        duration = _probe_duration_seconds(dest_path)
+
+        # Build a minimal clip record
+        clip: dict = {
+            "id": clip_id,
+            "title": title or original_name,
+            "url": "",
+            "duration": duration,
+            "view_count": 0,
+            "streamer": "manual",
+            "game": "",
+            "platform": "manual",
+            "is_shorts": True,
+            "source_path": str(dest_path),
+            "processed_path": str(dest_path),
+        }
+        db_save_clip(config, clip, status="approved")
+
+        # Track ingest status per clip in a simple dict (in-memory)
+        _ingest_status[clip_id] = {"status": "transcribing", "word_count": 0, "subtitle_path": None}
+
+        def _run_transcription():
+            try:
+                from clipper.process.subtitles import transcribe
+                ass_path, all_words, _censor = transcribe(dest_path, config, clip=clip)
+                word_count = len(all_words) if all_words else 0
+                sub_path = str(ass_path) if ass_path else None
+                if sub_path:
+                    db_update_clip(config, clip_id, subtitle_path=sub_path)
+                _ingest_status[clip_id] = {
+                    "status": "done",
+                    "word_count": word_count,
+                    "subtitle_path": sub_path,
+                }
+            except Exception as exc:
+                logger.warning("Ingest transcription failed for %s: %s", clip_id, exc)
+                _ingest_status[clip_id] = {
+                    "status": "error",
+                    "word_count": 0,
+                    "subtitle_path": None,
+                    "error": str(exc),
+                }
+
+        background_tasks.add_task(_run_transcription)
+        return {"clip_id": clip_id, "status": "transcribing"}
+
+    @app.get("/api/ingest/{clip_id}/status")
+    def ingest_status(clip_id: str):
+        """Poll ingest transcription status."""
+        info = _ingest_status.get(clip_id)
+        if info is None:
+            raise HTTPException(404, f"No ingest job for {clip_id}")
+        return info
+
+    @app.get("/api/clips/{clip_id}/frame")
+    def get_clip_frame(clip_id: str):
+        """Extract a preview frame at 30% duration and return it as JPEG."""
+        from clipper.db import get_clip as db_get_clip
+
+        output_dir = Path(config["_output_dir"])
+        preview_path = output_dir / f"{clip_id}_preview.jpg"
+
+        # Serve cached frame if it exists
+        if preview_path.exists():
+            return FileResponse(str(preview_path), media_type="image/jpeg")
+
+        clip = db_get_clip(config, clip_id)
+        if not clip:
+            raise HTTPException(404, f"Clip {clip_id} not found")
+
+        # Resolve video path from source_path or processed_path
+        video_path_str = clip.get("source_path") or clip.get("processed_path")
+        if not video_path_str or not Path(video_path_str).exists():
+            raise HTTPException(404, "Video file not found for this clip")
+
+        video_path = Path(video_path_str)
+        duration = float(clip.get("duration") or 0)
+
+        # Probe duration if missing
+        if duration <= 0:
+            duration = _probe_duration_seconds(video_path)
+
+        seek_time = max(0, duration * 0.3)
+
+        cmd = [
+            get_ffmpeg(),
+            "-y",
+            "-ss", str(seek_time),
+            "-i", str(video_path),
+            "-frames:v", "1",
+            "-q:v", "3",
+            "-vf", "scale=720:-1",
+            str(preview_path),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
+        except Exception as exc:
+            logger.warning("Frame extraction failed for %s: %s", clip_id, exc)
+            raise HTTPException(500, "Frame extraction failed")
 
         return FileResponse(str(preview_path), media_type="image/jpeg")
 

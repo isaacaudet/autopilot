@@ -6,11 +6,13 @@ targets:
       # Big names (intermittent Deadlock)
       xqc, shroud,
       # Skilled / Deadlock-native
-      surefour, eido, draskyl,
+      surefour, eido, draskyl, averagejonas, anathan, eskay,
       # Personality / clip-friendly
-      boxaroni, fredthefinch, thes1tuation,
+      boxaroni, fredthefinch, thes1tuation, cdnthe3rd, wayneradiotv,
       # Proven on this channel
       noxtism, goober70,
+      # Rising / gamewide performers
+      incon, evafps, metro, lacari,
     ]
     games: [Deadlock, ARC Raiders, Valorant]
     clips_per_source: 100
@@ -26,31 +28,35 @@ settings:
   max_duration: 300
   shorts_threshold: 60
   language: en  # filters by broadcaster language (reliable, unlike clip language field)
+  compilation_min_score: 45  # balances quality vs. having enough clips for a full compilation
 
 autopilot:
-  daily_count: 8
-  min_score: 45
+  daily_count: 20
+  min_score: 65
   game: Deadlock
   scope: configured
-  fallback_to_gamewide: true
+  pre_llm_screen: true
+  fallback_to_gamewide: false
   revive_skipped_candidates: true
   shorts_layout: fill
   period: 24h
   channel: default
   auto_upload: true
-  privacy: private
+  privacy: unlisted
   prefer_calibrated_streamers: true
   require_calibrated_streamers: true
   allow_uncalibrated_fallback: true
   profile_bonus_points: 8.0
+  max_clips_per_streamer: 2
 
 upload:
   title_template: "{title} | {streamer} {game}"
   description_template: |
-    {streamer} {game} clip
+    {streamer} with an insane {game} moment 🎮
 
-    Watch {streamer} live:
-    {url}
+    Watch {streamer} live: {url}
+
+    Subscribe for daily highlights from Deadlock's best players ↑
 
     {tags_as_hashtags}
 

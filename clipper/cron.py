@@ -15,9 +15,7 @@ AUTOPILOT_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{AUTOPILOT_P
 AUTOPILOT_CRON_MARKER = "# clipper-autopilot"
 AUTOPILOT_LOG = Path.home() / ".clipper_autopilot.log"
 AUTOPILOT_TIMES = [
-    {"Hour": 9, "Minute": 0},
-    {"Hour": 14, "Minute": 0},
-    {"Hour": 19, "Minute": 0},
+    {"Hour": 8, "Minute": 0},
 ]
 
 
@@ -51,12 +49,21 @@ def install() -> bool:
     cmd = _clipper_bin()
 
     if detect_platform() == "macos":
+        project_dir = str(Path(__file__).parent.parent.resolve())
+        pyenv_bin = str(Path(sys.executable).parent)
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>{PLIST_NAME}</string>
+    <key>WorkingDirectory</key>
+    <string>{project_dir}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{pyenv_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>{sys.executable}</string>
@@ -145,16 +152,9 @@ def is_autopilot_installed() -> bool:
 def install_autopilot() -> bool:
     """Install autopilot cron/launchd job (runs 3x/day). Returns True on success."""
     if detect_platform() == "macos":
-        # Build StartCalendarInterval array for 3 daily runs
-        calendar_entries = "\n".join(
-            f"""        <dict>
-            <key>Hour</key>
-            <integer>{t['Hour']}</integer>
-            <key>Minute</key>
-            <integer>{t['Minute']}</integer>
-        </dict>"""
-            for t in AUTOPILOT_TIMES
-        )
+        t = AUTOPILOT_TIMES[0]
+        project_dir = str(Path(__file__).parent.parent.resolve())
+        pyenv_bin = str(Path(sys.executable).parent)
 
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -162,17 +162,27 @@ def install_autopilot() -> bool:
 <dict>
     <key>Label</key>
     <string>{AUTOPILOT_PLIST_NAME}</string>
+    <key>WorkingDirectory</key>
+    <string>{project_dir}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{pyenv_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>{sys.executable}</string>
         <string>-m</string>
         <string>clipper</string>
-        <string>autopilot</string>
+        <string>daily-compilation</string>
     </array>
     <key>StartCalendarInterval</key>
-    <array>
-{calendar_entries}
-    </array>
+    <dict>
+        <key>Hour</key>
+        <integer>{t['Hour']}</integer>
+        <key>Minute</key>
+        <integer>{t['Minute']}</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{AUTOPILOT_LOG}</string>
     <key>StandardErrorPath</key>

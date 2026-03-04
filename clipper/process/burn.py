@@ -339,6 +339,21 @@ def _render_hook_overlay_png(hook_text: str, config: dict, clip: dict | None = N
     return overlay_path
 
 
+def _get_subscribe_assets() -> tuple[Path | None, Path | None]:
+    """Return (mov_path, bell_wav_path) for the animated subscribe overlay.
+
+    Assets bundled in clipper/assets/:
+    - subscribe_anim.mov  — ProRes with alpha (VP8/VP9 WebM silently loses alpha)
+    - subscribe_bell.wav  — macOS Ping.aiff converted to WAV
+    """
+    assets_dir = Path(__file__).resolve().parent.parent / "assets"
+    mov = assets_dir / "subscribe_anim.mov"
+    bell = assets_dir / "subscribe_bell.wav"
+    if mov.exists() and bell.exists():
+        return mov, bell
+    return None, None
+
+
 def _build_hook_filter(hook_text: str, config: dict, clip: dict | None = None, duration: float = 2.0) -> str:
     """Build FFmpeg drawtext filters for the first-frame hook overlay.
 
@@ -502,23 +517,53 @@ def burn_subtitles(
         zoom_filter = _build_zoom_filter()
         vf = f"{zoom_filter},{vf}"
 
+    # Title card — first 1.5s of Shorts so it shows in feed previews.
+    if is_shorts and clip:
+        # Strip non-ASCII (emoji) and chars that break filter_complex quoting (' : ; [ ])
+        raw_title = "".join(
+            c for c in (clip.get("title") or "")
+            if ord(c) < 128 and c not in ("'", ":", ";", "[", "]", "\\")
+        )[:48].strip()
+        if raw_title:
+            title_esc = raw_title.replace("'", "\\'").replace(":", "\\:")
+            vf += (
+                f",drawtext=text='{title_esc}'"
+                f":font=Impact:fontsize=40"
+                f":fontcolor=white:borderw=3:bordercolor=black"
+                f":x=(w-text_w)/2:y=80"
+                f":enable='between(t,0,1.5)'"
+            )
+
     hook_overlay_path: Path | None = None
     hook_duration = float(clip.get("_hook_duration", 2.0)) if clip else 2.0
+
+    # Probe duration for Shorts upfront (needed for subscribe CTA timing).
+    vid_duration: float | None = None
+    if is_shorts:
+        from clipper.config import get_ffprobe
+        try:
+            probe = subprocess.run(
+                [get_ffprobe(), "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            vid_duration = float(probe.stdout.strip())
+        except (ValueError, subprocess.SubprocessError, FileNotFoundError):
+            pass
 
     # Hook text overlay always; progress bar only for non-Shorts outputs.
     if hook_text:
         if not is_shorts:
             # Progress bar — probe duration first
             from clipper.config import get_ffprobe
-
             try:
                 probe = subprocess.run(
                     [get_ffprobe(), "-v", "quiet", "-show_entries", "format=duration",
                      "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
                     capture_output=True, text=True,
                 )
-                vid_duration = float(probe.stdout.strip())
-                progress_filter = _build_progress_bar_filter(vid_duration)
+                pb_duration = float(probe.stdout.strip())
+                progress_filter = _build_progress_bar_filter(pb_duration)
                 vf = f"{vf},{progress_filter}"
             except (ValueError, subprocess.SubprocessError):
                 pass  # skip progress bar if probe fails
@@ -532,26 +577,119 @@ def burn_subtitles(
             if hook_filter:
                 vf = f"{vf},{hook_filter}"
 
+    # Subscribe CTA overlay — animated WebM with bell sound over the last 6s.
+    sub_anim_path: Path | None = None
+    sub_bell_path: Path | None = None
+    if is_shorts:
+        shorts_cfg_inner = config.get("shorts", {}) or {}
+        if shorts_cfg_inner.get("subscribe_cta", True):
+            sub_anim_path, sub_bell_path = _get_subscribe_assets()
+
     audio_args = []
     if censor_ranges:
         audio_args.extend(["-af", _build_censor_audio_filter(censor_ranges)])
     audio_args.extend(["-c:a", "aac", "-b:a", "256k"])
 
+    # Build PNG overlay chain: hook (start) → subscribe CTA (end).
+    png_overlays: list[dict] = []
     if hook_overlay_path is not None:
-        overlay_escaped = _escape_filter_path(hook_overlay_path)
-        filter_complex = (
-            f"[0:v]{vf}[base];"
-            f"movie='{overlay_escaped}',format=rgba[hook];"
-            f"[base][hook]overlay=x=0:y=0:enable='between(t,0.1,{hook_duration:.2f})'[v]"
-        )
+        png_overlays.append({
+            "path": hook_overlay_path,
+            "label": "hook",
+            "fade": "",
+            "enable": f"between(t,0.1,{hook_duration:.2f})",
+        })
+    # Animated subscribe CTA — last ~6s of the clip.
+    # Requires vid_duration > 10s to avoid dominating short clips.
+    use_anim_cta = (
+        sub_anim_path is not None
+        and sub_bell_path is not None
+        and vid_duration is not None
+        and vid_duration > 10.0
+    )
+    if use_anim_cta:
+        sub_start = max(0.5, vid_duration - 6.3)
+    else:
+        sub_start = 0.0
+
+    filter_complex: str | None = None
+    use_bell_audio = use_anim_cta
+
+    if png_overlays or use_anim_cta:
+        filter_parts = [f"[0:v]{vf}[base]"]
+        prev_label = "base"
+
+        # Static PNG overlays (hook card, etc.)
+        for i, ov in enumerate(png_overlays):
+            out_label = f"lay{i}"
+            path_escaped = _escape_filter_path(ov["path"])
+            filter_parts.append(
+                f"movie='{path_escaped}',format=rgba{ov['fade']}[{ov['label']}]"
+            )
+            filter_parts.append(
+                f"[{prev_label}][{ov['label']}]overlay=x=0:y=0:enable='{ov['enable']}'[{out_label}]"
+            )
+            prev_label = out_label
+
+        # Animated subscribe MOV — crop button area (630x380 @ x=645,y=700 from 1920x1080),
+        # scale to 560px wide, centered at bottom safe zone.
+        # Prepend a transparent blank stream so the animation starts at the right time.
+        # (movie= plays continuously regardless of enable=; blank concat is the correct fix.)
+        if use_anim_cta:
+            anim_escaped = _escape_filter_path(sub_anim_path)
+            if sub_start > 0.05:
+                filter_parts.append(
+                    f"movie='{anim_escaped}',"
+                    f"crop=630:380:645:700,scale=560:-1,setsar=1,format=rgba[ani_raw]"
+                )
+                filter_parts.append(
+                    f"color=s=560x338:d={sub_start:.3f}:r=30,"
+                    f"format=rgba,colorchannelmixer=aa=0[blank]"
+                )
+                filter_parts.append("[blank][ani_raw]concat=n=2:v=1:a=0[sub_anim]")
+            else:
+                filter_parts.append(
+                    f"movie='{anim_escaped}',"
+                    f"crop=630:380:645:700,scale=560:-1,setsar=1,format=rgba[sub_anim]"
+                )
+            filter_parts.append(
+                f"[{prev_label}][sub_anim]overlay=(W-w)/2:H-h-80:format=auto:eof_action=pass[v]"
+            )
+            prev_label = "v"
+        else:
+            # Rename last label to [v] for consistent mapping
+            if png_overlays:
+                filter_parts[-1] = filter_parts[-1].replace(f"[{prev_label}]", "[v]")
+                prev_label = "v"
+
+        # Audio: mix in bell if animated CTA is active
+        if use_bell_audio:
+            bell_escaped = _escape_filter_path(sub_bell_path)
+            bell_delay_ms = int(sub_start * 1000)
+            filter_parts.append(
+                f"amovie='{bell_escaped}',adelay={bell_delay_ms}|{bell_delay_ms}[bell]"
+            )
+            filter_parts.append(
+                "[0:a][bell]amix=inputs=2:duration=first:weights=1 0.35[a]"
+            )
+
+        if prev_label != "v" and png_overlays and not use_anim_cta:
+            pass  # already handled above
+        elif not use_anim_cta and not png_overlays:
+            pass
+
+        filter_complex = ";".join(filter_parts)
+
+        audio_map = "[a]" if use_bell_audio else "0:a?"
         cmd = [
             ffmpeg_bin,
             "-i", str(video_path),
             "-filter_complex", filter_complex,
             "-map", "[v]",
-            "-map", "0:a?",
+            "-map", audio_map,
             *get_encoder_args(),
-            *audio_args,
+            *(audio_args if not use_bell_audio else [a for a in audio_args if not a.startswith("-af")]),
+            "-c:a", "aac", "-b:a", "256k",
             "-movflags", "+faststart",
             "-y",
             str(output_path),
@@ -571,8 +709,9 @@ def burn_subtitles(
     console.print(f"[blue]Burning subtitles:[/blue] {video_path.name}")
     if verbose:
         console.print(f"[dim]FFmpeg: {ffmpeg_bin}[/dim]")
-        if hook_overlay_path is not None:
-            console.print(f"[dim]Hook overlay: {hook_overlay_path}[/dim]")
+        if filter_complex:
+            for ov in png_overlays:
+                console.print(f"[dim]Overlay ({ov['label']}): {ov['path']}[/dim]")
             console.print(f"[dim]Filter complex: {filter_complex}[/dim]")
         else:
             console.print(f"[dim]Filter: {vf}[/dim]")

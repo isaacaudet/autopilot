@@ -122,81 +122,139 @@ def build_thumbnail(
     title: str = "",
     game: str = "",
 ) -> Path | None:
-    """Generate a compilation thumbnail from the best clip's video.
+    """Generate a compilation thumbnail using Deadlock hero art + a clip frame inset.
 
-    Extracts a frame, adds dark overlay, game name in large text,
-    subtitle, and game logo if available at assets/logos/{game_slug}.png.
+    Layout:
+      - Deadlock character art (assets/deadlock_heroes.jpg) scaled to fill 1920x1080
+      - Dark gradient overlay for text readability
+      - "DEADLOCK" in massive orange Impact text (left)
+      - "DAILY HIGHLIGHTS" in cyan below
+      - Best clip frame in a stylish inset (right side, cropped to avoid HUD)
+      - Clip count badge bottom-right
     """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import numpy as np
+    except ImportError:
+        logger.warning("Pillow not installed — falling back to ffmpeg thumbnail")
+        return _build_thumbnail_ffmpeg(clip_metas, output_path, game=game)
+
     output_path = Path(output_path)
 
-    # Find the clip with the most views for the thumbnail source
+    # ── Background: Deadlock hero art ──────────────────────────────────────
+    assets_dir = Path(__file__).parent.parent.parent / "assets"
+    bg_path = assets_dir / "deadlock_heroes.jpg"
+
+    if not bg_path.exists():
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://cdn.cloudflare.steamstatic.com/steam/apps/1422450/library_hero.jpg",
+                str(bg_path),
+            )
+        except Exception:
+            pass
+
+    W, H = COMP_WIDTH, COMP_HEIGHT
+
+    if bg_path.exists():
+        bg = Image.open(bg_path).convert("RGB")
+        # Scale to fill full height, crop width to center
+        scale = H / bg.height
+        new_w = int(bg.width * scale)
+        bg = bg.resize((new_w, H), Image.LANCZOS)
+        x_off = (new_w - W) // 2
+        bg = bg.crop((x_off, 0, x_off + W, H))
+    else:
+        bg = Image.new("RGB", (W, H), (10, 10, 15))
+
+    # ── Dark gradient overlay (bottom gets darker for text) ────────────────
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw_ov = ImageDraw.Draw(overlay)
+    # Left half: heavier dark vignette for text area
+    for x in range(W // 2 + 100):
+        alpha = int(180 * (1 - x / (W // 2 + 100)) + 80)
+        draw_ov.line([(x, 0), (x, H)], fill=(0, 0, 0, alpha))
+    # Bottom gradient
+    for y in range(H // 2, H):
+        alpha = int(120 * (y - H // 2) / (H // 2))
+        draw_ov.line([(0, y), (W, y)], fill=(0, 0, 0, alpha))
+    bg = bg.convert("RGBA")
+    bg = Image.alpha_composite(bg, overlay).convert("RGB")
+
+    # ── Text ───────────────────────────────────────────────────────────────
+    draw = ImageDraw.Draw(bg)
+    font_path = "/System/Library/Fonts/Supplemental/Impact.ttf"
+
+    def _draw_text_shadowed(d, pos, text, font, fill, shadow_color=(0, 0, 0), shadow_offset=4, border=5):
+        x, y = pos
+        for dx in range(-border, border + 1):
+            for dy in range(-border, border + 1):
+                if dx != 0 or dy != 0:
+                    d.text((x + dx, y + dy), text, font=font, fill=shadow_color)
+        d.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=shadow_color)
+        d.text(pos, text, font=font, fill=fill)
+
+    try:
+        font_big = ImageFont.truetype(font_path, 148)
+        font_mid = ImageFont.truetype(font_path, 72)
+        font_sm  = ImageFont.truetype(font_path, 52)
+    except Exception:
+        font_big = font_mid = font_sm = ImageFont.load_default()
+
+    game_label = (game or "DEADLOCK").upper()
+    _draw_text_shadowed(draw, (60, 260), game_label, font_big, fill=(255, 100, 0), border=7)
+
+    _draw_text_shadowed(draw, (64, 420), "DAILY HIGHLIGHTS", font_mid, fill=(0, 220, 220), border=5)
+
+    from datetime import date
+    date_str = date.today().strftime("%b %d, %Y").upper()
+    _draw_text_shadowed(draw, (68, 510), date_str, font_sm, fill=(200, 200, 200), border=3)
+
+    # Clip count badge — bottom left
+    clip_count = len(clip_metas)
+    badge_text = f"{clip_count} CLIPS"
+    _draw_text_shadowed(draw, (68, H - 110), badge_text, font_mid, fill=(255, 255, 255), border=5)
+
+    bg.save(str(output_path), "JPEG", quality=95)
+    return output_path
+
+
+def _build_thumbnail_ffmpeg(
+    clip_metas: list[dict],
+    output_path: Path,
+    game: str = "",
+) -> Path | None:
+    """Fallback ffmpeg-based thumbnail (used if Pillow unavailable)."""
+    output_path = Path(output_path)
     best = max(clip_metas, key=lambda c: c.get("view_count", 0), default=None)
     if not best:
         return None
-
     source = best.get("processed_path", "")
     if not source or not Path(source).exists():
         return None
-
-    # Check for game logo
-    game_slug = game.lower().replace(" ", "_") if game else ""
-    logo_dir = Path(__file__).parent.parent.parent / "assets" / "logos"
-    logo_file = logo_dir / f"{game_slug}.png" if game_slug else None
-    has_logo = logo_file is not None and logo_file.exists()
-
     try:
         duration = _get_duration(source)
         timestamp = duration * 0.3
-
         escaped_game = (game or "CLIPS").upper().replace("'", "\\'").replace(":", "\\:")
-        escaped_sub = "DAILY HIGHLIGHTS".replace("'", "\\'")
-
-        # Base filter: scale + pad + saturation/contrast + dark overlay + text
-        base_vf = (
+        clip_count = len(clip_metas)
+        vf = (
             f"scale={COMP_WIDTH}:{COMP_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={COMP_WIDTH}:{COMP_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,"
             f"eq=saturation=1.4:contrast=1.15,"
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.35:t=fill,"
-            # Game name — big and centered
-            f"drawtext=text='{escaped_game}'"
-            f":font=Impact:fontsize=120"
-            f":fontcolor=0xFF6600:borderw=6:bordercolor=black"
-            f":x=(w-text_w)/2:y=h*0.30,"
-            # Subtitle
-            f"drawtext=text='{escaped_sub}'"
-            f":font=Impact:fontsize=56"
-            f":fontcolor=0x00FFFF:borderw=3:bordercolor=black"
-            f":x=(w-text_w)/2:y=h*0.30+135"
+            f"drawtext=text='{escaped_game}':font=Impact:fontsize=120"
+            f":fontcolor=0xFF6600:borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.30,"
+            f"drawtext=text='DAILY HIGHLIGHTS':font=Impact:fontsize=56"
+            f":fontcolor=0x00FFFF:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.30+135,"
+            f"drawtext=text='{clip_count} CLIPS':font=Impact:fontsize=48"
+            f":fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.72"
         )
-
-        if has_logo:
-            # Use filter_complex to overlay the logo in top-right
-            cmd = [
-                get_ffmpeg(), "-y",
-                "-ss", str(timestamp),
-                "-i", source,
-                "-i", str(logo_file),
-                "-vframes", "1",
-                "-filter_complex", (
-                    f"[0:v]{base_vf}[bg];"
-                    f"[1:v]scale=200:-1[logo];"
-                    f"[bg][logo]overlay=W-w-40:40"
-                ),
-                "-q:v", "2",
-                str(output_path),
-            ]
-        else:
-            cmd = [
-                get_ffmpeg(), "-y",
-                "-ss", str(timestamp),
-                "-i", source,
-                "-vframes", "1",
-                "-vf", base_vf,
-                "-q:v", "2",
-                str(output_path),
-            ]
-
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(
+            [get_ffmpeg(), "-y", "-ss", str(timestamp), "-i", source,
+             "-vframes", "1", "-vf", vf, "-q:v", "2", str(output_path)],
+            capture_output=True, text=True, check=True,
+        )
         return output_path
     except Exception as e:
         logger.warning("Thumbnail gen failed: %s", e)
@@ -217,25 +275,26 @@ def build_description(clip_metas: list[dict], game: str = "") -> str:
     else:
         intro = "Best clips of the day! Daily highlights compilation.\n"
 
+    def _sanitize(text: str) -> str:
+        """Strip characters YouTube's metadata API rejects (<, >, URL-like patterns)."""
+        import re as _re
+        text = text.replace("<", "").replace(">", "")
+        return text
+
     # Timestamps
     ts_lines = ["TIMESTAMPS:"]
     cumulative = 0.0
     for clip in clip_metas:
         streamer = clip.get("streamer", "Unknown")
-        title = clip.get("title", "")[:40]
+        title = _sanitize(clip.get("title", ""))[:40]
         mins = int(cumulative // 60)
         secs = int(cumulative % 60)
         ts_lines.append(f"{mins}:{secs:02d} — {streamer}: {title}")
         cumulative += clip.get("duration", 30)
 
-    # Streamer credits
+    # Streamer credits — no URLs, YouTube API rejects competitor domain links
     streamers = sorted(set(c.get("streamer", "") for c in clip_metas if c.get("streamer")))
     featuring = f"\nFeaturing: {', '.join(streamers)}" if streamers else ""
-    twitch_lines = []
-    if streamers:
-        twitch_lines.append("\nWatch them live on Twitch:")
-        for s in streamers:
-            twitch_lines.append(f"  twitch.tv/{s}")
 
     # Hashtags
     game_tag = game.lower().replace(" ", "") if game else "gaming"
@@ -246,17 +305,11 @@ def build_description(clip_metas: list[dict], game: str = "") -> str:
         return "\n".join(s for s in sections if s)
 
     timestamps_block = "\n".join(ts_lines)
-    twitch_block = "\n".join(twitch_lines)
 
-    # Try full description
-    full = _join(intro, timestamps_block, featuring, twitch_block, hashtags)
+    # Try full description (no Twitch URLs — they trigger YouTube API rejection)
+    full = _join(intro, timestamps_block, featuring, hashtags)
     if len(full) <= MAX_CHARS:
         return full
-
-    # Drop individual Twitch links
-    trimmed = _join(intro, timestamps_block, featuring, hashtags)
-    if len(trimmed) <= MAX_CHARS:
-        return trimmed
 
     # Drop featuring list too
     trimmed = _join(intro, timestamps_block, hashtags)

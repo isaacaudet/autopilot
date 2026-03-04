@@ -30,6 +30,12 @@ export async function fetchQueue(
   return data.clips
 }
 
+export async function resetQueue(status: 'pending' | 'approved' = 'pending'): Promise<{ deleted: number; history_cleared: number }> {
+  const res = await fetch(`${BASE}/api/queue?status=${status}&also_remove_history=true`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Reset queue failed: ${res.status}`)
+  return res.json()
+}
+
 export async function resyncOutput(limit = 200): Promise<{ created: number; clips: string[]; orphans_found: number }> {
   const res = await fetch(`${BASE}/api/output/resync?limit=${encodeURIComponent(String(limit))}`, {
     method: 'POST',
@@ -217,6 +223,7 @@ export async function updateClipMetadata(
     sync_youtube?: boolean
     hook_text_override?: string
     hook_duration?: number
+    subtitle_margin_v?: number
   },
 ): Promise<void> {
   const res = await fetch(`${BASE}/api/clips/${encodeURIComponent(clipId)}`, {
@@ -635,6 +642,43 @@ export async function updateSubtitles(clipId: string, lines: SubtitleLine[]): Pr
     const err = await res.json().catch(() => ({ detail: `Save subtitles failed: ${res.status}` }))
     throw new Error(err.detail || `Save subtitles failed: ${res.status}`)
   }
+}
+
+// -- Manual ingest --
+
+export interface IngestStatus {
+  status: 'transcribing' | 'done' | 'error'
+  word_count: number
+  subtitle_path: string | null
+  error?: string
+}
+
+export async function ingestVideo(
+  file: File,
+  title?: string,
+): Promise<{ clip_id: string; status: string }> {
+  const form = new FormData()
+  form.append('file', file)
+  if (title) form.append('title', title)
+  const res = await fetch(`${BASE}/api/ingest`, { method: 'POST', body: form })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Ingest failed: ${res.status}` }))
+    throw new Error(err.detail || `Ingest failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function pollIngestStatus(clipId: string): Promise<IngestStatus> {
+  const res = await fetch(`${BASE}/api/ingest/${encodeURIComponent(clipId)}/status`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: `Status check failed: ${res.status}` }))
+    throw new Error(err.detail || `Status check failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+export function clipFrameUrl(clipId: string): string {
+  return `${BASE}/api/clips/${encodeURIComponent(clipId)}/frame`
 }
 
 export async function fetchStudioClips(opts?: {

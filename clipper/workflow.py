@@ -236,6 +236,7 @@ def _load_and_score_pending(
     game: str = "",
     use_game_multipliers: bool = False,
     persist: bool = True,
+    apply_view_floor: bool = False,
 ) -> list[dict]:
     """Load pending clips from DB, filter by game + English, score, and sort by score desc.
 
@@ -264,6 +265,16 @@ def _load_and_score_pending(
             clip["_game_multiplier"] = mult
 
         clips.append(clip)
+
+    if apply_view_floor:
+        from clipper.process.score import apply_view_floor as _apply_view_floor
+        clips, view_floored = _apply_view_floor(clips)
+        if view_floored and persist:
+            for c in view_floored:
+                if c.get("id"):
+                    update_clip(config, c["id"], status="skipped", score=0)
+        if view_floored:
+            console.print(f"  View floor: removed {len(view_floored)} low-traction clips")
 
     source_priors = _build_source_priors(config, clips)
     ranked = rank_clips_v2(
@@ -328,7 +339,7 @@ def _build_source_priors(config: dict, clips: list[dict]) -> dict[str, float]:
         delta = avg - global_mean
         # Translate log-view delta into score points with sample-size shrinkage.
         shrink = len(values) / (len(values) + 5.0)
-        return max(-6.0, min(8.0, (delta * 6.0) * shrink))
+        return max(-8.0, min(15.0, (delta * 8.0) * shrink))
 
     for game, logs in by_game.items():
         priors[f"game::{game}"] = round(_prior_from_logs(logs), 3)
@@ -386,12 +397,18 @@ def _approve_clips(
     conn.commit()
 
     approved = 0
+    streamer_counts: dict[str, int] = {}
+    max_per_streamer = int((config.get("autopilot") or {}).get("max_clips_per_streamer", 2))
     for clip in clips:
         clip_id = clip.get("id")
         if not clip_id:
             continue
         clip_score = float(clip.get("_score", 0.0) or 0.0)
         if min_score is not None and clip_score < float(min_score):
+            update_clip(config, clip_id, status="skipped", score=clip_score)
+            continue
+        streamer = str(clip.get("streamer") or "").lower()
+        if streamer and streamer_counts.get(streamer, 0) >= max_per_streamer:
             update_clip(config, clip_id, status="skipped", score=clip_score)
             continue
         if approved < count:
@@ -410,6 +427,8 @@ def _approve_clips(
                 f"{clip.get('title', '?')[:40]} (score {clip_score:.0f})"
             )
             approved += 1
+            if streamer:
+                streamer_counts[streamer] = streamer_counts.get(streamer, 0) + 1
         else:
             update_clip(config, clip_id, status="skipped", score=clip_score)
 
@@ -456,11 +475,13 @@ def _fetch_clips(
     elif scope_key == "configured":
         fetch_config["targets"]["twitch"]["games"] = []
         fetch_config["targets"]["twitch"]["streamers"] = list(config.get("targets", {}).get("twitch", {}).get("streamers", []) or [])
+        fetch_config["targets"]["twitch"]["game_filter"] = game
     else:
         fetch_config["targets"]["twitch"]["games"] = []
         fetch_config["targets"]["twitch"]["streamers"] = [str(s).strip() for s in (streamers or []) if str(s).strip()]
         if not fetch_config["targets"]["twitch"]["streamers"]:
             raise ValueError("Selected-streamer scope requires at least one streamer")
+        fetch_config["targets"]["twitch"]["game_filter"] = game
 
     # Fetch with a wider net than the final quality floor.
     # `min_views` is a quality floor for approval; discovery should stay broader.
@@ -468,12 +489,9 @@ def _fetch_clips(
     cfg_min_views = int(settings_cfg.get("min_views", 0) or 0)
     raw_fetch_min = settings_cfg.get("fetch_min_views")
     if raw_fetch_min is None:
-        # Adaptive default: if global floor is high (e.g. 100+), still pull a broader
-        # review candidate set and let scoring/ranking decide.
-        if cfg_min_views <= 0:
-            fetch_min_views = 20
-        else:
-            fetch_min_views = max(10, min(40, cfg_min_views // 4))
+        # Don't pre-filter by views. Twitch API returns view_count=0 for fresh
+        # clips (< ~24h old) — a known API quirk. Let scoring handle quality.
+        fetch_min_views = 0
     else:
         fetch_min_views = max(0, int(raw_fetch_min))
     fetch_config["settings"]["min_views"] = fetch_min_views
@@ -485,8 +503,9 @@ def _fetch_clips(
     else:
         scope_text = f"{len(fetch_config['targets']['twitch']['streamers'])} selected streamer(s)"
 
+    views_label = f"min {fetch_min_views} views" if fetch_min_views > 0 else "no view floor"
     console.print(
-        f"\n[bold]Fetching clips ({scope_text}, last {period_str}, min {fetch_min_views} views)...[/bold]"
+        f"\n[bold]Fetching clips ({scope_text}, last {period_str}, {views_label})...[/bold]"
     )
     return fetch_twitch_clips(fetch_config, verbose=verbose)
 
@@ -633,6 +652,88 @@ def _revive_skipped_candidates(
     return promoted
 
 
+def _pre_screen_candidates(
+    clips: list[dict],
+    config: dict,
+    target_count: int,
+    *,
+    screen_top_n: int = 30,
+    blend_weight: float = 0.4,
+) -> list[dict]:
+    """Pre-screen top candidates with a single batched Gemini metadata call.
+
+    Blends the Gemini pre-score into the existing score for re-ranking.
+    Falls back gracefully to original order if Gemini is unavailable.
+    """
+    from clipper.process.analyze import pre_analyze_clips
+    from clipper.db import update_clip
+
+    n = min(len(clips), max(screen_top_n, target_count * 3))
+    candidates, rest = clips[:n], clips[n:]
+
+    pre_scores = pre_analyze_clips(candidates)
+    if not pre_scores:
+        return clips  # graceful degradation
+
+    console.print(f"  [cyan]Pre-screen:[/cyan] {len(pre_scores)}/{n} clips rated by Gemini")
+
+    for clip in candidates:
+        ps = pre_scores.get(clip.get("id", ""))
+        if ps is not None:
+            clip["_pre_score"] = ps
+            update_clip(config, clip["id"], pre_score=ps)
+
+    def _blended(clip: dict) -> float:
+        base = float(clip.get("_score", 0) or 0)
+        ps = clip.get("_pre_score")
+        if ps is None:
+            return base
+        return (1 - blend_weight) * base + blend_weight * (float(ps) / 10.0 * 100.0)
+
+    candidates.sort(key=_blended, reverse=True)
+    for c in candidates:
+        c["_blended_score"] = round(_blended(c), 2)
+    return candidates + rest
+
+
+def _flag_exceptional_clips(
+    qualifying: list[dict],
+    approved_ids: set[str],
+    config: dict,
+    *,
+    max_exceptional: int = 2,
+    score_threshold: float = 75.0,
+    pre_score_threshold: int = 8,
+) -> list[dict]:
+    """Flag high-quality clips that weren't auto-approved (e.g. uncalibrated streamer).
+
+    Prints a banner with URL so user can process manually if desired.
+    """
+    from clipper.db import update_clip
+
+    exceptional = []
+    for clip in qualifying:
+        if len(exceptional) >= max_exceptional:
+            break
+        cid = clip.get("id", "")
+        if not cid or cid in approved_ids:
+            continue
+        score = float(clip.get("_score", 0) or 0)
+        pre = clip.get("_pre_score")
+        if score < score_threshold and (pre is None or pre < pre_score_threshold):
+            continue
+        update_clip(config, cid, status="exceptional_pending")
+        exceptional.append(clip)
+        pre_str = f", pre={pre}/10" if pre is not None else ""
+        console.print(
+            f"\n[bold yellow]  ⚠ EXCEPTIONAL — manual review needed:[/bold yellow]\n"
+            f"  {clip.get('streamer', '?')} — \"{str(clip.get('title', '?'))[:55]}\"\n"
+            f"  score={score:.0f}{pre_str} | {float(clip.get('duration', 0) or 0):.0f}s\n"
+            f"  {clip.get('url', '')}"
+        )
+    return exceptional
+
+
 def _upload_processed_clips(
     processed: list[dict],
     config: dict,
@@ -656,18 +757,41 @@ def _upload_processed_clips(
     failed = 0
     uploaded_ids: list[str] = []
 
+    # Pre-compute scheduled publish times if the channel has a schedule configured
+    # and we're uploading to YouTube (other platforms don't support publishAt yet)
+    publish_slots: list[str] = []
+    _channel_key = channel or (config.get("autopilot", {}) or {}).get("channel") or "default"
+    _platform = get_channel_platform(_channel_key, config)
+    if _platform == "youtube" and processed:
+        try:
+            from clipper.schedule import get_next_slots
+            ch_cfg = (config.get("channels", {}) or {}).get(_channel_key, {})
+            if ch_cfg.get("schedule", {}).get("release_times"):
+                slots = get_next_slots(_channel_key, config, count=len(processed))
+                from datetime import timezone as _tz
+                publish_slots = [
+                    s.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    for s in slots
+                ]
+        except Exception:
+            pass
+
     if state is not None:
         state.uploads_total = len(processed)
         state.uploads_done = 0
         state.set_phase("uploading", f"Uploading {len(processed)} clips ({privacy_key})")
 
-    for clip in processed:
+    for i, clip in enumerate(processed):
         clip_id = str(clip.get("id", "")).strip()
         if not clip_id:
             failed += 1
             continue
 
-        upload_id = upload_clip(clip, config, privacy=privacy_key, channel=channel, verbose=verbose)
+        publish_at = publish_slots[i] if i < len(publish_slots) else None
+        if publish_at and verbose:
+            console.print(f"  [dim]Scheduled publish: {publish_at}[/dim]")
+
+        upload_id = upload_clip(clip, config, privacy=privacy_key, channel=channel, verbose=verbose, publish_at=publish_at)
         if not upload_id:
             failed += 1
             if state is not None:
@@ -859,6 +983,18 @@ def run_autopilot_workflow(
             state.set_phase("done", detail)
         return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "below_threshold"}
 
+    # One-time weight reset (remove reset_weights_once from config.yaml after first run)
+    if autopilot_cfg.get("reset_weights_once"):
+        from clipper.learn import reset_weights
+        reset_weights(config)
+        console.print("[bold yellow]Remove 'reset_weights_once' from config.yaml[/bold yellow]")
+
+    # Pre-LLM screening: re-rank candidates using batched Gemini metadata call
+    if autopilot_cfg.get("pre_llm_screen", False):
+        if state is not None:
+            state.set_phase("scoring", "Pre-screening candidates with Gemini...")
+        qualifying = _pre_screen_candidates(qualifying, config, target_count)
+
     qualifying = _prioritize_calibrated_streamers(qualifying, config)
     used_uncalibrated_fallback = False
     require_calibrated = bool(autopilot_cfg.get("require_calibrated_streamers", True))
@@ -903,6 +1039,26 @@ def run_autopilot_workflow(
     if autopilot_layout not in {"fill", "blur"}:
         autopilot_layout = "fill"
 
+    # Simulate approval to identify which clips will be auto-approved
+    _approved_ids: set[str] = set()
+    _streamer_seen: dict[str, int] = {}
+    _max_per = int(autopilot_cfg.get("max_clips_per_streamer", 2))
+    for _c in qualifying:
+        if len(_approved_ids) >= target_count:
+            break
+        _s = str(_c.get("streamer") or "").lower()
+        if float(_c.get("_score", 0) or 0) < float(min_score):
+            continue
+        if _s and _streamer_seen.get(_s, 0) >= _max_per:
+            continue
+        _cid = _c.get("id", "")
+        if _cid:
+            _approved_ids.add(_cid)
+        if _s:
+            _streamer_seen[_s] = _streamer_seen.get(_s, 0) + 1
+
+    _flag_exceptional_clips(qualifying, _approved_ids, config)
+
     if state is not None:
         state.set_phase("approving", f"Approving top {target_count} clips...")
     approved = _approve_clips(
@@ -946,6 +1102,21 @@ def run_autopilot_workflow(
         summary["failed_uploads"] = int(upload_summary.get("failed_uploads", 0) or 0)
         summary["privacy"] = upload_summary.get("privacy", "unlisted")
         summary["status"] = "uploaded"
+
+    # Report long-form candidates that were skipped as Shorts
+    long_form = [
+        c for c in qualifying
+        if 60.0 < float(c.get("duration", 0) or 0) <= 180.0
+        and c.get("id", "") not in _approved_ids
+    ]
+    if long_form:
+        console.print("\n[bold blue]Long-form candidates (>60s, not processed as Shorts):[/bold blue]")
+        for lf in long_form[:5]:
+            console.print(
+                f"  {lf.get('streamer', '?')} — \"{str(lf.get('title', '?'))[:50]}\" "
+                f"({float(lf.get('duration', 0) or 0):.0f}s, score={float(lf.get('_score', 0) or 0):.0f})"
+            )
+        summary["long_form_candidates"] = len(long_form)
 
     if state is not None and state.phase != "error":
         detail = (
@@ -1075,10 +1246,10 @@ def run_compilation_workflow(
             state.set_phase("done", "No clips found")
         return
 
-    # 2. Score & rank
+    # 2. Score & rank (no view floor — compilations need broader candidate pool)
     if state:
         state.set_phase("scoring", f"Scoring and ranking clips")
-    pending = _load_and_score_pending(config, game=game)
+    pending = _load_and_score_pending(config, game=game, apply_view_floor=False)
     if not pending:
         console.print("[yellow]No English clips found.[/yellow]")
         if state:

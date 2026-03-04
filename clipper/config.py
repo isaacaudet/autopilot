@@ -85,7 +85,7 @@ def get_encoder_args() -> list[str]:
             capture_output=True, text=True, timeout=10,
         )
         if "h264_videotoolbox" in result.stdout:
-            return ["-c:v", "h264_videotoolbox", "-q:v", "65"]
+            return ["-c:v", "h264_videotoolbox", "-q:v", "30"]
     except (subprocess.TimeoutExpired, OSError):
         pass
 

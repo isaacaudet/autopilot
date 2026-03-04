@@ -48,7 +48,9 @@ interface TrimOverrides {
 
 function defaultTitleOverrides(clip: ClipMeta): TitleOverrides {
   return {
-    title: clip._title_override ?? clip._analysis?.title_variants?.[0] ?? clip.title ?? '',
+    // Only pre-fill with an explicit override or LLM variant — never the raw Twitch title.
+    // An empty string here means "auto-generate at upload time" via _build_title.
+    title: clip._title_override ?? clip._analysis?.title_variants?.[0] ?? '',
     hookText: clip._hook_text_override ?? clip._analysis?.hook_text ?? '',
   }
 }
@@ -258,8 +260,8 @@ export function EditPage() {
         const hookOverride = String(tOv?.hookText ?? '').trim()
         mergedOverrides[clip.id] = {
           ...(cropOv ?? {}),
-          _title_override: titleOverride,
-          _hook_text_override: hookOverride,
+          _title_override: titleOverride || undefined,
+          _hook_text_override: hookOverride || undefined,
           _trim_start: Math.max(0, Number(trimOv.trimStart || 0)),
           _trim_end: Math.max(0, Number(trimOv.trimEnd || 0)),
         }

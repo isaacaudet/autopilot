@@ -6,6 +6,7 @@ import {
   ListChecks,
   SlidersHorizontal,
   TrendingUp,
+  Upload,
   Workflow,
   Zap,
 } from 'lucide-react'
@@ -35,6 +36,7 @@ const navItems = [
   { to: '/', label: 'Home', icon: Zap },
   { to: '/review', label: 'Review', icon: ListChecks, badgeKey: 'pending' as const },
   { to: '/edit', label: 'Edit', icon: SlidersHorizontal, badgeKey: 'approved' as const },
+  { to: '/upload', label: 'Upload', icon: Upload },
   { to: '/studio', label: 'Studio', icon: Film },
   { to: '/pipeline', label: 'Pipeline', icon: Workflow, pulsing: true },
   { to: '/schedule', label: 'Schedule', icon: Calendar },

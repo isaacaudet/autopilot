@@ -1,11 +1,92 @@
 """LLM-powered clip transcript analysis. Gemini Flash → Ollama fallback."""
 
+import datetime as _dt
 import json
 import os
 
 from rich.console import Console
 
 console = Console()
+
+
+def _clip_age_hours(clip: dict) -> float:
+    """Return clip age in hours. Kept local to avoid circular import with score.py."""
+    created = str(clip.get("created_at", "") or "").strip()
+    if not created:
+        return 24.0
+    try:
+        created_dt = _dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        now = _dt.datetime.now(_dt.timezone.utc)
+        return max(0.5, (now - created_dt).total_seconds() / 3600.0)
+    except (ValueError, TypeError):
+        return 24.0
+
+
+_PRE_SCREEN_PROMPT = """You are a YouTube Shorts virality expert for gaming clips.
+Rate the viral potential of each clip based ONLY on its metadata (no video).
+
+Clips:
+{clip_list}
+
+For each, assess:
+- Title viral signal: specific hype words (clutch, 1v5, ace, rage, banned) vs generic (character names, single letters, stream titles)
+- Moment type: clutch/fail/funny/rage/hype/skill vs boring/filler
+- View traction: views given clip age (fresh 0-view clips are OK; old low-view clips are not)
+- Duration: 15-58s ideal for Shorts; penalize > 90s
+
+Score guide:
+10: Unmistakably viral (hype title + known streamer + strong views)
+7-9: Clear potential (2+ strong signals)
+5-6: Average (one weak signal or generic content)
+3-4: Weak (generic title + low views)
+1-2: Reject (single word/letter title, zero traction, stream title spam)
+
+Respond ONLY as JSON: {{"clip_id_1": 8, "clip_id_2": 3, ...}}"""
+
+
+def pre_analyze_clips(clips: list[dict]) -> dict[str, int]:
+    """Batch pre-screen clips via a single Gemini text call (no download needed).
+
+    Returns {clip_id: score_1_to_10} dict. Falls back silently to {} on any failure.
+    """
+    if not clips:
+        return {}
+
+    lines = []
+    for c in clips:
+        age = _clip_age_hours(c)
+        lines.append(
+            f"- id={c.get('id', '?')} | streamer={c.get('streamer', '?')} | "
+            f"game={c.get('game', '?')} | title=\"{str(c.get('title', ''))[:60]}\" | "
+            f"dur={float(c.get('duration', 0) or 0):.0f}s | "
+            f"views={int(c.get('view_count', 0) or 0)} | age={age:.1f}h"
+        )
+
+    prompt = _PRE_SCREEN_PROMPT.format(clip_list="\n".join(lines))
+
+    try:
+        text = _call_gemini(prompt)
+        if not text:
+            return {}
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                score = max(1, min(10, int(v)))
+                result[str(k)] = score
+            except (TypeError, ValueError):
+                pass
+        return result
+    except Exception:
+        return {}
 
 _TEXT_PROMPT_TEMPLATE = """Analyze this gaming stream clip transcript for entertainment value.
 

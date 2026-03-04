@@ -184,6 +184,89 @@ def autopilot(
     )
 
 
+@cli.command("daily-compilation")
+@click.option("--channel", "-c", default=None, help="Channel key from config.yaml.")
+@click.option("--game", default=None, help="Game name (overrides config).")
+@click.option("--duration", type=int, default=None, help="Target compilation length in minutes.")
+@click.option("--privacy", type=click.Choice(["unlisted", "private", "public"]), default=None)
+@click.option("--skip-shorts", is_flag=True, help="Skip the Shorts autopilot run (compilation only).")
+@click.option("--verbose", "-v", is_flag=True)
+def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
+    """Fetch the previous day's best clips and build + upload a daily compilation."""
+    from clipper.workflow import run_compilation_workflow
+
+    config = load_config()
+    autopilot_cfg = config.get("autopilot", {}) or {}
+    upload_cfg = config.get("upload", {}) or {}
+
+    resolved_game = str(game or autopilot_cfg.get("game", "Deadlock")).strip()
+    resolved_channel = str(channel or autopilot_cfg.get("channel", "")).strip() or None
+    resolved_privacy = str(
+        privacy or autopilot_cfg.get("privacy", upload_cfg.get("default_privacy", "unlisted"))
+    ).strip().lower()
+    if resolved_privacy not in {"unlisted", "private", "public"}:
+        resolved_privacy = "unlisted"
+    resolved_duration = int(duration or (config.get("compilation") or {}).get("target_minutes", 10))
+    resolved_shorts_count = int(autopilot_cfg.get("daily_count", 20))
+    resolved_min_score = float(autopilot_cfg.get("min_score", 45))
+
+    click.echo(
+        f"Daily compilation: game={resolved_game} channel={resolved_channel or 'auto'} "
+        f"target={resolved_duration}min privacy={resolved_privacy}"
+        + ("" if skip_shorts else f" shorts={resolved_shorts_count}")
+    )
+
+    # Publish any scheduled releases that are due
+    from clipper.schedule import execute_releases
+    execute_releases(config, verbose=verbose)
+
+    # Refresh YouTube analytics + retrain weights before selecting clips
+    try:
+        from clipper.learn import collect_performance, train_weights
+        n = collect_performance(config)
+        if n > 0 or True:  # always retrain so new manual weight edits apply
+            train_weights(config)
+            if verbose:
+                click.echo(f"Learning: refreshed {n} performance snapshot(s), weights retrained")
+    except Exception as e:
+        if verbose:
+            click.echo(f"Learning refresh failed (non-fatal): {e}")
+
+    # 1. Shorts autopilot first — populates the clip pool before compilation picks from it
+    if not skip_shorts:
+        from clipper.workflow import run_autopilot_workflow
+        click.echo(f"\nRunning Shorts autopilot ({resolved_shorts_count} clips)...")
+        result = run_autopilot_workflow(
+            config,
+            count=resolved_shorts_count,
+            min_score=resolved_min_score,
+            channel=resolved_channel,
+            game=resolved_game,
+            period="24h",
+            scope="configured",
+            auto_upload=True,
+            privacy=resolved_privacy,
+            verbose=verbose,
+            state=None,
+        )
+        click.echo(
+            f"Shorts complete: approved={result.get('approved', 0)} "
+            f"processed={result.get('processed', 0)} "
+            f"uploaded={result.get('uploaded', 0)}"
+        )
+
+    # 2. Compilation — runs after autopilot so it has a full clip pool to choose from
+    run_compilation_workflow(
+        config,
+        game=resolved_game,
+        duration=resolved_duration,
+        channel=resolved_channel,
+        auto=True,
+        privacy=resolved_privacy,
+        verbose=verbose,
+    )
+
+
 @cli.command("autopilot-cron")
 @click.option("--install", "install_job", is_flag=True, help="Install autopilot cron/launchd schedule.")
 @click.option("--remove", "remove_job", is_flag=True, help="Remove autopilot cron/launchd schedule.")

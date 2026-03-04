@@ -5,6 +5,7 @@ import { AppSidebar } from './components/AppSidebar'
 import { HomePage } from './pages/HomePage'
 import { ReviewPage } from './pages/ReviewPage'
 import { EditPage } from './pages/EditPage'
+import { UploadPage } from './pages/UploadPage'
 import { StudioPage } from './pages/StudioPage'
 import { PipelinePage } from './pages/PipelinePage'
 import { SchedulePage } from './pages/SchedulePage'
@@ -29,6 +30,7 @@ export default function App() {
                     <Route path="/" element={<HomePage />} />
                     <Route path="/review" element={<ReviewPage />} />
                     <Route path="/edit" element={<EditPage />} />
+                    <Route path="/upload" element={<UploadPage />} />
                     <Route path="/studio" element={<StudioPage />} />
                     <Route path="/pipeline" element={<PipelinePage />} />
                     <Route path="/schedule" element={<SchedulePage />} />

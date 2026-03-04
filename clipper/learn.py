@@ -22,68 +22,118 @@ _MIN_WEIGHT = 5
 
 
 def collect_performance(config: dict, min_age_hours: float = 48) -> int:
-    """Scan output clips for uploads, fetch YouTube stats, save to performance table.
+    """Pull all channel uploads from YouTube, batch-fetch stats, save to performance table.
 
-    Only collects for clips older than min_age_hours (enough time to accumulate views).
-    Returns number of new entries collected.
+    Uses the uploads playlist approach (ceiling: ~10 API calls for 400 videos)
+    instead of one call per clip. Backlills video_id on DB clips that are missing it.
+    Re-collects on a schedule: every 24h for <7d clips, 72h for 7-30d, 14d for older.
+    Returns number of snapshots saved/updated.
     """
-    from clipper.analytics import fetch_video_stats, fetch_retention_curve
-    from clipper.db import list_clips, performance_ids, save_performance
+    from clipper.analytics import fetch_channel_recent_ex
+    from clipper.db import list_clips, performance_ids, save_performance, update_clip
+    from clipper.process.score import _STRONG_KEYWORDS, _VIRAL_KEYWORDS
 
-    existing_ids = performance_ids(config)
+    existing = performance_ids(config)  # {clip_id: collected_at}
     now = datetime.now(timezone.utc)
     collected = 0
 
-    # Query output clips that have been uploaded
-    output_clips = list_clips(config, status="output", has_video_id=True, limit=5000)
+    # Pull ALL channel uploads in one sweep (uploads playlist + batch stats)
+    # 365 days covers the full history; fetch_channel_recent_ex batches in 50s
+    channel_key = (config.get("autopilot", {}) or {}).get("channel") or "default"
+    yt_videos, err = fetch_channel_recent_ex(
+        config=config, channel=channel_key, days=365, refresh=True
+    )
+    if err and not yt_videos:
+        console.print(f"[yellow]collect_performance: YouTube fetch failed ({err})[/yellow]")
+        return 0
 
+    console.print(f"  collect_performance: {len(yt_videos)} channel videos fetched")
+
+    # Build video_id → YT stats map
+    yt_by_video_id: dict[str, dict] = {v["video_id"]: v for v in yt_videos if v.get("video_id")}
+
+    # Load all output clips and index by video_id for fast lookup
+    output_clips = list_clips(config, status="output", limit=5000)
+    clips_by_video_id: dict[str, dict] = {}
+    clips_by_id: dict[str, dict] = {}
     for clip in output_clips:
-        video_id = clip.get("video_id")
+        vid = clip.get("video_id", "")
+        if vid and vid != "previously_uploaded":
+            clips_by_video_id[vid] = clip
+        clips_by_id[clip.get("id", "")] = clip
+
+    # Backfill video_id for DB clips that are missing it — match by title
+    untracked_clips = [c for c in output_clips if not c.get("video_id") or c.get("video_id") == "previously_uploaded"]
+    if untracked_clips:
+        # Build title → video lookup from YouTube side
+        yt_by_title: dict[str, dict] = {}
+        for v in yt_videos:
+            t = (v.get("title") or "").strip().lower()
+            if t:
+                yt_by_title[t] = v
+
+        backfilled = 0
+        for clip in untracked_clips:
+            clip_title = (clip.get("title") or "").strip().lower()
+            if clip_title and clip_title in yt_by_title:
+                matched = yt_by_title[clip_title]
+                vid = matched["video_id"]
+                update_clip(config, clip["id"], video_id=vid)
+                clip["video_id"] = vid
+                clips_by_video_id[vid] = clip
+                backfilled += 1
+        if backfilled:
+            console.print(f"  Backfilled video_id for {backfilled} untracked clips")
+
+    # Now save performance for all YT videos we can match to a DB clip
+    for video_id, yt in yt_by_video_id.items():
+        clip = clips_by_video_id.get(video_id)
+        if not clip:
+            continue
+
         clip_id = clip.get("id", "")
 
-        if not video_id or video_id == "previously_uploaded":
-            continue
-        if clip_id in existing_ids:
+        # Check published age
+        published_at = yt.get("published_at", "")
+        age_hours = 72.0
+        if published_at:
+            try:
+                pub_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                age_hours = max(0.0, (now - pub_dt).total_seconds() / 3600)
+            except (ValueError, TypeError):
+                pass
+
+        if age_hours < min_age_hours:
             continue
 
-        # Check age
-        created_at = clip.get("created_at", "")
-        if created_at:
+        # Re-collection schedule
+        if clip_id in existing:
             try:
-                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                age_hours = (now - created_dt).total_seconds() / 3600
-                if age_hours < min_age_hours:
+                last_dt = datetime.fromisoformat(existing[clip_id].replace("Z", "+00:00"))
+                hours_since = (now - last_dt).total_seconds() / 3600
+                if age_hours < 7 * 24:
+                    interval = 24.0
+                elif age_hours < 30 * 24:
+                    interval = 72.0
+                else:
+                    interval = 14 * 24.0
+                if hours_since < interval:
                     continue
             except (ValueError, TypeError):
                 pass
 
-        # Fetch YouTube stats
-        stats = fetch_video_stats(video_id)
-        if not stats:
-            continue
-
-        # Extract original clip features for correlation
-        analysis = clip.get("_analysis", {}) or {}
+        # Build features from DB clip metadata
         title = clip.get("title", "").lower()
-
-        from clipper.process.score import _STRONG_KEYWORDS, _VIRAL_KEYWORDS
         has_strong = any(kw in title for kw in _STRONG_KEYWORDS)
         has_moderate = any(kw in title for kw in _VIRAL_KEYWORDS) and not has_strong
-
-        # Compute velocity at time of clipping
-        views = clip.get("view_count", 0)
-        age_h = 24.0
-        if created_at:
-            try:
-                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                age_h = max(0.5, (now - created_dt).total_seconds() / 3600)
-            except (ValueError, TypeError):
-                pass
+        analysis = clip.get("_analysis", {}) or {}
+        source_views = clip.get("view_count", 0) or 0
+        age_h = max(0.5, age_hours)
 
         features = {
             "duration_sec": clip.get("duration", 0),
-            "velocity": views / age_h,
-            "source_views": views,
+            "velocity": source_views / age_h,
+            "source_views": source_views,
             "age_hours": age_h,
             "streamer": clip.get("streamer", ""),
             "has_strong_keyword": has_strong,
@@ -94,21 +144,17 @@ def collect_performance(config: dict, min_age_hours: float = 48) -> int:
             "game": clip.get("game", ""),
         }
         youtube = {
-            "views": stats.get("views", 0),
-            "likes": stats.get("likes", 0),
-            "comments": stats.get("comments", 0),
-            "avg_view_pct": stats.get("avg_view_percentage", 0),
-            "avg_duration_sec": stats.get("avg_view_duration_seconds", 0),
+            "views": yt.get("views", 0),
+            "likes": yt.get("likes", 0),
+            "comments": yt.get("comments", 0),
+            "avg_view_pct": 0,
+            "avg_duration_sec": 0,
         }
 
-        # Fetch retention curve (cheap: 1 quota unit)
-        retention = fetch_retention_curve(video_id)
-
-        save_performance(config, clip_id, now.isoformat(), features, youtube, retention_curve=retention)
-        existing_ids.add(clip_id)
+        save_performance(config, clip_id, now.isoformat(), features, youtube)
+        existing[clip_id] = now.isoformat()
         collected += 1
-        retention_info = f" retention={retention[len(retention)//2]:.0f}%" if retention else ""
-        console.print(f"  [green]+[/green] {clip_id}: {stats.get('views', 0):,} views{retention_info}")
+        console.print(f"  [green]+[/green] {clip.get('streamer','?')} — {clip.get('title','?')[:40]}: {yt.get('views',0):,} views")
 
     return collected
 
@@ -233,6 +279,9 @@ def train_weights(config: dict) -> dict | None:
         biggest = max(weights, key=weights.get)
         weights[biggest] += 100 - total
 
+    # Apply guardrails: velocity floor + llm cap
+    weights = _apply_weight_guardrails(weights)
+
     rounded_corrs = {k: round(v, 3) for k, v in correlations.items()}
     save_weights(config, weights, rounded_corrs, len(perf_data))
 
@@ -261,6 +310,60 @@ def get_learned_weights(config: dict) -> dict | None:
     if data.get("sample_size", 0) < _MIN_SAMPLES:
         return None
     return data.get("weights")
+
+
+def reset_weights(config: dict) -> None:
+    """Delete learned weights from the database, reverting to hardcoded defaults."""
+    from clipper.db import get_db
+
+    conn = get_db(config)
+    conn.execute("DELETE FROM scoring_weights WHERE id = 1")
+    conn.commit()
+    console.print("[yellow]Learned weights reset to defaults.[/yellow]")
+
+
+def _apply_weight_guardrails(weights: dict) -> dict:
+    """Enforce hard constraints on learned weights before saving.
+
+    1. velocity >= 20 (never gut the viral signal)
+    2. llm <= velocity (LLM was post-selection; can't lead velocity)
+    """
+    w = dict(weights)
+
+    # Guardrail 1: velocity floor of 20
+    velocity = float(w.get("velocity", 0))
+    if velocity < 20.0:
+        shortfall = 20.0 - velocity
+        w["velocity"] = 20.0
+        # Drain shortfall proportionally from other features
+        others = {k: float(v) for k, v in w.items() if k != "velocity" and float(v) > 0}
+        total_others = sum(others.values())
+        if total_others > 0:
+            for k in others:
+                drain = shortfall * (others[k] / total_others)
+                w[k] = max(0.0, float(w[k]) - drain)
+
+    # Guardrail 2: llm <= velocity
+    if "llm" in w:
+        velocity = float(w.get("velocity", 0))
+        llm = float(w.get("llm", 0))
+        if llm > velocity:
+            excess = llm - velocity
+            w["llm"] = velocity
+            w["velocity"] = velocity + excess
+
+    # Re-normalize to sum to 100
+    total = sum(float(v) for v in w.values())
+    if total > 0 and abs(total - 100.0) > 0.5:
+        factor = 100.0 / total
+        w = {k: round(float(v) * factor) for k, v in w.items()}
+        # Fix rounding error
+        total2 = sum(w.values())
+        if total2 != 100:
+            biggest = max(w, key=lambda k: w[k])
+            w[biggest] += 100 - total2
+
+    return {k: int(round(v)) for k, v in w.items()}
 
 
 _GAME_STATS_MIN_UPLOADS = 3
