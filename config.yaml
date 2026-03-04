@@ -42,12 +42,17 @@ autopilot:
   period: 24h
   channel: default
   auto_upload: true
-  privacy: unlisted
+  privacy: public
   prefer_calibrated_streamers: true
   require_calibrated_streamers: true
   allow_uncalibrated_fallback: true
   profile_bonus_points: 8.0
   max_clips_per_streamer: 2
+  # Cross-post same clips to these channels after primary upload
+  upload_channels:
+    - tiktok_main
+    - instagram_main
+    - facebook_main
 
 upload:
   title_template: "{title} | {streamer} {game}"
@@ -98,15 +103,23 @@ shorts:
       border_px: 4
       border_color: "white@0.95"
 
+instagram:
+  # Public base URL where the Clipper API is reachable by Instagram's servers.
+  # Instagram pulls video by URL (cannot upload binary). Options:
+  #   - ngrok: run `ngrok http 8000`, set to "https://xxxx.ngrok.io"
+  #   - VPS/domain: set to your server's public URL
+  # Leave blank to skip Instagram uploads.
+  video_base_url: ""
+
 channels:
   default:
     name: "Main Channel"
     platform: youtube
     token_file: ".clipper_token.json"
-    default_privacy: unlisted
+    default_privacy: public
     schedule:
-      shorts_per_day: 3
-      release_times: ["10:00", "14:00", "18:00"]
+      shorts_per_day: 7
+      release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"]
   class_instantiate:
     name: "class.instantiate@gmail.com"
     platform: youtube
@@ -121,21 +134,21 @@ channels:
     token_file: ".clipper_tiktok_main.json"
     default_privacy: public
     schedule:
-      shorts_per_day: 3
-      release_times: ["09:00", "13:00", "17:00"]
+      shorts_per_day: 7
+      release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"]
   instagram_main:
     name: "Instagram Reels"
     platform: instagram
     token_file: ".clipper_instagram_main.json"
-    default_privacy: unlisted
+    default_privacy: public
     schedule:
-      shorts_per_day: 2
-      release_times: ["10:00", "15:00"]
+      shorts_per_day: 7
+      release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"]
   facebook_main:
     name: "Facebook Reels"
     platform: facebook
     token_file: ".clipper_facebook_main.json"
-    default_privacy: unlisted
+    default_privacy: public
     schedule:
-      shorts_per_day: 2
-      release_times: ["11:00", "16:00"]
+      shorts_per_day: 7
+      release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00"]

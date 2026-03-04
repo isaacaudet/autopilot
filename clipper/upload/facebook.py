@@ -56,8 +56,12 @@ def _build_description(clip: dict, config: dict) -> str:
     return f"{title}\n\n{' '.join(hashtags)}"
 
 
-def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -> str | None:
-    """Upload a clip as a Facebook Reel. Returns the video_id on success."""
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, publish_at=None) -> str | None:
+    """Upload a clip as a Facebook Reel. Returns the video_id on success.
+
+    publish_at: UTC ISO8601 string (e.g. "2026-03-04T15:00:00Z"). When set,
+    uses video_state=SCHEDULED with scheduled_publish_time (Unix timestamp).
+    """
     processed_path = clip.get("processed_path")
     if not processed_path or not Path(processed_path).exists():
         console.print(f"[red]Missing processed file: {processed_path}[/red]")
@@ -77,11 +81,23 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -
         raise RuntimeError("Facebook token file missing page_id or page_access_token.")
 
     description = clip.get("_description_override") or _build_description(clip, config)
-    video_state = "PUBLISHED" if privacy == "public" else "DRAFT"
+
+    # Determine publish state and optional scheduled timestamp
+    unix_ts: int | None = None
+    if publish_at:
+        from datetime import datetime
+        dt = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
+        unix_ts = int(dt.timestamp())
+        video_state = "SCHEDULED"
+    elif privacy == "public":
+        video_state = "PUBLISHED"
+    else:
+        video_state = "DRAFT"
 
     try:
         # Step 1: Start upload session
-        console.print("  [bold]Uploading Facebook Reel...[/bold]")
+        schedule_str = f" (scheduled {publish_at})" if publish_at else ""
+        console.print(f"  [bold]Uploading Facebook Reel{schedule_str}...[/bold]")
         start_resp = requests.post(
             f"{GRAPH_API}/{page_id}/video_reels",
             params={
@@ -115,20 +131,27 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -
             upload_resp.raise_for_status()
 
         # Step 3: Finish upload
+        finish_params: dict = {
+            "upload_phase": "finish",
+            "access_token": page_token,
+            "video_id": video_id,
+            "video_state": video_state,
+            "description": description,
+        }
+        if unix_ts:
+            finish_params["scheduled_publish_time"] = str(unix_ts)
+
         finish_resp = requests.post(
             f"{GRAPH_API}/{page_id}/video_reels",
-            params={
-                "upload_phase": "finish",
-                "access_token": page_token,
-                "video_id": video_id,
-                "video_state": video_state,
-                "description": description,
-            },
+            params=finish_params,
             timeout=30,
         )
         finish_resp.raise_for_status()
 
-        console.print(f"[green]Facebook Reel uploaded:[/green] {video_id}")
+        if publish_at:
+            console.print(f"[green]Facebook Reel scheduled:[/green] {video_id} → {publish_at}")
+        else:
+            console.print(f"[green]Facebook Reel uploaded:[/green] {video_id}")
         return video_id
 
     except Exception as e:

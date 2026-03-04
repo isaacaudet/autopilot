@@ -135,8 +135,13 @@ def _poll_container_status(access_token: str, container_id: str, max_wait: int =
     return False
 
 
-def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -> str | None:
-    """Upload a clip as an Instagram Reel. Returns the media_id on success."""
+def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, publish_at=None) -> str | None:
+    """Upload a clip as an Instagram Reel. Returns the media_id on success.
+
+    publish_at: UTC ISO8601 string (e.g. "2026-03-04T15:00:00Z"). When set,
+    the Reel is scheduled — Meta auto-publishes at that time, no media_publish
+    call needed. Must be 10 min to 75 days in the future.
+    """
     processed_path = clip.get("processed_path")
     if not processed_path or not Path(processed_path).exists():
         console.print(f"[red]Missing processed file: {processed_path}[/red]")
@@ -153,17 +158,30 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -
     video_url = _get_video_url(clip, config)
     caption = clip.get("_description_override") or _build_caption(clip, config)
 
+    # Convert UTC ISO8601 → Unix timestamp for Meta API
+    unix_ts: int | None = None
+    if publish_at:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
+        unix_ts = int(dt.timestamp())
+
     try:
         # Step 1: Create media container
-        console.print("  [bold]Creating Instagram Reel container...[/bold]")
+        schedule_str = f" (scheduled {publish_at})" if publish_at else ""
+        console.print(f"  [bold]Creating Instagram Reel container{schedule_str}...[/bold]")
+        container_params: dict = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption,
+            "access_token": access_token,
+        }
+        if unix_ts:
+            container_params["published"] = "false"
+            container_params["scheduled_publish_time"] = str(unix_ts)
+
         create_resp = requests.post(
             f"{GRAPH_API}/{ig_user_id}/media",
-            params={
-                "media_type": "REELS",
-                "video_url": video_url,
-                "caption": caption,
-                "access_token": access_token,
-            },
+            params=container_params,
             timeout=30,
         )
         create_resp.raise_for_status()
@@ -173,13 +191,18 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -
             console.print(f"[red]Instagram container creation failed: {create_resp.json()}[/red]")
             return None
 
-        # Step 2: Poll until container is ready
+        # Step 2: Poll until container is ready (FINISHED = ready to publish / scheduled)
         console.print("  [dim]Waiting for Instagram processing...[/dim]")
         if not _poll_container_status(access_token, container_id):
             console.print("[red]Instagram container failed or timed out.[/red]")
             return None
 
-        # Step 3: Publish the container
+        # Step 3: Publish immediately, or return container_id for scheduled posts
+        if unix_ts:
+            # Scheduled — Meta auto-publishes at scheduled_publish_time
+            console.print(f"[green]Instagram Reel scheduled:[/green] {container_id} → {publish_at}")
+            return container_id
+
         publish_resp = requests.post(
             f"{GRAPH_API}/{ig_user_id}/media_publish",
             params={

@@ -757,12 +757,12 @@ def _upload_processed_clips(
     failed = 0
     uploaded_ids: list[str] = []
 
-    # Pre-compute scheduled publish times if the channel has a schedule configured
-    # and we're uploading to YouTube (other platforms don't support publishAt yet)
+    # Pre-compute scheduled publish times for channels that support it.
+    # TikTok excluded — posts immediately (pre-audit restriction).
     publish_slots: list[str] = []
     _channel_key = channel or (config.get("autopilot", {}) or {}).get("channel") or "default"
     _platform = get_channel_platform(_channel_key, config)
-    if _platform == "youtube" and processed:
+    if _platform != "tiktok" and processed:
         try:
             from clipper.schedule import get_next_slots
             ch_cfg = (config.get("channels", {}) or {}).get(_channel_key, {})
@@ -829,6 +829,86 @@ def _upload_processed_clips(
         "uploaded_ids": uploaded_ids,
         "privacy": privacy_key,
     }
+
+
+def _cross_post_clips(
+    processed: list[dict],
+    config: dict,
+    *,
+    extra_channels: list[str],
+    verbose: bool = False,
+) -> dict:
+    """Upload already-processed clips to additional channels (cross-posting).
+
+    Each extra channel gets its own schedule slots. TikTok posts immediately
+    (no scheduling pre-audit). Errors on one channel don't block others.
+    """
+    from clipper.db import update_clip as db_update_clip
+    from clipper.upload.dispatcher import (
+        get_channel_platform,
+        platform_id_column,
+        upload_clip,
+    )
+    from clipper.schedule import get_next_slots
+    from datetime import timezone as _tz
+
+    results: dict = {}
+    for extra_ch in extra_channels:
+        uploaded = 0
+        failed = 0
+
+        _platform = get_channel_platform(extra_ch, config)
+        # TikTok has no scheduling pre-audit — posts immediately as private
+        tiktok = _platform == "tiktok"
+        privacy_for_ch = "unlisted" if tiktok else "public"
+
+        # Get scheduled slots for this channel
+        publish_slots: list[str] = []
+        if not tiktok:
+            try:
+                ch_cfg = (config.get("channels", {}) or {}).get(extra_ch, {})
+                if ch_cfg.get("schedule", {}).get("release_times"):
+                    slots = get_next_slots(extra_ch, config, count=len(processed))
+                    publish_slots = [
+                        s.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        for s in slots
+                    ]
+            except Exception as e:
+                console.print(f"  [yellow]Schedule error for {extra_ch}: {e}[/yellow]")
+
+        console.print(f"\n[bold cyan]Cross-posting {len(processed)} clips → {extra_ch}[/bold cyan]")
+
+        for i, clip in enumerate(processed):
+            clip_id = str(clip.get("id", "")).strip()
+            if not clip_id:
+                failed += 1
+                continue
+
+            publish_at = publish_slots[i] if i < len(publish_slots) else None
+
+            try:
+                upload_id = upload_clip(
+                    clip, config,
+                    privacy=privacy_for_ch,
+                    channel=extra_ch,
+                    verbose=verbose,
+                    publish_at=publish_at,
+                )
+            except Exception as e:
+                console.print(f"  [red]{extra_ch} upload error: {e}[/red]")
+                upload_id = None
+
+            if upload_id:
+                id_col = platform_id_column(_platform)
+                db_update_clip(config, clip_id, **{id_col: upload_id})
+                uploaded += 1
+            else:
+                failed += 1
+
+        results[extra_ch] = {"uploaded": uploaded, "failed": failed}
+        console.print(f"  {extra_ch}: {uploaded} uploaded, {failed} failed")
+
+    return results
 
 
 def run_autopilot_workflow(
@@ -1102,6 +1182,18 @@ def run_autopilot_workflow(
         summary["failed_uploads"] = int(upload_summary.get("failed_uploads", 0) or 0)
         summary["privacy"] = upload_summary.get("privacy", "unlisted")
         summary["status"] = "uploaded"
+
+        # Cross-post to additional channels (same processed clips, each channel's own schedule)
+        upload_channels = list(autopilot_cfg.get("upload_channels", []) or [])
+        if upload_channels:
+            if state is not None:
+                state.set_phase("uploading", f"Cross-posting to {len(upload_channels)} extra platforms...")
+            xpost = _cross_post_clips(
+                processed, config,
+                extra_channels=upload_channels,
+                verbose=verbose,
+            )
+            summary["cross_post"] = xpost
 
     # Report long-form candidates that were skipped as Shorts
     long_form = [
