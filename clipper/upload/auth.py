@@ -185,7 +185,13 @@ def _wait_for_auth_code() -> str:
 
 
 def setup_tiktok_auth(channel_name: str, config: dict):
-    """Run TikTok OAuth flow — opens browser, saves token file."""
+    """Run TikTok OAuth flow with PKCE — opens browser, saves token file.
+
+    TikTok v2 requires PKCE (code_verifier + code_challenge) since 2024.
+    """
+    import base64
+    import hashlib
+    import os
     from rich.console import Console
     console = Console()
 
@@ -198,21 +204,29 @@ def setup_tiktok_auth(channel_name: str, config: dict):
     client_key = require_env("TIKTOK_CLIENT_KEY")
     client_secret = require_env("TIKTOK_CLIENT_SECRET")
 
+    # PKCE: generate code_verifier and code_challenge
+    code_verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+
     redirect_uri = f"http://localhost:{_REDIRECT_PORT}/"
     auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode({
         "client_key": client_key,
         "response_type": "code",
         "scope": "video.publish",
         "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     })
 
     console.print(f"[bold]Setting up TikTok auth for channel '{channel_name}'[/bold]")
-    console.print(f"Opening browser for authorization...")
+    console.print("Opening browser for authorization...")
     webbrowser.open(auth_url)
 
     code = _wait_for_auth_code()
 
-    # Exchange code for tokens
+    # Exchange code for tokens (include code_verifier for PKCE)
     resp = requests.post(
         "https://open.tiktokapis.com/v2/oauth/token/",
         json={
@@ -221,6 +235,7 @@ def setup_tiktok_auth(channel_name: str, config: dict):
             "code": code,
             "grant_type": "authorization_code",
             "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
         },
         timeout=15,
     )
@@ -242,7 +257,9 @@ def setup_tiktok_auth(channel_name: str, config: dict):
 # ---------------------------------------------------------------------------
 
 _META_SCOPES = {
-    "instagram": "instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement",
+    # instagram_basic deprecated Dec 2024 (Basic Display API shutdown) → instagram_business_basic
+    # pages_read_engagement removed — not needed for content publishing
+    "instagram": "instagram_business_basic,instagram_content_publish,pages_show_list",
     "facebook": "pages_manage_posts,publish_video,pages_show_list",
 }
 
