@@ -257,9 +257,9 @@ def setup_tiktok_auth(channel_name: str, config: dict):
 # ---------------------------------------------------------------------------
 
 _META_SCOPES = {
-    # instagram_basic deprecated Dec 2024 (Basic Display API shutdown) → instagram_business_basic
-    # pages_read_engagement removed — not needed for content publishing
-    "instagram": "instagram_business_basic,instagram_content_publish,pages_show_list",
+    # instagram_basic deprecated Dec 2024; instagram_content_publish = Facebook Login for Business scope
+    # pages_show_list needed to find linked Instagram Business Account via Facebook Page
+    "instagram": "instagram_content_publish,pages_show_list",
     "facebook": "pages_manage_posts,publish_video,pages_show_list",
 }
 
