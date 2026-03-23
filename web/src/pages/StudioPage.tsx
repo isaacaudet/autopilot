@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef, useMemo, memo } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -57,6 +58,9 @@ import {
   openOutputClip,
   openOutputFolder,
   resyncOutput,
+  fetchCalibrationQueue,
+  seedCalibrationEdit,
+  cleanupCalibrationEdit,
 } from '@/lib/api'
 import type { ClipMeta } from '@/lib/types'
 import { usePipeline } from '@/hooks/usePipeline'
@@ -98,6 +102,12 @@ export function StudioPage() {
   const [resyncing, setResyncing] = useState(false)
   const [latestOnly, setLatestOnly] = useState(false)
   const [cropsOpen, setCropsOpen] = useState(false)
+  const [cropsInitialStreamer, setCropsInitialStreamer] = useState<string | null>(null)
+  const [calibrationQueue, setCalibrationQueue] = useState<Array<{ id: string; title: string; streamer: string; game: string }>>([])
+  const [calibrationExpanded, setCalibrationExpanded] = useState(false)
+  const [calibrationSeeding, setCalibrationSeeding] = useState(false)
+  const [calibrationCleaning, setCalibrationCleaning] = useState(false)
+  const navigate = useNavigate()
   const [subtitleClip, setSubtitleClip] = useState<ClipMeta | null>(null)
   const [limit, setLimit] = useState(50)
   const [studioView, setStudioView] = useState<StudioView>('clips')
@@ -107,6 +117,7 @@ export function StudioPage() {
   // Load learning status on mount
   useEffect(() => {
     fetchLearnStatus().then(setLearnStatus).catch(() => {})
+    fetchCalibrationQueue().then(setCalibrationQueue).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -386,14 +397,19 @@ export function StudioPage() {
               </Button>
               <Button
                 size="sm"
-                variant="outline"
-                className="h-7 text-xs gap-1"
-                onClick={() => setCropsOpen(true)}
+                variant={calibrationQueue.length > 0 ? 'default' : 'outline'}
+                className="h-7 text-xs gap-1 relative"
+                onClick={() => { setCropsInitialStreamer(null); setCropsOpen(true) }}
                 disabled={clips.length === 0}
                 title="Calibrate facecam + HUD crops per streamer (used by Fill portrait layout)"
               >
                 <Crop className="size-3" />
                 Crops
+                {calibrationQueue.length > 0 && (
+                  <span className="ml-0.5 rounded-full bg-destructive text-destructive-foreground text-[10px] px-1 leading-tight">
+                    {calibrationQueue.length}
+                  </span>
+                )}
               </Button>
               <Button
                 size="sm"
@@ -410,6 +426,84 @@ export function StudioPage() {
               </span>
             </div>
           </div>
+
+          {/* Calibration queue notice */}
+          {calibrationQueue.length > 0 && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs">
+              <div className="flex w-full items-center gap-2">
+                <button
+                  className="flex flex-1 items-center gap-2 text-amber-600 dark:text-amber-400"
+                  onClick={() => setCalibrationExpanded((v) => !v)}
+                >
+                  <Crop className="size-3 shrink-0" />
+                  <span className="font-medium">{calibrationQueue.length} streamer{calibrationQueue.length !== 1 ? 's' : ''} need facecam calibration</span>
+                  {calibrationExpanded ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+                </button>
+                <Button
+                  size="sm"
+                  variant="default"
+                  className="h-6 text-[10px] px-2 shrink-0"
+                  disabled={calibrationSeeding}
+                  onClick={async () => {
+                    setCalibrationSeeding(true)
+                    try {
+                      const res = await seedCalibrationEdit()
+                      toast.success(`Loaded ${res.seeded} streamer${res.seeded !== 1 ? 's' : ''} into Edit page`)
+                      navigate('/edit')
+                    } catch {
+                      toast.error('Failed to seed calibration clips')
+                    } finally {
+                      setCalibrationSeeding(false)
+                    }
+                  }}
+                >
+                  {calibrationSeeding ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+                  Calibrate in Edit →
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 text-[10px] px-2 shrink-0"
+                  disabled={calibrationCleaning}
+                  onClick={async () => {
+                    setCalibrationCleaning(true)
+                    try {
+                      const res = await cleanupCalibrationEdit()
+                      toast.success(`Reset ${res.reset} clip${res.reset !== 1 ? 's' : ''} back to output`)
+                      const updated = await fetchCalibrationQueue()
+                      setCalibrationQueue(updated)
+                    } catch {
+                      toast.error('Failed to cleanup calibration clips')
+                    } finally {
+                      setCalibrationCleaning(false)
+                    }
+                  }}
+                >
+                  {calibrationCleaning ? <Loader2 className="size-3 animate-spin mr-1" /> : null}
+                  Done Calibrating
+                </Button>
+              </div>
+              {calibrationExpanded && (
+                <div className="mt-2 space-y-1 pl-5">
+                  {calibrationQueue.map((item) => (
+                    <div key={item.streamer} className="flex items-center gap-2">
+                      <span className="font-medium text-foreground">{item.streamer}</span>
+                      <span className="text-muted-foreground truncate flex-1">{item.title}</span>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-5 text-[10px] px-2 shrink-0"
+                        onClick={() => { setCropsInitialStreamer(item.streamer); setCropsOpen(true) }}
+                        disabled={clips.length === 0}
+                      >
+                        Calibrate
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Card grid */}
           {loading ? (
@@ -474,7 +568,12 @@ export function StudioPage() {
       )}
 
       {studioView === 'clips' && (
-        <CropProfilesDialog open={cropsOpen} onOpenChange={setCropsOpen} clips={clips} />
+        <CropProfilesDialog
+          open={cropsOpen}
+          onOpenChange={(v) => { setCropsOpen(v); if (!v) setCropsInitialStreamer(null) }}
+          clips={clips}
+          initialStreamer={cropsInitialStreamer}
+        />
       )}
 
       {studioView === 'clips' && subtitleClip && (

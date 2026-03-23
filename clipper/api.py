@@ -464,6 +464,105 @@ def create_app(config: dict | None = None) -> FastAPI:
         removed = _delete(config, streamer)
         return {"ok": True, "removed": removed}
 
+    @app.get("/api/calibration-queue")
+    def get_calibration_queue():
+        """Return all streamers with output clips but no saved facecam profile.
+
+        Covers both configured streamers and any streamer that appeared in gamewide
+        searches — sorted by most output clips (best-represented first).
+        """
+        conn = get_db(config)
+        profiled = {r["streamer"] for r in conn.execute("SELECT streamer FROM facecam_profiles").fetchall()}
+
+        # Streamers with meaningful output: 2+ clips OR 1k+ views on any clip
+        rows = conn.execute("""
+            SELECT LOWER(streamer) as streamer_key, streamer as display_name,
+                   COUNT(*) as output_count,
+                   MAX(view_count) as max_views
+            FROM clips
+            WHERE status = 'output'
+              AND processed_path IS NOT NULL
+            GROUP BY LOWER(streamer)
+            HAVING COUNT(*) >= 2 OR MAX(view_count) >= 1000
+            ORDER BY output_count DESC, max_views DESC
+        """).fetchall()
+
+        queue = []
+        for row in rows:
+            if row["streamer_key"] in profiled:
+                continue
+            # Best recent clip for the calibration UI
+            clip = conn.execute("""
+                SELECT id, title, streamer, processed_path, game, created_at
+                FROM clips
+                WHERE LOWER(streamer) = ?
+                  AND status = 'output'
+                  AND processed_path IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (row["streamer_key"],)).fetchone()
+            if clip:
+                entry = dict(clip)
+                entry["output_count"] = row["output_count"]
+                entry["max_views"] = row["max_views"]
+                queue.append(entry)
+        return queue
+
+    @app.post("/api/calibration/seed-edit")
+    def seed_calibration_edit():
+        """Promote one Deadlock output clip per uncalibrated streamer to 'approved' for Edit page calibration."""
+        from clipper.db import get_db
+        conn = get_db(config)
+
+        candidates = conn.execute("""
+            SELECT LOWER(streamer) as streamer_key,
+                   MAX(view_count) as max_views, MAX(created_at) as created_at
+            FROM clips
+            WHERE status = 'output'
+              AND game LIKE '%Deadlock%'
+              AND processed_path IS NOT NULL
+              AND LOWER(streamer) NOT IN (SELECT LOWER(streamer) FROM facecam_profiles)
+            GROUP BY LOWER(streamer)
+            ORDER BY max_views DESC
+            LIMIT 30
+        """).fetchall()
+
+        to_seed = []
+        streamers_seeded = []
+        for row in candidates:
+            clip = conn.execute("""
+                SELECT id FROM clips
+                WHERE LOWER(streamer) = ? AND status = 'output'
+                  AND game LIKE '%Deadlock%' AND processed_path IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1
+            """, (row["streamer_key"],)).fetchone()
+            if clip:
+                to_seed.append(clip["id"])
+                streamers_seeded.append(row["streamer_key"])
+
+        if to_seed:
+            conn.execute(
+                f"UPDATE clips SET status='approved' WHERE id IN ({','.join('?' * len(to_seed))})",
+                to_seed
+            )
+            conn.commit()
+
+        return {"seeded": len(to_seed), "streamers": streamers_seeded}
+
+    @app.post("/api/calibration/cleanup-edit")
+    def cleanup_calibration_edit():
+        """Reset approved clips that already have processed_path back to 'output' (undo seed)."""
+        from clipper.db import get_db
+        conn = get_db(config)
+        result = conn.execute("""
+            UPDATE clips SET status = 'output'
+            WHERE status = 'approved'
+              AND processed_path IS NOT NULL
+              AND processed_path != ''
+        """)
+        conn.commit()
+        return {"reset": result.rowcount}
+
     @app.post("/api/review/batch")
     def review_batch(body: dict):
         from clipper.db import update_clip as db_update_clip
@@ -1543,14 +1642,25 @@ def create_app(config: dict | None = None) -> FastAPI:
     @app.post("/api/releases")
     def create_release(req: ReleaseRequest):
         from clipper.db import create_release as db_create_release
+        from datetime import timezone as _tz
+
+        channels_cfg = config.get("channels", {}) or {}
+        if req.channel and req.channel not in channels_cfg:
+            raise HTTPException(400, f"Unknown channel: {req.channel}")
 
         try:
             scheduled_at = datetime.fromisoformat(req.scheduled_at)
         except ValueError:
             raise HTTPException(400, f"Invalid datetime: {req.scheduled_at}")
 
+        # Normalize to UTC so pending_releases_due comparison against datetime('now') is correct
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=_tz.utc)
+        else:
+            scheduled_at = scheduled_at.astimezone(_tz.utc)
+
         release_id = db_create_release(
-            config, req.clip_id, req.channel, scheduled_at.isoformat(),
+            config, req.clip_id, req.channel, scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         return {"id": release_id}
 
@@ -1567,6 +1677,116 @@ def create_app(config: dict | None = None) -> FastAPI:
             return {"videos": fetch_channel_recent(days=days, refresh=refresh, channel=channel_key, config=config)}
         videos, errors = fetch_channels_recent(config, days=days, refresh=refresh)
         return {"videos": videos, "errors": errors}
+
+    @app.get("/api/analytics/daily")
+    def get_daily_analytics(days: int = Query(30)):
+        """Return daily view data aggregated per platform + channel for charting."""
+        from datetime import date, timedelta
+        import sqlite3 as _sqlite3
+
+        result: dict = {"days": days, "channels": {}}
+        errors: list[str] = []
+        end = date.today()
+        start = end - timedelta(days=days - 1)
+
+        from clipper.config import get_project_root as _root
+        _r = _root()
+
+        # ── YouTube Analytics (both channels) ──────────────────────────────
+        yt_tokens = [
+            ("pro_deadlock", str(_r / ".clipper_token.json")),
+            ("pro_marathon", str(_r / ".clipper_token_class_instantiate.json")),
+        ]
+        for label, token_file in yt_tokens:
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                from google.oauth2.credentials import Credentials as _Creds
+                from googleapiclient.discovery import build as _build
+                tok = _json.loads(_Path(token_file).read_text())
+                creds = _Creds(
+                    token=tok.get("token"), refresh_token=tok.get("refresh_token"),
+                    token_uri="https://oauth2.googleapis.com/token",
+                    client_id=tok.get("client_id"), client_secret=tok.get("client_secret"),
+                )
+                yta = _build("youtubeAnalytics", "v2", credentials=creds)
+                resp = yta.reports().query(
+                    ids="channel==MINE",
+                    startDate=start.isoformat(), endDate=end.isoformat(),
+                    metrics="views,likes,estimatedMinutesWatched",
+                    dimensions="day", sort="day",
+                ).execute()
+                rows = resp.get("rows") or []
+                result["channels"][label] = {
+                    "platform": "youtube",
+                    "label": label.replace("_", " ").title(),
+                    "daily": [{"date": r[0], "views": int(r[1]), "likes": int(r[2]), "watch_min": int(r[3])} for r in rows],
+                    "total_views": sum(int(r[1]) for r in rows),
+                }
+            except Exception as e:
+                errors.append(f"YouTube {label}: {e}")
+
+        # ── Instagram — account-level daily reach (unique accounts reached per day) ─
+        import time as _time
+        ig_channels = [
+            ("instagram_main", str(_r / ".clipper_instagram_main.json")),
+            ("instagram_marathon", str(_r / ".clipper_instagram_marathon.json")),
+        ]
+        for ch_key, token_file in ig_channels:
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+                import requests as _requests
+                tok = _json.loads(_Path(token_file).read_text())
+                access_token = tok["access_token"]
+                ig_user_id = tok["ig_user_id"]
+                api = "https://graph.instagram.com/v21.0"
+
+                since_ts = int(_time.mktime(start.timetuple()))
+                until_ts = int(_time.mktime((end + timedelta(days=1)).timetuple()))
+
+                ig_resp = _requests.get(
+                    f"{api}/{ig_user_id}/insights",
+                    params={
+                        "metric": "reach",
+                        "period": "day",
+                        "since": since_ts,
+                        "until": until_ts,
+                        "access_token": access_token,
+                    },
+                    timeout=15,
+                )
+                ig_resp.raise_for_status()
+                ig_data = ig_resp.json().get("data", [])
+
+                # Build {date: {reach, views}} from returned metrics
+                by_date: dict[str, dict] = {}
+                for metric in ig_data:
+                    name = metric["name"]
+                    for v in metric.get("values", []):
+                        d = v["end_time"][:10]
+                        if d not in by_date:
+                            by_date[d] = {"date": d, "views": 0, "reach": 0}
+                        by_date[d][name] = v["value"]
+
+                sorted_daily = sorted(by_date.values(), key=lambda x: x["date"])
+                total = sum(d.get("reach", 0) for d in sorted_daily)
+                result["channels"][ch_key] = {
+                    "platform": "instagram",
+                    "label": ch_key.replace("_", " ").title(),
+                    "metric": "reach",
+                    "daily": [{"date": d["date"], "views": d.get("reach", 0)} for d in sorted_daily],
+                    "total_views": total,
+                }
+            except Exception as e:
+                # Truncate error to avoid leaking token in URL
+                err_str = str(e)
+                if len(err_str) > 120:
+                    err_str = err_str[:120] + "…"
+                errors.append(f"Instagram {ch_key}: {err_str}")
+
+        result["errors"] = errors
+        return result
 
     @app.get("/api/analytics/{video_id}/retention")
     def get_retention_curve(video_id: str):
@@ -2328,7 +2548,21 @@ def create_app(config: dict | None = None) -> FastAPI:
         web_root = web_dist.resolve()
 
         @app.get("/", include_in_schema=False)
-        def spa_index():
+        def spa_index(code: str = "", error: str = "", scopes: str = "", state: str = ""):
+            # OAuth callbacks arrive here via ngrok tunnel.
+            # Distinguish platform by query params:
+            #   TikTok:    has scopes=video.upload,...
+            #   Instagram: has state=instagram OR no scopes param
+            if code or error:
+                import os as _os
+                is_tiktok = "video.upload" in scopes
+                cb_file = "/tmp/clipper_tiktok_oauth_code.txt" if is_tiktok else "/tmp/clipper_instagram_oauth_code.txt"
+                if code:
+                    with open(cb_file, "w") as _f:
+                        _f.write(code)
+                from fastapi.responses import HTMLResponse
+                return HTMLResponse("<h2>Auth complete! You can close this tab.</h2>" if code
+                                    else f"<h2>Auth failed: {error}</h2>")
             return FileResponse(str(index_file))
 
         @app.get("/{full_path:path}", include_in_schema=False)

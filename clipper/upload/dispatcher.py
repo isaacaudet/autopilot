@@ -45,8 +45,49 @@ def _get_module(platform: str):
     return importlib.import_module(mod_name)
 
 
+def _ensure_formatted(clip: dict, config: dict) -> dict:
+    """Ensure the clip's processed file has been formatted for Shorts.
+
+    If processed_path points to a raw source file (no _final/_shorts/_clean
+    suffix), runs format_for_shorts and updates the clip + DB.
+    Compilations are exempt (they're already in final form).
+    """
+    from pathlib import Path
+
+    pp = str(clip.get("processed_path", ""))
+    if not pp:
+        return clip
+
+    stem = Path(pp).stem
+    clip_id = str(clip.get("id", ""))
+
+    # Compilations are already formatted
+    if "compilation" in clip_id or "compilation" in stem:
+        return clip
+
+    # Already formatted
+    if any(tag in stem for tag in ("_final", "_shorts", "_clean", "_ig_")):
+        return clip
+
+    # Raw source — format it
+    if not Path(pp).exists():
+        return clip
+
+    logger.info("Raw source detected for %s, formatting before upload", clip_id)
+    from clipper.process.format import format_for_shorts
+    formatted = format_for_shorts(pp, config, clip=clip)
+    clip["processed_path"] = str(formatted)
+
+    if clip_id:
+        from clipper.db import update_clip
+        update_clip(config, clip_id, processed_path=str(formatted))
+
+    return clip
+
+
 def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, publish_at=None) -> str | None:
     """Upload a clip via the platform module for the given channel."""
+    clip = _ensure_formatted(clip, config)
     platform = get_channel_platform(channel, config)
     mod = _get_module(platform)
     fn = mod.upload_clip

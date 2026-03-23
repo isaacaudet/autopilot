@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import re
+import socket
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ def _build_title(clip: dict, config: dict) -> str:
     # Safety net: sanitize again in case title was set externally
     sanitized = sanitize_title(result)
     if sanitized is None:
-        streamer = clip.get("streamer", "Unknown")
+        streamer = clip.get("streamer") or "Unknown"
         game = clip.get("game", "")
         result = f"{game} Moment | {streamer}" if game else f"Insane Moment | {streamer}"
     else:
@@ -185,7 +186,7 @@ def _build_description(clip: dict, config: dict) -> str:
         "{streamer} clip\n\n{url}"
     )
 
-    streamer = clip.get("streamer", "Unknown")
+    streamer = clip.get("streamer") or "Unknown"
     game = clip.get("game", "")
 
     format_vars = {
@@ -601,10 +602,15 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
         )
 
         response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status and verbose:
-                console.print(f"[dim]Upload progress: {int(status.progress() * 100)}%[/dim]")
+        _prev_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(300)  # 5 min per chunk — prevents indefinite hang
+        try:
+            while response is None:
+                status, response = request.next_chunk()
+                if status and verbose:
+                    console.print(f"[dim]Upload progress: {int(status.progress() * 100)}%[/dim]")
+        finally:
+            socket.setdefaulttimeout(_prev_timeout)
 
         video_id = response["id"]
 
@@ -614,9 +620,21 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
         # Set thumbnail if configured
         if config.get("upload", {}).get("extract_thumbnail", False):
             thumb_path = Path(processed_path).with_suffix(".jpg")
-            # Prefer an existing prebuilt thumbnail (e.g. compilation builder output).
-            # Fallback to scene extraction for normal clips.
-            thumb = str(thumb_path) if thumb_path.exists() else _extract_thumbnail(processed_path, str(thumb_path))
+            # If a prebuilt branded thumbnail already exists, use it.
+            # Otherwise generate one with the proper design system.
+            if not thumb_path.exists():
+                try:
+                    from clipper.process.thumbnail import generate_clip_thumbnail
+                    generate_clip_thumbnail(
+                        clip,
+                        processed_path,
+                        str(thumb_path),
+                        game=clip.get("game") or config.get("game") or "",
+                    )
+                except Exception as _te:
+                    logger.warning("Branded thumbnail failed, falling back: %s", _te)
+                    _extract_thumbnail(processed_path, str(thumb_path))
+            thumb = str(thumb_path) if thumb_path.exists() else None
             if thumb:
                 try:
                     service.thumbnails().set(

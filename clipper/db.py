@@ -107,6 +107,21 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE releases ADD COLUMN platform TEXT DEFAULT 'youtube'")
         conn.commit()
 
+    if "retry_count" not in rel_cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN retry_count INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE releases ADD COLUMN last_error TEXT")
+        conn.commit()
+
+    # Prevent duplicate releases for the same clip+channel (keeps the earliest entry)
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_clip_channel "
+            "ON releases(clip_id, channel) WHERE status IN ('pending', 'uploaded')"
+        )
+        conn.commit()
+    except Exception:
+        pass  # partial index WHERE not supported in older SQLite — tolerate
+
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS clips (
@@ -140,6 +155,10 @@ CREATE TABLE IF NOT EXISTS clips (
     tags_override TEXT,
     hook_duration REAL,
     hook_text_override TEXT,
+    tiktok_id TEXT,
+    instagram_id TEXT,
+    facebook_id TEXT,
+    pre_score INTEGER,
     meta_json TEXT,
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -197,6 +216,9 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 CREATE INDEX IF NOT EXISTS idx_releases_status ON releases(status);
 CREATE INDEX IF NOT EXISTS idx_releases_scheduled ON releases(scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_releases_clip_id ON releases(clip_id);
+CREATE INDEX IF NOT EXISTS idx_clips_streamer ON clips(streamer);
+CREATE INDEX IF NOT EXISTS idx_clips_updated_at ON clips(updated_at);
 """
 
 
@@ -224,8 +246,17 @@ def mark_clips_seen(config: dict, clip_ids: list[str]) -> None:
 
 def all_seen_ids(config: dict) -> set[str]:
     conn = get_db(config)
-    rows = conn.execute("SELECT clip_id FROM history").fetchall()
+    rows = conn.execute(
+        "SELECT clip_id FROM history WHERE fetched_at >= datetime('now', '-30 days')"
+    ).fetchall()
     return {r["clip_id"] for r in rows}
+
+
+def is_clip_in_history(config: dict, clip_id: str) -> bool:
+    """Check if a clip ID exists in history (any age). Uses index lookup."""
+    conn = get_db(config)
+    row = conn.execute("SELECT 1 FROM history WHERE clip_id = ?", (clip_id,)).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -566,9 +597,9 @@ def save_performance(
     conn.commit()
 
 
-def list_performance(config: dict) -> list[dict]:
+def list_performance(config: dict, limit: int = 500) -> list[dict]:
     conn = get_db(config)
-    rows = conn.execute("SELECT * FROM performance ORDER BY collected_at DESC").fetchall()
+    rows = conn.execute("SELECT * FROM performance ORDER BY collected_at DESC LIMIT ?", (limit,)).fetchall()
     result = []
     for r in rows:
         entry = {
@@ -715,11 +746,11 @@ def delete_facecam_profile_db(config: dict, streamer: str) -> bool:
 
 def create_release(config: dict, clip_id: str, channel: str, scheduled_at: str,
                    privacy: str = "unlisted", meta_path: str | None = None,
-                   platform: str = "youtube") -> int:
+                   platform: str = "youtube", status: str = "pending") -> int:
     conn = get_db(config)
     cursor = conn.execute(
-        "INSERT INTO releases (clip_id, channel, scheduled_at, privacy, meta_path, platform) VALUES (?, ?, ?, ?, ?, ?)",
-        (clip_id, channel, scheduled_at, privacy, meta_path, platform),
+        "INSERT INTO releases (clip_id, channel, scheduled_at, privacy, meta_path, platform, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (clip_id, channel, scheduled_at, privacy, meta_path, platform, status),
     )
     conn.commit()
     return cursor.lastrowid
@@ -758,12 +789,18 @@ def update_release(config: dict, release_id: int, **fields) -> bool:
 
 
 def pending_releases_due(config: dict) -> list[dict]:
-    """Get releases that are due (scheduled_at <= now) and still pending or uploaded."""
+    """Get releases that are due (scheduled_at <= now) and still pending or uploaded.
+
+    Uses SQLite datetime() to normalize timezone-aware ISO8601 strings (e.g. +00:00 or -08:00)
+    so that UTC-stored and local-offset-stored times are compared correctly.
+    Also recovers 'executing' releases older than 10 min (stale from crashed process).
+    """
     conn = get_db(config)
-    now = datetime.now().isoformat()
     rows = conn.execute(
-        "SELECT * FROM releases WHERE scheduled_at <= ? AND status IN ('pending', 'uploaded') ORDER BY scheduled_at",
-        (now,),
+        "SELECT * FROM releases WHERE datetime(scheduled_at) <= datetime('now') "
+        "AND (status IN ('pending', 'uploaded') "
+        "     OR (status = 'executing' AND datetime(scheduled_at) <= datetime('now', '-10 minutes'))) "
+        "ORDER BY scheduled_at",
     ).fetchall()
     return [dict(r) for r in rows]
 

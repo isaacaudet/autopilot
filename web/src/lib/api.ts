@@ -700,3 +700,21 @@ export async function fetchStudioClips(opts?: {
   const data = await res.json()
   return data.clips
 }
+
+export async function fetchCalibrationQueue(): Promise<Array<{ id: string; title: string; streamer: string; game: string; created_at: string }>> {
+  const res = await fetch(`${BASE}/api/calibration-queue`)
+  if (!res.ok) return []
+  return res.json()
+}
+
+export async function seedCalibrationEdit(): Promise<{ seeded: number; streamers: string[] }> {
+  const res = await fetch(`${BASE}/api/calibration/seed-edit`, { method: 'POST' })
+  if (!res.ok) throw new Error('Seed failed')
+  return res.json()
+}
+
+export async function cleanupCalibrationEdit(): Promise<{ reset: number }> {
+  const res = await fetch(`${BASE}/api/calibration/cleanup-edit`, { method: 'POST' })
+  if (!res.ok) throw new Error('Cleanup failed')
+  return res.json()
+}

@@ -275,7 +275,7 @@ def train_weights(config: dict) -> dict | None:
 
     # Re-normalize to exactly 100
     total = sum(weights.values())
-    if total != 100:
+    if total != 100 and weights:
         biggest = max(weights, key=weights.get)
         weights[biggest] += 100 - total
 
@@ -352,16 +352,16 @@ def _apply_weight_guardrails(weights: dict) -> dict:
             w["llm"] = velocity
             w["velocity"] = velocity + excess
 
-    # Re-normalize to sum to 100
+    # Re-normalize to sum to exactly 100 (guardrails may have drifted totals via float ops)
     total = sum(float(v) for v in w.values())
-    if total > 0 and abs(total - 100.0) > 0.5:
+    if total > 0:
         factor = 100.0 / total
-        w = {k: round(float(v) * factor) for k, v in w.items()}
-        # Fix rounding error
-        total2 = sum(w.values())
-        if total2 != 100:
-            biggest = max(w, key=lambda k: w[k])
-            w[biggest] += 100 - total2
+        rounded = {k: int(round(float(v) * factor)) for k, v in w.items()}
+        diff = 100 - sum(rounded.values())
+        if diff != 0:
+            biggest = max(rounded, key=lambda k: rounded[k])
+            rounded[biggest] += diff
+        return rounded
 
     return {k: int(round(v)) for k, v in w.items()}
 
@@ -439,8 +439,10 @@ def collect_game_stats(config: dict) -> dict:
             if game:
                 local_game_map[video_id] = game
 
-    # Fetch ALL channel uploads from YouTube
-    yt = get_youtube_service()
+    # Fetch ALL channel uploads from YouTube — use channel-specific credentials
+    channel_key = (config.get("autopilot", {}) or {}).get("channel") or "default"
+    from clipper.upload.auth import get_youtube_service_for_channel
+    yt = get_youtube_service_for_channel(channel_key, config)
     channels = yt.channels().list(part="id", mine=True).execute()
     items = channels.get("items", [])
     if not items:

@@ -268,8 +268,8 @@ def generate_title(clip: dict) -> str:
 
     Uses clip keys: title, streamer, game, id, _analysis.
     """
-    streamer = clip.get("streamer", "Unknown")
-    game = clip.get("game", "")
+    streamer = clip.get("streamer") or "Unknown"
+    game = clip.get("game") or ""
 
     def _add_context(base: str) -> str:
         """Append streamer/game context when it fits and isn't redundant."""
@@ -342,14 +342,17 @@ def generate_title(clip: dict) -> str:
             game_lower = game.lower() if game else ""
             action = _GAME_ACTIONS.get(game_lower, f"{game} Moment" if game else "Insane Moment")
         # Append game to streamer only if not already in the action phrase
+        streamer_suffix = f" {streamer}" if streamer and streamer != "Unknown" else ""
         if game and game.lower() != "just chatting" and game.lower() not in action.lower():
-            result = f"{action} | {streamer} {game}"
+            result = f"{action} |{streamer_suffix} {game}".strip()
+        elif streamer_suffix:
+            result = f"{action} |{streamer_suffix}"
         else:
-            result = f"{action} | {streamer}"
+            result = action
     else:
         # Title is decent — clean it up, keep original casing
         cleaned = _clean_title(raw_title)
-        if streamer.lower() not in cleaned.lower():
+        if streamer and streamer != "Unknown" and streamer.lower() not in cleaned.lower():
             cleaned = f"{streamer}: {cleaned}"
         if game and game.lower() not in cleaned.lower() and game.lower() != "just chatting":
             cleaned = f"{cleaned} | {game}"

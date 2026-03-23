@@ -80,6 +80,14 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None, p
     if not page_id or not page_token:
         raise RuntimeError("Facebook token file missing page_id or page_access_token.")
 
+    # Warn if user token is close to expiry (page tokens are non-expiring,
+    # but the underlying user token expires in ~60 days and must be refreshed via re-auth)
+    expires_at = token_data.get("expires_at", 0)
+    import time as _time
+    days_left = (expires_at - _time.time()) / 86400
+    if expires_at and days_left < 14:
+        console.print(f"[yellow]⚠ Facebook token expires in {days_left:.0f} days — run `clipper auth -c {channel or 'facebook_main'}` to refresh.[/yellow]")
+
     description = clip.get("_description_override") or _build_description(clip, config)
 
     # Determine publish state and optional scheduled timestamp

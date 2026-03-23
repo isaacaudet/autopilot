@@ -41,7 +41,7 @@ def _process_single_clip(
     from clipper.process.titles import generate_hook_text
     from clipper.db import update_clip
 
-    output_dir = config["_output_dir"]
+    output_dir = config.get("_output_dir") or Path("output")
 
     clip_name = clip.get("id", "unknown")
     clip_title = clip.get("title", clip_name)[:40]
@@ -65,7 +65,7 @@ def _process_single_clip(
             return None
 
         force_shorts = clip.get("force_shorts", False)
-        shorts_threshold = config["settings"]["shorts_threshold"]
+        shorts_threshold = (config.get("settings") or {}).get("shorts_threshold", 60)
 
         trim_start = max(0.0, float(clip.get("_trim_start", 0.0) or 0.0))
         trim_end = max(0.0, float(clip.get("_trim_end", 0.0) or 0.0))
@@ -96,14 +96,17 @@ def _process_single_clip(
             layout_forces_shorts or force_shorts or (effective_duration > 0 and effective_duration <= shorts_threshold)
         )
 
-        # Smart trim for Shorts clips >40s — trim around peak moment
-        if is_shorts and effective_duration > 40:
-            from clipper.process.trim import find_peak_moment, smart_trim
-            if state:
-                state.update_worker(worker_label, "trimming")
-            peak = find_peak_moment(video_path, analysis=None, verbose=verbose)
-            if peak is not None:
-                video_path = smart_trim(video_path, peak, target_duration=30.0, verbose=verbose)
+        # No auto-detection — uncalibrated streamers fall back to blur layout
+        if is_shorts and not for_compilation:
+            streamer_key = str(clip.get("streamer") or "").strip().lower()
+            if streamer_key:
+                from clipper.db import get_facecam_profile
+                existing_profile = get_facecam_profile(config, streamer_key)
+                if existing_profile is None:
+                    # No calibrated profile — use blur layout (user must calibrate manually)
+                    clip["_shorts_layout"] = "blur"
+                    if verbose:
+                        console.print(f"  [dim]No facecam profile for {streamer_key} → blur[/dim]")
 
         if state:
             state.update_worker(worker_label, "transcribing")
@@ -122,6 +125,11 @@ def _process_single_clip(
             analysis = analyze_clip(clip, transcript_text, verbose=verbose, video_path=str(video_path))
             if analysis:
                 clip["_analysis"] = analysis
+                if not analysis.get("is_actual_gameplay", True):
+                    from clipper.db import update_clip as _uc
+                    _uc(config, clip.get("id", ""), status="skipped", _analysis=analysis)
+                    console.print(f"[yellow]  Rejected (not gameplay): {clip.get('title', '?')[:50]}[/yellow]")
+                    return {"status": "skipped", "reason": "not_gameplay"}
 
         # Ensure title_variants exist — fall back to keyword-based generation
         from clipper.process.titles import generate_title
@@ -161,6 +169,39 @@ def _process_single_clip(
                     output_name=output_name,
                     censor_ranges=clip.get("censor_ranges"),
                 )
+                # Produce platform-specific versions for cross-posting.
+                # Instagram gets a Follow CTA; TikTok/others get a clean version.
+                # Uses veryfast preset since platforms recompress anyway (~50% faster).
+                if is_shorts and not for_compilation:
+                    # Instagram version: Follow CTA overlay instead of Subscribe
+                    try:
+                        ig_path = burn_subtitles(
+                            video_path, subtitle_path, thread_config,
+                            clip=clip,
+                            is_shorts=is_shorts, hook_text=hook_text, verbose=False,
+                            output_name=f"{output_name}_ig",
+                            censor_ranges=clip.get("censor_ranges"),
+                            skip_subscribe_cta=True,
+                            follow_cta=True,
+                            encoder_preset="veryfast",
+                        )
+                        clip["_ig_processed_path"] = str(ig_path)
+                    except Exception:
+                        pass  # non-fatal — falls back to clean or YouTube version
+                    # Clean version for TikTok/other platforms (no CTA at all)
+                    try:
+                        clean_path = burn_subtitles(
+                            video_path, subtitle_path, thread_config,
+                            clip=clip,
+                            is_shorts=is_shorts, hook_text=hook_text, verbose=False,
+                            output_name=f"{output_name}_clean",
+                            censor_ranges=clip.get("censor_ranges"),
+                            skip_subscribe_cta=True,
+                            encoder_preset="veryfast",
+                        )
+                        clip["_clean_processed_path"] = str(clean_path)
+                    except Exception:
+                        pass  # non-fatal — cross-post falls back to YouTube version
         else:
             final_path = video_path
 
@@ -194,14 +235,14 @@ def _process_single_clip(
 
 def _process_clips(
     config: dict, verbose: bool = False, for_compilation: bool = False,
-    state=None,
+    state=None, game: str | None = None,
 ) -> list[dict]:
     """Process all approved clips concurrently. Returns list of processed clip metadata dicts."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
     from clipper.db import list_clips
 
-    approved = list_clips(config, status="approved")
+    approved = list_clips(config, status="approved", game=game)
     if not approved:
         console.print("[yellow]No approved clips to process.[/yellow]")
         return []
@@ -224,9 +265,13 @@ def _process_clips(
             for clip in approved
         }
         for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                processed.append(result)
+            try:
+                result = future.result()
+                if result is not None:
+                    processed.append(result)
+            except Exception as e:
+                clip_id = futures[future]
+                logger.error("Worker failed for clip %s: %s", clip_id, e)
 
     return processed
 
@@ -386,19 +431,39 @@ def _approve_clips(
     channel: str | None = None,
     min_score: float | None = None,
     shorts_layout: str | None = None,
+    skip_remaining: bool = True,
 ) -> int:
-    """Mark top `count` scored clips as approved, rest as skipped. Returns approved count."""
+    """Mark top `count` scored clips as approved, rest as skipped. Returns approved count.
+
+    skip_remaining: if False, don't bulk-skip leftover pending clips (used by
+    compilation so the Shorts autopilot can still use them).
+    """
     from clipper.db import update_clip, get_db
 
     conn = get_db(config)
 
-    # Reset any previously approved clips back to skipped
-    conn.execute("UPDATE clips SET status = 'skipped' WHERE status = 'approved'")
+    # Scope resets to the game(s) in this batch — prevents cross-contaminating other game pipelines
+    # (e.g. Deadlock autopilot resetting Marathon compilation approvals running in parallel)
+    game_values = list({str(c.get("game") or "").strip() for c in clips if c.get("game")})
+    if game_values:
+        placeholders = ",".join("?" for _ in game_values)
+        conn.execute(
+            f"UPDATE clips SET status = 'skipped' WHERE status = 'approved' AND game IN ({placeholders}) "
+            f"AND (video_id IS NULL OR video_id = '') AND (processed_path IS NULL OR processed_path = '')",
+            game_values,
+        )
+    else:
+        conn.execute("UPDATE clips SET status = 'skipped' WHERE status = 'approved' AND (video_id IS NULL OR video_id = '') AND (processed_path IS NULL OR processed_path = '')")
     conn.commit()
 
     approved = 0
     streamer_counts: dict[str, int] = {}
-    max_per_streamer = int((config.get("autopilot") or {}).get("max_clips_per_streamer", 2))
+    autopilot_cfg = config.get("autopilot") or {}
+    max_per_streamer = int(autopilot_cfg.get("max_clips_per_streamer", 2))
+    priority_streamers: set[str] = {
+        s.strip().lower() for s in (autopilot_cfg.get("priority_streamers") or [])
+    }
+    priority_max = int(autopilot_cfg.get("priority_streamer_max_clips", max_per_streamer))
     for clip in clips:
         clip_id = clip.get("id")
         if not clip_id:
@@ -408,19 +473,23 @@ def _approve_clips(
             update_clip(config, clip_id, status="skipped", score=clip_score)
             continue
         streamer = str(clip.get("streamer") or "").lower()
-        if streamer and streamer_counts.get(streamer, 0) >= max_per_streamer:
+        cap = priority_max if streamer in priority_streamers else max_per_streamer
+        if streamer and streamer_counts.get(streamer, 0) >= cap:
             update_clip(config, clip_id, status="skipped", score=clip_score)
             continue
         if approved < count:
             updates = {"status": "approved", "score": clip_score}
             if channel:
                 updates["channel"] = channel
-            layout_key = str(shorts_layout or "").strip().lower()
-            if layout_key in {"fill", "blur"}:
-                updates["_shorts_layout"] = layout_key
-                if layout_key == "fill":
-                    # Ensure streamer defaults are used in autopilot, not stale per-clip overrides.
-                    updates["_layout_override"] = None
+            # Per-clip layout: game_layout_defaults takes precedence over autopilot default.
+            from clipper.process.format import _pick_shorts_layout_mode
+            layout_key = _pick_shorts_layout_mode(clip, config) if clip.get("game") else str(shorts_layout or "").strip().lower()
+            if not layout_key:
+                layout_key = str(shorts_layout or "fill").strip().lower()
+            updates["_shorts_layout"] = layout_key
+            if layout_key == "fill":
+                # Ensure streamer defaults are used in autopilot, not stale per-clip overrides.
+                updates["_layout_override"] = None
             update_clip(config, clip_id, **updates)
             console.print(
                 f"[green]  +[/green] {clip.get('streamer', '?')} — "
@@ -432,10 +501,19 @@ def _approve_clips(
         else:
             update_clip(config, clip_id, status="skipped", score=clip_score)
 
-    # Skip any remaining pending (non-English clips not in the scored list)
-    conn.execute(
-        "UPDATE clips SET status = 'skipped' WHERE status = 'pending'"
-    )
+    # Skip any remaining pending/exceptional_pending in this game
+    # (non-English clips not in the scored list, plus stale exceptional flags).
+    # Compilations pass skip_remaining=False so Shorts autopilot can still use them.
+    if skip_remaining:
+        if game_values:
+            placeholders = ",".join("?" for _ in game_values)
+            conn.execute(
+                f"UPDATE clips SET status = 'skipped' WHERE status IN ('pending', 'exceptional_pending') AND game IN ({placeholders}) "
+                f"AND (video_id IS NULL OR video_id = '')",
+                game_values,
+            )
+        else:
+            conn.execute("UPDATE clips SET status = 'skipped' WHERE status IN ('pending', 'exceptional_pending') AND (video_id IS NULL OR video_id = '')")
     conn.commit()
 
     return approved
@@ -511,26 +589,67 @@ def _fetch_clips(
 
 
 def count_output_shorts_today(config: dict, *, channel: str | None = None) -> int:
-    """Return how many Shorts outputs were produced today (local day boundary)."""
+    """Return how many Shorts are already scheduled or uploaded for today.
+
+    Counts releases table entries for today (covers clips that are scheduled
+    with a future publishAt but haven't gone live yet) plus any output clips
+    uploaded without a release record.
+    """
     from clipper.db import get_db
+    from datetime import datetime, timedelta, timezone
+
+    pst = timezone(timedelta(hours=-8))
+    today_start = datetime.now(pst).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
 
     conn = get_db(config)
-    conditions = [
+
+    # Count releases scheduled for today (the primary signal)
+    # When no channel specified, only count YouTube channels — cross-posts to
+    # TikTok/Instagram have their own caps and shouldn't inflate the Shorts count.
+    channels_config = config.get("channels", {})
+    rel_conditions = [
+        "status NOT IN ('failed', 'cancelled')",
+        "clip_id NOT LIKE 'compilation_%'",
+        "scheduled_at >= ?",
+        "scheduled_at < ?",
+    ]
+    rel_params: list = [today_start.isoformat(), today_end.isoformat()]
+    if channel:
+        rel_conditions.append("channel = ?")
+        rel_params.append(channel)
+    else:
+        yt_channels = [k for k, v in channels_config.items() if v.get("platform") == "youtube"]
+        if yt_channels:
+            placeholders = ",".join("?" for _ in yt_channels)
+            rel_conditions.append(f"channel IN ({placeholders})")
+            rel_params.extend(yt_channels)
+    rel_row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM releases WHERE {' AND '.join(rel_conditions)}",
+        rel_params,
+    ).fetchone()
+    releases_today = int((rel_row["n"] if rel_row else 0) or 0)
+
+    # Also count output clips uploaded today without a release record (fallback)
+    clip_conditions = [
         "status = 'output'",
         "id NOT LIKE 'compilation_%'",
         "is_shorts = 1",
+        "video_id IS NOT NULL AND video_id != ''",
         "datetime(COALESCE(updated_at, fetched_at, created_at)) >= datetime('now', 'localtime', 'start of day')",
+        "id NOT IN (SELECT clip_id FROM releases WHERE clip_id IS NOT NULL)",
     ]
-    params: list[str] = []
+    clip_params: list = []
     if channel:
-        conditions.append("channel = ?")
-        params.append(channel)
-
-    row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM clips WHERE {' AND '.join(conditions)}",
-        params,
+        clip_conditions.append("channel = ?")
+        clip_params.append(channel)
+    clip_row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM clips WHERE {' AND '.join(clip_conditions)}",
+        clip_params,
     ).fetchone()
-    return int((row["n"] if row else 0) or 0)
+    clips_today = int((clip_row["n"] if clip_row else 0) or 0)
+
+    return releases_today + clips_today
 
 
 def _normalize_privacy(value: str | None) -> str:
@@ -580,7 +699,11 @@ def _profile_calibration_score(profile: dict | None) -> float:
 
 
 def _prioritize_calibrated_streamers(clips: list[dict], config: dict) -> list[dict]:
-    """Prefer clips from streamers with saved layout profiles in autopilot mode."""
+    """Prefer clips from streamers with saved layout profiles in autopilot mode.
+
+    Also applies a priority_streamer_bonus to any streamer listed under
+    autopilot.priority_streamers (case-insensitive).
+    """
     autopilot_cfg = config.get("autopilot", {}) or {}
     if autopilot_cfg.get("prefer_calibrated_streamers", True) is False:
         return clips
@@ -590,12 +713,22 @@ def _prioritize_calibrated_streamers(clips: list[dict], config: dict) -> list[di
     profiles = load_facecam_profiles(config) or {}
     bonus_points = float(autopilot_cfg.get("profile_bonus_points", 8.0) or 8.0)
 
+    # Priority streamers get a hard score boost regardless of calibration
+    priority_streamers: set[str] = {
+        s.strip().lower()
+        for s in (autopilot_cfg.get("priority_streamers") or [])
+    }
+    priority_bonus = float(autopilot_cfg.get("priority_streamer_bonus", 20.0) or 20.0)
+
     prioritized: list[dict] = []
     for clip in clips:
         streamer_key = str(clip.get("streamer", "")).strip().lower()
         profile = profiles.get(streamer_key) if streamer_key else None
         readiness = _profile_calibration_score(profile)
         rank_score = float(clip.get("_score", 0.0) or 0.0) + (readiness * bonus_points)
+        if streamer_key in priority_streamers:
+            rank_score += priority_bonus
+            clip["_priority_streamer"] = True
         clip["_autopilot_profile_score"] = round(readiness, 3)
         clip["_autopilot_rank_score"] = round(rank_score, 3)
         prioritized.append(clip)
@@ -616,8 +749,13 @@ def _revive_skipped_candidates(
     game: str = "",
     min_score: float = 45.0,
     limit: int = 40,
+    include_output: bool = False,
 ) -> int:
-    """Promote top skipped clips back to pending when discovery is sparse."""
+    """Promote top skipped (and optionally output) clips back to pending.
+
+    include_output=True: also revive clips used in compilation but not yet
+    uploaded as Shorts. This prevents compilation from starving the Shorts pool.
+    """
     from clipper.db import list_clips, update_clip
 
     max_promote = max(1, int(limit))
@@ -628,6 +766,15 @@ def _revive_skipped_candidates(
         sort="score",
         limit=2000,
     )
+    if include_output:
+        output_clips = list_clips(
+            config,
+            status="output",
+            game=game if game else None,
+            sort="score",
+            limit=2000,
+        )
+        skipped = skipped + output_clips
 
     promoted = 0
     for clip in skipped:
@@ -643,7 +790,11 @@ def _revive_skipped_candidates(
         if not str(clip.get("url", "")).strip():
             continue
         score = float(clip.get("_score", clip.get("score", 0.0)) or 0.0)
-        if score < float(min_score):
+        clip_status = str(clip.get("status", "")).strip()
+        # Output clips (from compilation) may have score=0 because they were
+        # never scored for Shorts — skip the score filter for them so they can
+        # be properly scored after revival by _load_and_score_pending.
+        if clip_status != "output" and score < float(min_score):
             continue
 
         update_clip(config, clip_id, status="pending", score=score)
@@ -742,6 +893,7 @@ def _upload_processed_clips(
     privacy: str = "unlisted",
     state=None,
     verbose: bool = False,
+    force_publish_at: str | None = None,
 ) -> dict:
     """Upload processed clips and persist platform IDs to JSON + DB."""
     from clipper.db import update_clip as db_update_clip
@@ -752,7 +904,7 @@ def _upload_processed_clips(
     )
 
     privacy_key = _normalize_privacy(privacy)
-    out_dir = config["_output_dir"]
+    out_dir = config.get("_output_dir") or Path("output")
     uploaded = 0
     failed = 0
     uploaded_ids: list[str] = []
@@ -762,19 +914,33 @@ def _upload_processed_clips(
     publish_slots: list[str] = []
     _channel_key = channel or (config.get("autopilot", {}) or {}).get("channel") or "default"
     _platform = get_channel_platform(_channel_key, config)
-    if _platform != "tiktok" and processed:
+    if force_publish_at:
+        # Caller-specified time (e.g. compilation day-of scheduling) — bypass slot system.
+        publish_slots = [force_publish_at] * len(processed)
+    elif _platform != "tiktok" and processed:
         try:
             from clipper.schedule import get_next_slots
+            from datetime import timezone as _tz, timedelta as _td
+            _pst = _tz(_td(hours=-8))  # Fixed PST, no DST
             ch_cfg = (config.get("channels", {}) or {}).get(_channel_key, {})
             if ch_cfg.get("schedule", {}).get("release_times"):
-                slots = get_next_slots(_channel_key, config, count=len(processed))
-                from datetime import timezone as _tz
+                slots = get_next_slots(_channel_key, config, count=len(processed), today_only=True)
+                # Convert naive PST times → UTC ISO8601 (required by YouTube publishAt)
                 publish_slots = [
-                    s.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    s.replace(tzinfo=_pst).astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                     for s in slots
                 ]
         except Exception:
             pass
+
+    # HARD CAP: never upload more clips than available publish slots.
+    # Clips without a scheduled slot would go live immediately, flooding the channel.
+    if publish_slots and len(processed) > len(publish_slots):
+        console.print(
+            f"[yellow]Capping uploads to {len(publish_slots)} (available slots) — "
+            f"{len(processed) - len(publish_slots)} clips deferred[/yellow]"
+        )
+        processed = processed[:len(publish_slots)]
 
     if state is not None:
         state.uploads_total = len(processed)
@@ -818,6 +984,16 @@ def _upload_processed_clips(
         meta_path.write_text(json.dumps(current, indent=2))
 
         db_update_clip(config, clip_id, **{id_col: upload_id, "channel": channel or ""})
+        if publish_at and _platform == "youtube":
+            from clipper.db import create_release
+            # Create as "scheduled" (not "pending") so the release cron doesn't
+            # re-upload — YouTube's publishAt handles the actual scheduling.
+            # The slot is still tracked for get_next_slots double-booking prevention.
+            create_release(
+                config, clip_id, _channel_key, publish_at,
+                privacy=privacy_key, meta_path=str(meta_path),
+                status="scheduled",
+            )
         uploaded += 1
         uploaded_ids.append(upload_id)
         if state is not None:
@@ -840,45 +1016,163 @@ def _cross_post_clips(
 ) -> dict:
     """Upload already-processed clips to additional channels (cross-posting).
 
-    Each extra channel gets its own schedule slots. TikTok posts immediately
-    (no scheduling pre-audit). Errors on one channel don't block others.
+    Instagram: queued into the releases system so the release cron posts them
+    at scheduled times throughout the day (avoids flooding at autopilot runtime).
+    TikTok: posts immediately as private (no scheduling API available).
+    YouTube: uploads with publishAt scheduled in UTC.
     """
-    from clipper.db import update_clip as db_update_clip
+    import json
+    from pathlib import Path
+    from clipper.db import update_clip as db_update_clip, get_db, _row_to_clip
     from clipper.upload.dispatcher import (
         get_channel_platform,
         platform_id_column,
         upload_clip,
     )
-    from clipper.schedule import get_next_slots
-    from datetime import timezone as _tz
+    from clipper.schedule import get_next_slots, schedule_release
 
+    out_dir = Path(config.get("_output_dir") or "output")
     results: dict = {}
+
+    channels_config = config.get("channels", {})
+
     for extra_ch in extra_channels:
         uploaded = 0
         failed = 0
-
         _platform = get_channel_platform(extra_ch, config)
-        # TikTok has no scheduling pre-audit — posts immediately as private
         tiktok = _platform == "tiktok"
-        privacy_for_ch = "unlisted" if tiktok else "public"
+        instagram = _platform == "instagram"
 
-        # Get scheduled slots for this channel
-        publish_slots: list[str] = []
-        if not tiktok:
+        # Filter clips to only those matching this channel's game
+        ch_conf = channels_config.get(extra_ch, {})
+        ch_game = ch_conf.get("game", "")
+        if ch_game:
+            filtered = [c for c in processed if c.get("game", "") == ch_game or not c.get("game")]
+            if len(filtered) < len(processed):
+                console.print(f"  [dim]Filtered {len(processed) - len(filtered)} clips (game mismatch for {extra_ch})[/dim]")
+            processed_for_ch = filtered
+        else:
+            processed_for_ch = processed
+
+        # Instagram: queue releases so the cron uploads at scheduled times (not all at once)
+        if instagram:
+            console.print(f"\n[bold cyan]Queueing {len(processed_for_ch)} clips → {extra_ch} (release system)[/bold cyan]")
             try:
-                ch_cfg = (config.get("channels", {}) or {}).get(extra_ch, {})
-                if ch_cfg.get("schedule", {}).get("release_times"):
-                    slots = get_next_slots(extra_ch, config, count=len(processed))
-                    publish_slots = [
-                        s.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        for s in slots
-                    ]
+                slots = get_next_slots(extra_ch, config, count=len(processed_for_ch))
             except Exception as e:
                 console.print(f"  [yellow]Schedule error for {extra_ch}: {e}[/yellow]")
+                slots = []
 
-        console.print(f"\n[bold cyan]Cross-posting {len(processed)} clips → {extra_ch}[/bold cyan]")
+            conn = get_db(config)
+            id_col = platform_id_column(_platform)
+            for i, clip in enumerate(processed_for_ch):
+                clip_id = str(clip.get("id", "")).strip()
+                if not clip_id or i >= len(slots):
+                    failed += 1
+                    continue
+                # Skip if already uploaded to this platform
+                row_check = conn.execute(f"SELECT {id_col} FROM clips WHERE id=?", (clip_id,)).fetchone()
+                if row_check and row_check[id_col]:
+                    console.print(f"  [dim]Skip {clip_id[:12]} — already on {_platform}[/dim]")
+                    continue
+                # Skip if a release is already pending for this clip+channel
+                existing_release = conn.execute(
+                    "SELECT id FROM releases WHERE clip_id=? AND channel=? AND status IN ('pending','uploaded','executing','published','scheduled')",
+                    (clip_id, extra_ch),
+                ).fetchone()
+                if existing_release:
+                    console.print(f"  [dim]Skip {clip_id[:12]} — release already queued[/dim]")
+                    continue
+                slot = slots[i]
+                # Prefer Instagram-specific version (Follow CTA), fall back to clean
+                ig_path = clip.get("_ig_processed_path", "")
+                clean_path = clip.get("_clean_processed_path", "")
+                if ig_path and Path(ig_path).exists():
+                    processed_path = ig_path
+                elif clean_path and Path(clean_path).exists():
+                    processed_path = clean_path
+                else:
+                    processed_path = clip.get("processed_path", "")
+                meta_path = None
+                if processed_path:
+                    stem = Path(processed_path).stem.replace("_final", "").replace("_clean", "")
+                    meta_path = str(out_dir / f"{stem}_ig.json")
+                    # Write Instagram-specific meta with clean video path
+                    row = conn.execute("SELECT * FROM clips WHERE id=?", (clip_id,)).fetchone()
+                    meta_clip = _row_to_clip(row) if row else dict(clip)
+                    meta_clip["processed_path"] = processed_path
+                    with open(meta_path, "w") as f:
+                        json.dump(meta_clip, f, indent=2)
+                try:
+                    schedule_release(clip_id, extra_ch, slot, config, meta_path=meta_path, privacy="public")
+                    uploaded += 1
+                    console.print(f"  [dim]Queued {slot.strftime('%b %d %H:%M')} → {clip.get('streamer')} — {str(clip.get('title',''))[:30]}[/dim]")
+                except Exception as e:
+                    console.print(f"  [red]{extra_ch} queue error: {e}[/red]")
+                    failed += 1
 
-        for i, clip in enumerate(processed):
+            results[extra_ch] = {"queued": uploaded, "failed": failed}
+            console.print(f"  {extra_ch}: {uploaded} queued for release cron, {failed} failed")
+            continue
+
+        # TikTok: schedule through release system (same as Instagram, spread throughout day)
+        if tiktok:
+            console.print(f"\n[bold cyan]Queueing {len(processed_for_ch)} clips → {extra_ch} (release system)[/bold cyan]")
+            try:
+                slots = get_next_slots(extra_ch, config, count=len(processed_for_ch))
+            except Exception as e:
+                console.print(f"  [yellow]Schedule error for {extra_ch}: {e}[/yellow]")
+                slots = []
+
+            conn = get_db(config)
+            id_col = platform_id_column(_platform)
+            for i, clip in enumerate(processed_for_ch):
+                clip_id = str(clip.get("id", "")).strip()
+                if not clip_id or i >= len(slots):
+                    failed += 1
+                    continue
+                row_check = conn.execute(f"SELECT {id_col} FROM clips WHERE id=?", (clip_id,)).fetchone()
+                if row_check and row_check[id_col]:
+                    console.print(f"  [dim]Skip {clip_id[:12]} — already on {_platform}[/dim]")
+                    continue
+                existing_release = conn.execute(
+                    "SELECT id FROM releases WHERE clip_id=? AND channel=? AND status IN ('pending','uploaded','executing','published','scheduled')",
+                    (clip_id, extra_ch),
+                ).fetchone()
+                if existing_release:
+                    console.print(f"  [dim]Skip {clip_id[:12]} — release already queued[/dim]")
+                    continue
+                slot = slots[i]
+                try:
+                    schedule_release(clip_id, extra_ch, slot, config, privacy="public")
+                    uploaded += 1
+                    console.print(f"  [dim]Queued {slot.strftime('%b %d %H:%M')} → {clip.get('streamer')} — {str(clip.get('title',''))[:30]}[/dim]")
+                except Exception as e:
+                    console.print(f"  [red]{extra_ch} queue error: {e}[/red]")
+                    failed += 1
+
+            results[extra_ch] = {"queued": uploaded, "failed": failed}
+            console.print(f"  {extra_ch}: {uploaded} queued for release cron, {failed} failed")
+            continue
+
+        # YouTube: upload directly with publishAt scheduling
+        publish_slots: list[str] = []
+        try:
+            ch_cfg = (config.get("channels", {}) or {}).get(extra_ch, {})
+            if ch_cfg.get("schedule", {}).get("release_times"):
+                slots = get_next_slots(extra_ch, config, count=len(processed_for_ch))
+                from datetime import timezone as _tz, timedelta as _td
+                _pst = _tz(_td(hours=-8))  # Fixed PST, no DST
+                publish_slots = [
+                    s.replace(tzinfo=_pst).astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    for s in slots
+                ]
+        except Exception as e:
+            console.print(f"  [yellow]Schedule error for {extra_ch}: {e}[/yellow]")
+
+        console.print(f"\n[bold cyan]Cross-posting {len(processed_for_ch)} clips → {extra_ch}[/bold cyan]")
+
+        for i, clip in enumerate(processed_for_ch):
             clip_id = str(clip.get("id", "")).strip()
             if not clip_id:
                 failed += 1
@@ -886,10 +1180,15 @@ def _cross_post_clips(
 
             publish_at = publish_slots[i] if i < len(publish_slots) else None
 
+            xpost_clip = dict(clip)
+            clean_path = clip.get("_clean_processed_path", "")
+            if clean_path and Path(clean_path).exists():
+                xpost_clip["processed_path"] = clean_path
+
             try:
                 upload_id = upload_clip(
-                    clip, config,
-                    privacy=privacy_for_ch,
+                    xpost_clip, config,
+                    privacy="public",
                     channel=extra_ch,
                     verbose=verbose,
                     publish_at=publish_at,
@@ -934,7 +1233,12 @@ def run_autopilot_workflow(
 
     requested_count = max(1, int(count))
     target_count = requested_count
+    # Apply upload.max_uploads_per_day as hard ceiling across all same-channel runs today
+    upload_cfg = config.get("upload", {}) or {}
+    api_quota_cap = int(upload_cfg.get("max_uploads_per_day", 0) or 0)
     daily_cap = int(daily_limit or 0)
+    if api_quota_cap > 0:
+        daily_cap = min(daily_cap, api_quota_cap) if daily_cap > 0 else api_quota_cap
     if daily_cap > 0:
         already = count_output_shorts_today(config, channel=channel)
         remaining = max(0, daily_cap - already)
@@ -952,6 +1256,12 @@ def run_autopilot_workflow(
                 "status": "daily_cap_reached",
             }
         target_count = min(target_count, remaining)
+
+    # Pre-flight token check — warn early if tokens are bad (still proceed with processing)
+    upload_channels = list(autopilot_cfg.get("upload_channels", []) or [])
+    all_channels = ([channel] if channel else []) + upload_channels
+    if all_channels:
+        _check_token_health(config, all_channels)
 
     if state is not None:
         state.set_phase("learning", "Refreshing game stats...")
@@ -993,8 +1303,8 @@ def run_autopilot_workflow(
     # Enforce game filtering whenever a game is specified, even for configured/selected scopes.
     game_filter = game_name if game_name else ""
 
-    def _score_candidates() -> tuple[list[dict], list[dict]]:
-        scored_pending = _load_and_score_pending(config, game=game_filter, use_game_multipliers=True)
+    def _score_candidates(view_floor: bool = True) -> tuple[list[dict], list[dict]]:
+        scored_pending = _load_and_score_pending(config, game=game_filter, use_game_multipliers=True, apply_view_floor=view_floor)
         scored_qualifying = [
             c for c in scored_pending if float(c.get("_score", 0.0) or 0.0) >= float(min_score)
         ]
@@ -1028,34 +1338,37 @@ def run_autopilot_workflow(
             state.set_phase("scoring", "Scoring fallback candidates...")
         pending, qualifying = _score_candidates()
 
-    if not pending and revive_skipped:
+    if (not pending or len(qualifying) < target_count) and revive_skipped:
         if state is not None:
-            state.set_phase("scoring", "Recycling skipped candidates...")
+            state.set_phase("scoring", "Recycling skipped/output candidates...")
         revived_count = _revive_skipped_candidates(
             config,
             game=game_filter,
             min_score=min_score,
             limit=max(target_count * 8, 30),
+            include_output=True,
         )
         if revived_count > 0:
-            pending, qualifying = _score_candidates()
+            pending, qualifying = _score_candidates(view_floor=False)
 
     if not pending:
         if state is not None:
             state.set_phase("done", "No qualifying clips found")
         return {"requested": requested_count, "approved": 0, "processed": 0, "uploaded": 0, "status": "no_clips"}
 
-    if not qualifying and revive_skipped:
+    if (not qualifying or len(qualifying) < target_count) and revive_skipped:
         if state is not None:
-            state.set_phase("scoring", "Recycling top skipped candidates...")
-        revived_count = _revive_skipped_candidates(
+            state.set_phase("scoring", "Recycling top skipped/output candidates...")
+        more = _revive_skipped_candidates(
             config,
             game=game_filter,
             min_score=min_score,
             limit=max(target_count * 6, 25),
+            include_output=True,
         )
-        if revived_count > 0:
-            pending, qualifying = _score_candidates()
+        revived_count += more
+        if more > 0:
+            pending, qualifying = _score_candidates(view_floor=False)
 
     if not qualifying:
         detail = f"No clips above score {float(min_score):.0f}"
@@ -1077,7 +1390,10 @@ def run_autopilot_workflow(
 
     qualifying = _prioritize_calibrated_streamers(qualifying, config)
     used_uncalibrated_fallback = False
-    require_calibrated = bool(autopilot_cfg.get("require_calibrated_streamers", True))
+    # Calibration only matters for fill layout (facecam). Blur-only games skip this gate.
+    from clipper.process.format import _pick_shorts_layout_mode
+    _game_layout = _pick_shorts_layout_mode({"game": game_filter} if game_filter else None, config)
+    require_calibrated = bool(autopilot_cfg.get("require_calibrated_streamers", True)) and _game_layout != "blur"
     if require_calibrated:
         calibrated = [c for c in qualifying if float(c.get("_autopilot_profile_score", 0.0) or 0.0) > 0.0]
         if not calibrated and revive_skipped:
@@ -1088,6 +1404,7 @@ def run_autopilot_workflow(
                 game=game_filter,
                 min_score=min_score,
                 limit=max(target_count * 8, 30),
+                include_output=True,
             )
             revived_count += promoted_more
             if promoted_more > 0:
@@ -1156,7 +1473,7 @@ def run_autopilot_workflow(
 
     if state is not None:
         state.set_phase("processing", f"Processing {approved} clips...")
-    processed = _process_clips(config, verbose=verbose, state=state)
+    processed = _process_clips(config, verbose=verbose, state=state, game=game_name)
 
     summary = {
         "requested": requested_count,
@@ -1290,7 +1607,7 @@ def run_shorts_workflow(
     if state:
         state.set_phase("processing", f"Processing {approved_count} clips")
     console.print(f"\n[bold]Processing {approved_count} clips...[/bold]")
-    processed = _process_clips(config, verbose=verbose, state=state)
+    processed = _process_clips(config, verbose=verbose, state=state, game=game)
 
     if not processed:
         console.print("[yellow]No clips processed successfully.[/yellow]")
@@ -1314,6 +1631,60 @@ def run_shorts_workflow(
             state.set_phase("done", f"{state.completed} clips processed")
 
 
+def _check_token_health(config: dict, channels: list[str]):
+    """Validate tokens for all channels before starting pipeline. Logs warnings."""
+    from clipper.upload.auth import validate_token
+    from clipper.config import get_project_root
+
+    root = get_project_root()
+    for ch_key in channels:
+        ch_conf = config.get("channels", {}).get(ch_key, {})
+        token_file = ch_conf.get("token_file", "")
+        if token_file:
+            valid, msg = validate_token(str(root / token_file))
+            if not valid:
+                console.print(f"[red]Token warning ({ch_key}): {msg}[/red]")
+
+
+def _cleanup_old_compilations(config: dict):
+    """Delete compilation output files older than 24 hours.
+
+    Compilations are large (~500MB) and not needed after upload.
+    Only deletes files for compilations not referenced by active releases.
+    """
+    import os
+    from clipper.db import get_db
+
+    conn = get_db(config)
+    out_dir = Path(config.get("_output_dir") or "output")
+
+    rows = conn.execute("""
+        SELECT c.id, c.processed_path, c.source_path
+        FROM clips c
+        WHERE c.id LIKE 'compilation_%'
+          AND c.processed_path IS NOT NULL
+          AND c.created_at < datetime('now', '-1 day')
+          AND c.id NOT IN (
+              SELECT clip_id FROM releases
+              WHERE status IN ('pending', 'uploaded', 'executing', 'scheduled')
+          )
+    """).fetchall()
+
+    cleaned = 0
+    for row in rows:
+        for path_key in ("processed_path", "source_path"):
+            path = row[path_key] if isinstance(row, dict) else dict(row).get(path_key)
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                    console.print(f"[dim]Cleaned up: {os.path.basename(path)}[/dim]")
+                    cleaned += 1
+                except OSError:
+                    pass
+    if cleaned:
+        console.print(f"[dim]Cleaned {cleaned} old compilation file(s)[/dim]")
+
+
 def run_compilation_workflow(
     config: dict,
     game: str | None = None,
@@ -1325,13 +1696,21 @@ def run_compilation_workflow(
     state=None,
 ):
     """Compilation flow: fetch -> rank -> approve -> process -> compile -> optional upload."""
+    _cleanup_old_compilations(config)
+
+    # Pre-flight token check
+    upload_channels = list((config.get("autopilot", {}) or {}).get("upload_channels", []) or [])
+    all_channels = ([channel] if channel else []) + upload_channels
+    if all_channels:
+        _check_token_health(config, all_channels)
+
     if not game:
         raise ValueError("game is required")
 
-    # 1. Fetch
+    # 1. Fetch — use 3d window so we pull clips that weren't in the 24h shorts fetch
     if state:
         state.set_phase("fetching", f"Fetching {game} clips from Twitch")
-    raw_clips = _fetch_clips(config, game, verbose=verbose)
+    raw_clips = _fetch_clips(config, game, period="3d", verbose=verbose)
     if not raw_clips:
         console.print("[yellow]No clips found.[/yellow]")
         if state:
@@ -1342,6 +1721,25 @@ def run_compilation_workflow(
     if state:
         state.set_phase("scoring", f"Scoring and ranking clips")
     pending = _load_and_score_pending(config, game=game, apply_view_floor=False)
+
+    # Always merge in revived candidates (skipped/output) for compilations.
+    # Compilations need a large pool to fill 10 minutes — don't limit to
+    # whatever happens to be 'pending' after the shorts autopilot ran.
+    from clipper.db import get_db
+    conn = get_db(config)
+    rows = conn.execute(
+        "SELECT id FROM clips WHERE game=? AND status IN ('skipped', 'output') AND language='en' "
+        "AND duration BETWEEN 10 AND 120 AND (video_id IS NULL OR video_id = '') "
+        "ORDER BY score DESC LIMIT 200",
+        (game,),
+    ).fetchall()
+    if rows:
+        ids = [r["id"] for r in rows]
+        conn.executemany("UPDATE clips SET status='pending' WHERE id=?", [(i,) for i in ids])
+        conn.commit()
+        console.print(f"  [dim]Revived {len(ids)} {game} clips for compilation pool[/dim]")
+        pending = _load_and_score_pending(config, game=game, apply_view_floor=False)
+
     if not pending:
         console.print("[yellow]No English clips found.[/yellow]")
         if state:
@@ -1367,6 +1765,7 @@ def run_compilation_workflow(
         config,
         channel=channel,
         min_score=compilation_min_score,
+        skip_remaining=False,  # Don't poison the pool — Shorts autopilot runs next
     )
 
     if approved_count < 2:
@@ -1379,7 +1778,7 @@ def run_compilation_workflow(
     if state:
         state.set_phase("processing", f"Processing {approved_count} clips")
     console.print(f"\n[bold]Processing {approved_count} clips...[/bold]")
-    processed = _process_clips(config, verbose=verbose, for_compilation=True, state=state)
+    processed = _process_clips(config, verbose=verbose, for_compilation=True, state=state, game=game)
 
     if not processed or len(processed) < 2:
         console.print("[yellow]Not enough clips processed for compilation.[/yellow]")
@@ -1408,7 +1807,7 @@ def run_compilation_workflow(
 
     date_str = datetime.now().strftime("%Y%m%d")
     comp_name = f"compilation_{game.lower().replace(' ', '_')}_{date_str}.mp4"
-    comp_path = config["_output_dir"] / comp_name
+    comp_path = (config.get("_output_dir") or Path("output")) / comp_name
     title = f"{game.upper()} Daily Highlights — Best Clips {datetime.now().strftime('%m/%d')}"
 
     if state:
@@ -1416,9 +1815,35 @@ def run_compilation_workflow(
     console.print(f"\n[bold]Compiling {len(ordered)} clips (countdown order)...[/bold]")
     compile_clips(ordered, comp_path, config, verbose=verbose, countdown=True)
 
+    # Enforce minimum length — never upload a compilation shorter than min_minutes
+    min_minutes = float((config.get("compilation") or {}).get("min_minutes", 8.0))
+    from clipper.process.trim import get_video_duration
+    actual_duration = get_video_duration(comp_path)
+    if actual_duration < min_minutes * 60:
+        console.print(
+            f"[bold red]Compilation too short ({actual_duration/60:.1f} min < {min_minutes:.0f} min minimum). "
+            f"Not uploading.[/bold red]"
+        )
+        if state:
+            state.set_phase("done", f"Compilation too short ({actual_duration/60:.1f} min)")
+        return
+
     merged_subs = build_merged_subtitles(ordered, comp_path.with_suffix(".ass"))
     if merged_subs:
         console.print(f"  [green]Merged subtitles:[/green] {merged_subs}")
+        from clipper.process.burn import burn_subtitles
+        if state:
+            state.set_phase("subtitles", "Burning subtitles into compilation")
+        try:
+            subtitled_path = burn_subtitles(
+                comp_path, merged_subs, config,
+                clip=None, is_shorts=False, verbose=verbose,
+                output_name=comp_name.replace(".mp4", ""),
+            )
+            comp_path = subtitled_path
+            console.print(f"  [green]Subtitled compilation:[/green] {comp_path.name}")
+        except Exception as e:
+            console.print(f"  [yellow]Subtitle burn failed (using raw compilation): {e}[/yellow]")
 
     thumb_path = comp_path.with_suffix(".jpg")
     thumb = build_thumbnail(ordered, thumb_path, title=title, game=game)
@@ -1446,17 +1871,65 @@ def run_compilation_workflow(
     with open(comp_meta_path, "w") as f:
         json.dump(comp_clip, f, indent=2)
 
+    # Persist compilation to DB so video_id and analytics are tracked.
+    # ON CONFLICT preserves video_id so re-runs don't wipe upload tracking.
+    from clipper.db import get_db as _get_db
+    _conn = _get_db(config)
+    _conn.execute(
+        "INSERT INTO clips (id, title, game, status, is_shorts, processed_path, channel, title_override, description_override) "
+        "VALUES (?, ?, ?, 'output', 0, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET title=excluded.title, game=excluded.game, "
+        "status=excluded.status, processed_path=excluded.processed_path, channel=excluded.channel, "
+        "title_override=excluded.title_override, description_override=excluded.description_override",
+        (comp_clip["id"], title, game, str(comp_path), channel or "", title, description),
+    )
+    _conn.commit()
+
     console.print(f"\n[bold green]Done![/bold green] Compilation ready: {comp_path}")
 
     if auto:
-        if state:
-            state.set_phase("uploading", f"Uploading compilation ({_normalize_privacy(privacy)})")
-        _upload_processed_clips(
-            [comp_clip], config,
-            channel=channel,
-            privacy=_normalize_privacy(privacy),
-            state=state,
-            verbose=verbose,
-        )
+        # Check if this compilation was already uploaded today — skip re-upload.
+        existing = _conn.execute(
+            "SELECT video_id FROM clips WHERE id=?", (comp_clip["id"],)
+        ).fetchone()
+        if existing and existing["video_id"]:
+            console.print(f"[yellow]Compilation already uploaded: {existing['video_id']} — skipping re-upload.[/yellow]")
+        else:
+            if state:
+                state.set_phase("uploading", f"Uploading compilation ({_normalize_privacy(privacy)})")
+            # Compilations always publish day-of at a configured time, independent of the
+            # Shorts slot queue. Default: 19:00 PST. Override via compilation.publish_time.
+            from datetime import timezone as _tz, timedelta as _td
+            _pst = _tz(_td(hours=-8))
+            _comp_cfg = config.get("compilation", {}) or {}
+            _pub_time = str(_comp_cfg.get("publish_time", "19:00")).strip()
+            try:
+                _ph, _pm = (int(x) for x in _pub_time.split(":"))
+            except (ValueError, AttributeError):
+                _ph, _pm = 19, 0
+            _now_pst = datetime.now(tz=_pst)
+            _pub_dt = _now_pst.replace(hour=_ph, minute=_pm, second=0, microsecond=0)
+            # If that time already passed today, push to tomorrow same time
+            if _pub_dt <= _now_pst:
+                _pub_dt += timedelta(days=1)
+            _force_publish_at = _pub_dt.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _upload_processed_clips(
+                [comp_clip], config,
+                channel=channel,
+                privacy=_normalize_privacy(privacy),
+                state=state,
+                verbose=verbose,
+                force_publish_at=_force_publish_at,
+            )
+
+            # Cross-post compilation to additional channels (Instagram, TikTok)
+            upload_channels = list((config.get("autopilot", {}) or {}).get("upload_channels", []) or [])
+            if upload_channels:
+                _cross_post_clips(
+                    [comp_clip], config,
+                    extra_channels=upload_channels,
+                    verbose=verbose,
+                )
+
         if state and state.phase != "error":
             state.set_phase("done", "Compilation uploaded")

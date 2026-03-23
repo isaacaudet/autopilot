@@ -88,11 +88,14 @@ def _get_or_load_model(model_name: str, device: str):
     if _cached_model is not None and _cached_model_name == key:
         return _cached_model
     console.print(f"[blue]Loading Whisper model:[/blue] {model_name} on {device}")
-    from faster_whisper import WhisperModel
-    compute_type = "float16" if device == "cuda" else "int8"
-    _cached_model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    _cached_model_name = key
-    return _cached_model
+    try:
+        from faster_whisper import WhisperModel
+        compute_type = "float16" if device == "cuda" else "int8"
+        _cached_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        _cached_model_name = key
+        return _cached_model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Whisper model '{model_name}': {e}") from e
 
 
 # ASS header template for Shorts-style subtitles

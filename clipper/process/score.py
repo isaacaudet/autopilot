@@ -62,12 +62,17 @@ _VIRAL_KEYWORDS = {
     "funny", "fail", "rage quit", "tilted", "malding", "copium",
     "reaction", "shocked", "crying", "heated", "roast", "flamed",
     "outplay", "1hp", "no way", "wtf", "omg",
+    # Tech/technique signals — gaming discoveries perform well on YouTube
+    "new tech", "movement", "trick", "exploit", "combo", "parry",
+    "tech", "strat", "taught", "innovator",
 }
 
 _STRONG_KEYWORDS = {
     "insane", "crazy", "clutch", "1v5", "1v4", "ace", "rage", "banned",
     "destroyed", "exposed", "drama", "world record", "impossible",
     "screaming", "freakout", "unbelievable",
+    # Tech clips get strong views (22k+ "insane rebuttal parry", 6.9k "movement innovator")
+    "new tech", "movement tech", "parry tech",
 }
 
 SUPPORTED_FEATURES = (
@@ -82,15 +87,17 @@ SUPPORTED_FEATURES = (
     "pre_score",
 )
 
-# Views-first default objective.
+# Calibrated from 195 YouTube performance samples (Mar 2026).
+# LLM (r=0.498) and recency (r=0.395) are strongest predictors of YouTube success.
+# Twitch views/velocity have low correlation (r<0.15) — Twitch virality ≠ YouTube virality.
 DEFAULT_WEIGHTS = {
-    "duration": 16,
-    "velocity": 34,
-    "views": 26,
-    "keywords": 4,
-    "recency": 14,
-    "audio": 4,
-    "llm": 2,
+    "duration": 10,
+    "velocity": 25,
+    "views": 10,
+    "keywords": 5,
+    "recency": 22,
+    "audio": 5,
+    "llm": 23,
     "pre_score": 0,
 }
 
@@ -105,28 +112,45 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+_VIEW_FLOOR_DEFAULTS = {
+    "2h_24h": 80,    # clips 2-24h old
+    "24h_plus": 150,  # clips 24h+ old
+}
+
+# Per-game floor overrides: smaller audiences get gentler floors,
+# big audiences get stricter floors to surface only the best clips.
+# NOTE: Floors were 200/500 for Deadlock but that killed the daily Shorts
+# pipeline — by 7am most clips hadn't hit 200 views yet, so 0 got through.
+_VIEW_FLOOR_OVERRIDES: dict[str, dict[str, int]] = {
+    "deadlock": {"2h_24h": 100, "24h_plus": 250},
+    "marathon": {"2h_24h": 30, "24h_plus": 75},
+}
+
+
 def apply_view_floor(clips: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split clips into (passing, disqualified) based on view traction floors.
 
     Rules:
     - age < 2h  → pass (Twitch API shows 0 views for fresh clips)
-    - 2h ≤ age < 24h → require ≥ 150 views
-    - age ≥ 24h → require ≥ 300 views
+    - 2h ≤ age < 24h → require ≥ threshold views (game-dependent)
+    - age ≥ 24h → require ≥ threshold views (game-dependent)
     """
     passing: list[dict] = []
     disqualified: list[dict] = []
     for clip in clips:
         age = _age_hours(clip)
         views = _to_float(clip.get("view_count"), 0.0)
+        game = str(clip.get("game") or "").strip().lower()
+        floors = _VIEW_FLOOR_OVERRIDES.get(game, _VIEW_FLOOR_DEFAULTS)
         if age < 2.0:
             passing.append(clip)
         elif age < 24.0:
-            if views >= 150:
+            if views >= floors["2h_24h"]:
                 passing.append(clip)
             else:
                 disqualified.append(clip)
         else:
-            if views >= 300:
+            if views >= floors["24h_plus"]:
                 passing.append(clip)
             else:
                 disqualified.append(clip)
@@ -174,19 +198,19 @@ def _age_hours(clip: dict) -> float:
 
 
 def _duration_quality(duration: float) -> float:
-    """Score clip duration. Data shows 15-30s is the YouTube Shorts sweet spot
-    (avg 1,673 views vs 505 for <15s and 694 for 30-60s)."""
+    """Score clip duration. Channel data shows 30-50s is the sweet spot
+    (4,252 avg views vs 1,673 for 15-30s). Longer clips retain better."""
     if duration <= 0:
         return 0.0
-    if 15 <= duration <= 30:
-        return 1.0   # sweet spot — 2.4x better than other ranges
-    if 10 <= duration <= 45:
-        return 0.7
-    if 6 <= duration <= 60:
-        return 0.4
-    if duration <= 90:
-        return 0.15
-    return 0.05
+    if 30 <= duration <= 50:
+        return 1.0   # proven sweet spot — 4,252 avg views
+    if 20 <= duration <= 60:
+        return 0.75
+    if 15 <= duration <= 75:
+        return 0.5
+    if 10 <= duration <= 90:
+        return 0.3
+    return 0.1
 
 
 def _velocity_quality(views: float, age_hours: float) -> float:
@@ -495,6 +519,29 @@ def score_clip(
     base_score = weighted_quality * 100.0
     prior_points = _to_float(source_prior if source_prior is not None else clip.get("_source_prior"), 0.0)
     raw = base_score - penalty - max(0.0, _to_float(extra_penalty, 0.0)) + prior_points
+
+    # Data-driven category multipliers from channel performance data.
+    # fail (13,206 avg) and funny (4,331 avg) crush hype (1,037 avg).
+    _CATEGORY_MULTIPLIERS = {
+        "fail": 1.35,
+        "funny": 1.20,
+        "skill": 1.10,
+        "tech": 1.10,
+        "clutch": 1.05,
+        "rage": 1.0,
+        "hype": 0.85,
+        "commentary": 0.80,
+        "other": 0.90,
+    }
+    analysis = _analysis_dict(clip)
+    category = str(analysis.get("category", "") or "").strip().lower()
+    raw *= _CATEGORY_MULTIPLIERS.get(category, 1.0)
+
+    # Game mismatch penalty: if LLM detected the clip isn't actually the claimed game,
+    # heavily penalize it. This catches mis-categorized Twitch clips.
+    if analysis.get("game_matches") is False:
+        raw *= 0.1  # 90% penalty — effectively disqualifies the clip
+
     raw *= max(0.1, _to_float(game_multiplier, 1.0))
 
     confidence = _confidence_factor(qualities, views, velocity, age_h, title_penalty)

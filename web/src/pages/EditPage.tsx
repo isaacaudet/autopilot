@@ -25,6 +25,7 @@ import {
   approveProcess,
   batchReview,
   fetchQueue,
+  seedCalibrationEdit,
   thumbnailUrl,
   type LayoutProfile,
 } from '@/lib/api'
@@ -115,9 +116,14 @@ export function EditPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await fetchQueue('approved', { sort: '', limit: 500 })
+      let data = await fetchQueue('approved', { sort: '', limit: 500 })
+      if (data.length === 0) {
+        await seedCalibrationEdit()
+        data = await fetchQueue('approved', { sort: '', limit: 500 })
+      }
       setClips(data)
-    } catch {
+    } catch (err) {
+      console.error('Failed to load clips:', err)
       toast.error('Failed to load clips')
     } finally {
       setLoading(false)

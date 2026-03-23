@@ -3,10 +3,44 @@
 import datetime as _dt
 import json
 import os
+import threading
 
 from rich.console import Console
 
 console = Console()
+
+# Singleton Gemini client — avoids re-instantiating on every call (24-32× per run)
+_gemini_client = None
+_gemini_lock = threading.Lock()
+
+
+def _get_gemini_client():
+    """Return a cached Gemini client, or None if unavailable."""
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    with _gemini_lock:
+        if _gemini_client is not None:
+            return _gemini_client
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        try:
+            from google import genai
+            _gemini_client = genai.Client(api_key=api_key)
+            return _gemini_client
+        except ImportError:
+            return None
+
+
+def _get_gemini_model() -> str:
+    """Return the configured Gemini model name."""
+    return os.environ.get("CLIPPER_GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _get_ollama_model() -> str:
+    """Return the configured Ollama model name."""
+    return os.environ.get("CLIPPER_OLLAMA_MODEL", "gemma3:4b")
 
 
 def _clip_age_hours(clip: dict) -> float:
@@ -31,6 +65,7 @@ Clips:
 For each, assess:
 - Title viral signal: specific hype words (clutch, 1v5, ace, rage, banned) vs generic (character names, single letters, stream titles)
 - Moment type: clutch/fail/funny/rage/hype/skill vs boring/filler
+- Tech potential: clips showing new techniques, movement tricks, parry tech, combos, or mechanic discoveries are HIGH VALUE — score 8+
 - View traction: views given clip age (fresh 0-view clips are OK; old low-view clips are not)
 - Duration: 15-58s ideal for Shorts; penalize > 90s
 
@@ -71,6 +106,9 @@ def pre_analyze_clips(clips: list[dict]) -> dict[str, int]:
         text = text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        # Strip optional language identifier (e.g. "json\n") left by markdown fences
+        if text.startswith("json"):
+            text = text[4:].lstrip()
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
@@ -99,10 +137,17 @@ Views: {views}
 Transcript:
 {transcript}
 
+Categories:
+- tech: new technique, movement trick, mechanic discovery, parry tech, combo, exploit, advanced gameplay tip
+- skill: impressive mechanical play, aim, clutch under pressure
+- clutch/fail/funny/hype/rage/commentary/other: self-explanatory
+
+Use "tech" when the clip shows someone discovering, demonstrating, or teaching a game mechanic/technique.
+
 Respond with ONLY a JSON object (no markdown fences):
 {{
   "entertainment_score": <1-10 integer>,
-  "category": "<clutch|fail|funny|hype|rage|skill|commentary|other>",
+  "category": "<tech|clutch|fail|funny|hype|rage|skill|commentary|other>",
   "best_quote": "<most entertaining/memorable quote from transcript, max 30 chars>",
   "moment_timestamp": <approximate seconds into clip where the peak moment happens>,
   "summary": "<one sentence describing what happens>",
@@ -120,17 +165,31 @@ Views: {views}
 
 Consider gameplay intensity, streamer reactions, chat energy, comedic timing, and visual spectacle.
 
+IMPORTANT: Verify that the actual gameplay shown matches "{game}". Streamers sometimes miscategorize clips
+or leave the wrong game category set. If the clip shows a DIFFERENT game, a loading screen, a menu,
+just chatting, or no gameplay at all, set game_matches to false and identify the actual game.
+
+Categories:
+- tech: new technique, movement trick, mechanic discovery, parry tech, combo, exploit, advanced gameplay tip
+- skill: impressive mechanical play, aim, clutch under pressure
+- clutch/fail/funny/hype/rage/commentary/other: self-explanatory
+
+Use "tech" when the clip shows someone discovering, demonstrating, or teaching a game mechanic/technique.
+
 Respond with ONLY a JSON object (no markdown fences):
 {{
   "entertainment_score": <1-10 integer>,
-  "category": "<clutch|fail|funny|hype|rage|skill|commentary|other>",
+  "category": "<tech|clutch|fail|funny|hype|rage|skill|commentary|other>",
   "best_quote": "<most entertaining/memorable quote from transcript, max 30 chars>",
   "moment_timestamp": <approximate seconds into clip where the peak moment happens>,
   "summary": "<one sentence describing what happens>",
   "title_variants": ["<click-worthy YouTube title 1, max 70 chars>", "<title 2>", "<title 3>"],
   "hook_text": "<2-4 word hook overlay text for video intro, e.g. IMPOSSIBLE SAVE>",
   "visual_energy": <1-10 integer, how visually intense/dynamic the clip is>,
-  "retention_prediction": <0-100 integer, estimated percent of viewers watching to the end>
+  "retention_prediction": <0-100 integer, estimated percent of viewers watching to the end>,
+  "game_matches": <true if the actual gameplay matches "{game}", false if it's a different game or no gameplay>,
+  "detected_game": "<actual game being played if game_matches is false, otherwise same as {game}>",
+  "is_actual_gameplay": <true if the streamer is visibly engaged in playing (making in-game decisions, reacting to game events); false if they're chatting with game visible in background, having an IRL/drama moment, watching others play, on a loading screen or menu, or the game is running but they're not interacting with it>
 }}"""
 
 
@@ -140,6 +199,9 @@ def _parse_llm_response(text: str) -> dict | None:
     # Strip markdown fences if present
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    # Strip optional language identifier (e.g. "json\n") left by markdown fences
+    if text.startswith("json"):
+        text = text[4:].lstrip()
     if text.endswith("```"):
         text = text[:-3]
     text = text.strip()
@@ -150,7 +212,7 @@ def _parse_llm_response(text: str) -> dict | None:
         return None
     result["entertainment_score"] = max(1, min(10, int(result["entertainment_score"])))
 
-    valid_categories = {"clutch", "fail", "funny", "hype", "rage", "skill", "commentary", "other"}
+    valid_categories = {"tech", "clutch", "fail", "funny", "hype", "rage", "skill", "commentary", "other"}
     if result.get("category") not in valid_categories:
         result["category"] = "other"
 
@@ -171,6 +233,9 @@ def _parse_llm_response(text: str) -> dict | None:
         result.pop("hook_text", None)
 
     # Validate video-analysis fields (optional)
+    if "is_actual_gameplay" in result:
+        result["is_actual_gameplay"] = bool(result["is_actual_gameplay"])
+
     if "visual_energy" in result:
         try:
             result["visual_energy"] = max(1, min(10, int(result["visual_energy"])))
@@ -187,49 +252,39 @@ def _parse_llm_response(text: str) -> dict | None:
 
 
 def _call_gemini(prompt: str) -> str | None:
-    """Try Gemini 2.5 Flash with text. Returns raw response text or None."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    """Try Gemini with text. Returns raw response text or None."""
+    client = _get_gemini_client()
+    if not client:
         return None
 
-    try:
-        from google import genai
-    except ImportError:
-        return None
-
-    client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=_get_gemini_model(),
         contents=prompt,
     )
     return response.text
 
 
 def _call_gemini_video(video_path: str, prompt: str) -> str | None:
-    """Try Gemini 2.5 Flash with video upload. Returns raw response text or None."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    """Try Gemini with video upload. Returns raw response text or None."""
+    client = _get_gemini_client()
+    if not client:
         return None
 
-    try:
-        from google import genai
-    except ImportError:
-        return None
-
-    client = genai.Client(api_key=api_key)
     video_file = client.files.upload(file=video_path)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=_get_gemini_model(),
         contents=[video_file, prompt],
     )
     return response.text
 
 
-def _call_ollama(prompt: str, model: str = "gemma3:4b") -> str | None:
+def _call_ollama(prompt: str, model: str | None = None) -> str | None:
     """Try local Ollama. Returns raw response text or None."""
     import urllib.request
     import urllib.error
 
+    if model is None:
+        model = _get_ollama_model()
     payload = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
     req = urllib.request.Request(
         "http://localhost:11434/api/generate",

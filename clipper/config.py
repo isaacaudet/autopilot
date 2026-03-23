@@ -70,11 +70,14 @@ def get_ffmpeg() -> str:
     raise FileNotFoundError("ffmpeg not found. Install with: pip install imageio-ffmpeg")
 
 
-def get_encoder_args() -> list[str]:
+def get_encoder_args(intermediate: bool = False) -> list[str]:
     """Return FFmpeg encoder args — hardware if available, software fallback.
 
     Tries h264_videotoolbox (macOS Apple Silicon hardware encoder) first.
     Falls back to libx264 software encoding.
+
+    intermediate=True: higher bitrate for multi-pass pipelines (e.g. compilation
+    normalize step) to minimise generational loss before a second encode.
     """
     import subprocess
 
@@ -85,11 +88,14 @@ def get_encoder_args() -> list[str]:
             capture_output=True, text=True, timeout=10,
         )
         if "h264_videotoolbox" in result.stdout:
-            return ["-c:v", "h264_videotoolbox", "-q:v", "30"]
+            bitrate = "50M" if intermediate else "20M"
+            maxrate = "60M" if intermediate else "25M"
+            return ["-c:v", "h264_videotoolbox", "-b:v", bitrate, "-maxrate", maxrate]
     except (subprocess.TimeoutExpired, OSError):
         pass
 
-    return ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]
+    crf = "12" if intermediate else "18"
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", crf]
 
 
 def get_ffprobe() -> str:

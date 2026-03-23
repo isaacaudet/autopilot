@@ -17,15 +17,46 @@ console = Console()
 COMP_WIDTH = 1920
 COMP_HEIGHT = 1080
 
+# Per-game thumbnail config: (asset_filename, steam_library_hero_url, primary_color, secondary_color)
+_GAME_THUMB_CFG: dict[str, tuple[str, str, tuple, tuple]] = {
+    "deadlock": (
+        "deadlock_heroes.jpg",
+        "https://cdn.cloudflare.steamstatic.com/steam/apps/1422450/library_hero.jpg",
+        (255, 100, 0),    # orange
+        (0, 220, 220),    # cyan
+    ),
+    "marathon": (
+        "marathon_heroes.jpg",
+        "https://cdn.akamai.steamstatic.com/steam/apps/3344100/header.jpg",
+        (0, 220, 255),    # cyan-blue
+        (255, 200, 0),    # gold
+    ),
+    "arc raiders": (
+        "arcraiders_heroes.jpg",
+        "https://cdn.cloudflare.steamstatic.com/steam/apps/2418950/library_hero.jpg",
+        (255, 200, 0),    # gold
+        (220, 80, 0),     # red-orange
+    ),
+    "valorant": (
+        "valorant_heroes.jpg",
+        "https://cdn.cloudflare.steamstatic.com/steam/apps/1085660/library_hero.jpg",
+        (255, 70, 84),    # red
+        (255, 180, 0),    # gold
+    ),
+}
+
 
 def _get_duration(video_path: str) -> float:
     """Get video duration in seconds."""
     result = subprocess.run(
         [get_ffprobe(), "-v", "quiet", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=30,
     )
-    return float(result.stdout.strip())
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError(f"Could not read duration from {video_path} (ffprobe output: {result.stdout.strip()!r})")
 
 
 def _get_dimensions(video_path: str) -> tuple[int, int]:
@@ -33,9 +64,12 @@ def _get_dimensions(video_path: str) -> tuple[int, int]:
     result = subprocess.run(
         [get_ffprobe(), "-v", "quiet", "-print_format", "json",
          "-show_streams", video_path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=30,
     )
-    probe = json.loads(result.stdout)
+    try:
+        probe = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"ffprobe returned invalid JSON for {video_path}")
     for stream in probe.get("streams", []):
         if stream.get("codec_type") == "video":
             return int(stream["width"]), int(stream["height"])
@@ -103,7 +137,7 @@ def _normalize_clip(
         "-vf", vf,
         "-af", "loudnorm=I=-14:TP=-1:LRA=11",
         "-r", "30",
-        *get_encoder_args(),
+        *get_encoder_args(intermediate=True),
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
         output_path,
@@ -122,36 +156,36 @@ def build_thumbnail(
     title: str = "",
     game: str = "",
 ) -> Path | None:
-    """Generate a compilation thumbnail using Deadlock hero art + a clip frame inset.
+    """Generate a compilation thumbnail with multi-frame collage layout.
 
-    Layout:
-      - Deadlock character art (assets/deadlock_heroes.jpg) scaled to fill 1920x1080
-      - Dark gradient overlay for text readability
-      - "DEADLOCK" in massive orange Impact text (left)
-      - "DAILY HIGHLIGHTS" in cyan below
-      - Best clip frame in a stylish inset (right side, cropped to avoid HUD)
-      - Clip count badge bottom-right
+    Layout (1920x1080):
+      - Game hero art background, heavily darkened
+      - 3 best clip frames in angled/stacked layout (right 60%)
+      - Game title with glow accent (left side, massive)
+      - "BEST OF" / "DAILY HIGHLIGHTS" subtitle
+      - Streamer count + clip count badges
+      - Accent color bar at bottom
     """
     try:
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
     except ImportError:
         logger.warning("Pillow not installed — falling back to ffmpeg thumbnail")
         return _build_thumbnail_ffmpeg(clip_metas, output_path, game=game)
 
     output_path = Path(output_path)
 
-    # ── Background: Deadlock hero art ──────────────────────────────────────
+    # ── Background: game-specific hero art ─────────────────────────────────
     assets_dir = Path(__file__).parent.parent.parent / "assets"
-    bg_path = assets_dir / "deadlock_heroes.jpg"
+    game_key = (game or "deadlock").lower().strip()
+    cfg = next((v for k, v in _GAME_THUMB_CFG.items() if k in game_key), _GAME_THUMB_CFG["deadlock"])
+    asset_file, asset_url, primary_color, secondary_color = cfg
+    bg_path = assets_dir / asset_file
 
     if not bg_path.exists():
         try:
             import urllib.request
-            urllib.request.urlretrieve(
-                "https://cdn.cloudflare.steamstatic.com/steam/apps/1422450/library_hero.jpg",
-                str(bg_path),
-            )
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(asset_url, str(bg_path))
         except Exception:
             pass
 
@@ -159,63 +193,192 @@ def build_thumbnail(
 
     if bg_path.exists():
         bg = Image.open(bg_path).convert("RGB")
-        # Scale to fill full height, crop width to center
-        scale = H / bg.height
-        new_w = int(bg.width * scale)
-        bg = bg.resize((new_w, H), Image.LANCZOS)
+        scale = max(W / bg.width, H / bg.height)
+        new_w, new_h = int(bg.width * scale), int(bg.height * scale)
+        bg = bg.resize((new_w, new_h), Image.LANCZOS)
         x_off = (new_w - W) // 2
-        bg = bg.crop((x_off, 0, x_off + W, H))
+        y_off = (new_h - H) // 2
+        bg = bg.crop((x_off, y_off, x_off + W, y_off + H))
     else:
         bg = Image.new("RGB", (W, H), (10, 10, 15))
 
-    # ── Dark gradient overlay (bottom gets darker for text) ────────────────
+    # Darken background significantly for contrast
+    bg = ImageEnhance.Brightness(bg).enhance(0.35)
+    bg = ImageEnhance.Color(bg).enhance(1.4)
+
+    # ── Gradient overlays ──────────────────────────────────────────────────
+    bg = bg.convert("RGBA")
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw_ov = ImageDraw.Draw(overlay)
-    # Left half: heavier dark vignette for text area
-    for x in range(W // 2 + 100):
-        alpha = int(180 * (1 - x / (W // 2 + 100)) + 80)
+
+    # Left side gradient for text area (heavier)
+    for x in range(W // 2):
+        alpha = int(160 * (1 - x / (W // 2)))
         draw_ov.line([(x, 0), (x, H)], fill=(0, 0, 0, alpha))
+
     # Bottom gradient
-    for y in range(H // 2, H):
-        alpha = int(120 * (y - H // 2) / (H // 2))
+    for y in range(H - 200, H):
+        alpha = int(200 * (y - (H - 200)) / 200)
         draw_ov.line([(0, y), (W, y)], fill=(0, 0, 0, alpha))
-    bg = bg.convert("RGBA")
+
+    # Top gradient (subtle)
+    for y in range(120):
+        alpha = int(100 * (1 - y / 120))
+        draw_ov.line([(0, y), (W, y)], fill=(0, 0, 0, alpha))
+
     bg = Image.alpha_composite(bg, overlay).convert("RGB")
 
-    # ── Text ───────────────────────────────────────────────────────────────
+    # ── Multi-frame collage (top 3 clips by views) ────────────────────────
+    import urllib.request as _urlreq
+    import io
+
+    top_clips = sorted(clip_metas, key=lambda c: c.get("view_count", 0), reverse=True)[:3]
+    frames_loaded: list[Image.Image] = []
+
+    for clip in top_clips:
+        thumb_url = clip.get("thumbnail_url", "")
+        thumb_url = thumb_url.replace("%{width}", "1280").replace("%{height}", "720")
+        thumb_url = thumb_url.replace("{width}", "1280").replace("{height}", "720")
+        if not thumb_url:
+            continue
+        try:
+            req = _urlreq.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=10) as resp:
+                frame = Image.open(io.BytesIO(resp.read())).convert("RGB")
+            frame = ImageEnhance.Color(frame).enhance(1.2)
+            frame = ImageEnhance.Contrast(frame).enhance(1.1)
+            frames_loaded.append(frame)
+        except Exception:
+            continue
+
     draw = ImageDraw.Draw(bg)
+
+    if frames_loaded:
+        # Stacked frame layout — overlapping cards on the right side
+        frame_positions = [
+            # (x, y, w, h, rotation_placeholder)
+            (780, 60, 680, 383, 0),    # top-right: largest, main frame
+            (960, 460, 560, 315, 0),   # bottom-right: medium
+            (700, 520, 480, 270, 0),   # bottom-left of stack: smaller
+        ]
+        border_w = 5
+
+        for i, (fx, fy, fw, fh, _) in enumerate(frame_positions):
+            if i >= len(frames_loaded):
+                break
+            frame = frames_loaded[i].resize((fw, fh), Image.LANCZOS)
+
+            # Colored border (primary color for #1, secondary for others)
+            border_color = primary_color if i == 0 else secondary_color
+            draw.rectangle(
+                [fx - border_w, fy - border_w, fx + fw + border_w, fy + fh + border_w],
+                fill=border_color,
+            )
+            # Subtle shadow behind frame
+            shadow_offset = 6
+            draw.rectangle(
+                [fx + shadow_offset, fy + shadow_offset,
+                 fx + fw + shadow_offset, fy + fh + shadow_offset],
+                fill=(0, 0, 0, 80) if bg.mode == "RGBA" else (0, 0, 0),
+            )
+            bg.paste(frame, (fx, fy))
+            draw = ImageDraw.Draw(bg)
+
+            # Clip rank badge on top-left of each frame
+            badge_font_path = "/System/Library/Fonts/Supplemental/Impact.ttf"
+            try:
+                badge_font = ImageFont.truetype(badge_font_path, 36)
+            except Exception:
+                badge_font = ImageFont.load_default()
+            rank_text = f"#{i + 1}"
+            badge_x, badge_y = fx + 8, fy + 8
+            # Badge background
+            draw.rounded_rectangle(
+                [badge_x, badge_y, badge_x + 56, badge_y + 44],
+                radius=8,
+                fill=(0, 0, 0, 200) if bg.mode == "RGBA" else (0, 0, 0),
+            )
+            draw.text((badge_x + 8, badge_y + 2), rank_text, font=badge_font, fill=primary_color)
+
+    # ── Text layout ────────────────────────────────────────────────────────
     font_path = "/System/Library/Fonts/Supplemental/Impact.ttf"
 
-    def _draw_text_shadowed(d, pos, text, font, fill, shadow_color=(0, 0, 0), shadow_offset=4, border=5):
+    def _draw_text_bordered(d, pos, text, font, fill, border=6, shadow_offset=4):
         x, y = pos
+        # Black border
         for dx in range(-border, border + 1):
             for dy in range(-border, border + 1):
-                if dx != 0 or dy != 0:
-                    d.text((x + dx, y + dy), text, font=font, fill=shadow_color)
-        d.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=shadow_color)
+                if abs(dx) + abs(dy) > 0:
+                    d.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
+        # Drop shadow
+        d.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=(0, 0, 0))
         d.text(pos, text, font=font, fill=fill)
 
     try:
-        font_big = ImageFont.truetype(font_path, 148)
-        font_mid = ImageFont.truetype(font_path, 72)
-        font_sm  = ImageFont.truetype(font_path, 52)
+        font_title = ImageFont.truetype(font_path, 140)
+        font_sub = ImageFont.truetype(font_path, 64)
+        font_badge = ImageFont.truetype(font_path, 56)
+        font_date = ImageFont.truetype(font_path, 44)
     except Exception:
-        font_big = font_mid = font_sm = ImageFont.load_default()
+        font_title = font_sub = font_badge = font_date = ImageFont.load_default()
 
     game_label = (game or "DEADLOCK").upper()
-    _draw_text_shadowed(draw, (60, 260), game_label, font_big, fill=(255, 100, 0), border=7)
 
-    _draw_text_shadowed(draw, (64, 420), "DAILY HIGHLIGHTS", font_mid, fill=(0, 220, 220), border=5)
+    # Glow effect behind game title (primary color glow)
+    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow_layer)
+    glow_draw.text((60, 180), game_label, font=font_title, fill=(*primary_color, 60))
+    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=20))
+    bg = bg.convert("RGBA")
+    bg = Image.alpha_composite(bg, glow_layer).convert("RGB")
+    draw = ImageDraw.Draw(bg)
 
+    # Game title
+    _draw_text_bordered(draw, (60, 180), game_label, font_title, fill=primary_color, border=8)
+
+    # Subtitle
+    _draw_text_bordered(draw, (64, 340), "BEST HIGHLIGHTS", font_sub, fill=secondary_color, border=5)
+
+    # Date
     from datetime import date
     date_str = date.today().strftime("%b %d, %Y").upper()
-    _draw_text_shadowed(draw, (68, 510), date_str, font_sm, fill=(200, 200, 200), border=3)
+    _draw_text_bordered(draw, (68, 420), date_str, font_date, fill=(180, 180, 180), border=3)
 
-    # Clip count badge — bottom left
+    # Bottom bar — accent color strip
+    draw.rectangle([(0, H - 10), (W, H)], fill=primary_color)
+
+    # Clip count badge — bottom left with background
     clip_count = len(clip_metas)
+    streamers = set(c.get("streamer", "") for c in clip_metas if c.get("streamer"))
     badge_text = f"{clip_count} CLIPS"
-    _draw_text_shadowed(draw, (68, H - 110), badge_text, font_mid, fill=(255, 255, 255), border=5)
 
+    # Badge with background pill
+    badge_bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+    bw = badge_bbox[2] - badge_bbox[0]
+    bh = badge_bbox[3] - badge_bbox[1]
+    badge_x, badge_y = 60, H - 90
+    draw.rounded_rectangle(
+        [badge_x - 16, badge_y - 10, badge_x + bw + 16, badge_y + bh + 10],
+        radius=12,
+        fill=(0, 0, 0, 180) if bg.mode == "RGBA" else (20, 20, 20),
+    )
+    draw.text((badge_x, badge_y), badge_text, font=font_badge, fill=(255, 255, 255))
+
+    # Streamer count badge — next to clip count
+    if streamers:
+        streamer_text = f"{len(streamers)} STREAMERS"
+        s_bbox = draw.textbbox((0, 0), streamer_text, font=font_date)
+        sw = s_bbox[2] - s_bbox[0]
+        sh = s_bbox[3] - s_bbox[1]
+        sx = badge_x + bw + 48
+        draw.rounded_rectangle(
+            [sx - 12, badge_y + 2, sx + sw + 12, badge_y + sh + 14],
+            radius=10,
+            fill=(0, 0, 0, 150) if bg.mode == "RGBA" else (20, 20, 20),
+        )
+        draw.text((sx, badge_y + 6), streamer_text, font=font_date, fill=secondary_color)
+
+    bg = bg.convert("RGB")
     bg.save(str(output_path), "JPEG", quality=95)
     return output_path
 
@@ -387,13 +550,20 @@ def compile_clips(
             subtitle_path = clip.get("_subtitle_path", "")
 
             norm_path = str(Path(tmpdir) / f"clip_{i:03d}.mp4")
-            _normalize_clip(
-                clip["processed_path"], norm_path,
-                rank_text=rank_text,
-                verbose=verbose,
-                subtitle_path=subtitle_path,
-            )
+            try:
+                _normalize_clip(
+                    clip["processed_path"], norm_path,
+                    rank_text=rank_text,
+                    verbose=verbose,
+                    subtitle_path=subtitle_path,
+                )
+            except Exception as e:
+                console.print(f"  [yellow]Skipping clip {i} (normalize failed: {e})[/yellow]")
+                continue
             segments.append(norm_path)
+
+        if len(segments) < 2:
+            raise ValueError(f"Only {len(segments)} clip(s) normalized successfully, need at least 2.")
 
         if state:
             state.compile_step = "Concatenating"

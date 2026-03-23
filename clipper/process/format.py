@@ -1,10 +1,13 @@
 """Reformat video to 9:16 vertical (1080x1920) for YouTube Shorts."""
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
 from rich.console import Console
+
+logger = logging.getLogger(__name__)
 
 from clipper.config import get_ffmpeg, get_ffprobe, get_encoder_args
 from clipper.layout_profiles import load_facecam_profiles, normalize_layout_tuning, normalize_rect
@@ -73,10 +76,12 @@ def _pick_shorts_layout_mode(clip: dict | None, config: dict) -> str:
     if clip:
         raw = str(clip.get("_shorts_layout") or "").strip()
     if not raw:
-        raw = str(config.get("shorts", {}).get("layout") or "").strip()
+        # Check game-level default before falling back to global default
+        game = str((clip or {}).get("game") or "").strip()
+        game_defaults = (config.get("shorts") or {}).get("game_layout_defaults") or {}
+        raw = game_defaults.get(game) or str(config.get("shorts", {}).get("layout") or "").strip()
     raw = raw.lower()
     mode = "fill" if raw in ("fill", "stack", "stacked", "crop", "split") else "blur"
-
     return mode
 
 
@@ -160,6 +165,18 @@ def _get_hud_rect(clip: dict | None, config: dict, profile: dict | None = None) 
         except Exception:
             pass
 
+    # Check for game-level HUD defaults (e.g. Deadlock always has the same HUD layout)
+    if clip:
+        game = str(clip.get("game", "") or "").strip()
+        game_hud_defaults = fill_cfg.get("game_hud_defaults", {}) or {}
+        if isinstance(game_hud_defaults, dict):
+            game_rect = game_hud_defaults.get(game) or game_hud_defaults.get(game.lower())
+            if isinstance(game_rect, dict):
+                try:
+                    default = normalize_rect(game_rect)
+                except Exception:
+                    pass
+
     if not clip:
         return default
 
@@ -169,6 +186,7 @@ def _get_hud_rect(clip: dict | None, config: dict, profile: dict | None = None) 
 
     rect = prof.get("hud")
     if not isinstance(rect, dict):
+        # No per-streamer override — fall back to game default (or global default)
         return default
 
     try:
@@ -216,6 +234,58 @@ def _get_layout_tuning(clip: dict | None, config: dict, profile: dict | None = N
     return merged
 
 
+def _get_or_detect_facecam(video_path: Path, streamer: str, config: dict, game: str = "") -> dict | None:
+    """Return auto-detected facecam rect for a streamer with no DB profile.
+
+    - If ANY profile already exists (manual or auto-cached): return None immediately.
+      The existing profile path in _build_fill_filter handles it correctly.
+    - Otherwise: run detect_facecam_rect, cache result (even None), return rect.
+
+    Caching prevents re-running detection on every render for the same streamer.
+    A "no face found" result is stored as {auto_detected:True, facecam_enabled:False}.
+    """
+    from clipper.db import get_facecam_profile, save_facecam_profile
+
+    if streamer:
+        existing = get_facecam_profile(config, streamer)
+        if existing is not None:
+            return None  # profile exists — standard path handles it
+
+    from clipper.process.detect_facecam import detect_facecam_rect
+    logger.info("No facecam profile for %s — running auto-detection", streamer or video_path.name)
+    result = detect_facecam_rect(video_path)
+
+    # Handle new return format {"rect": ..., "tight": ...} vs old {x,y,w,h}
+    if result is None:
+        rect = None
+        tight = None
+    elif "rect" in result:
+        rect = result["rect"]
+        tight = result.get("tight")
+    else:
+        rect = result  # backwards compat
+        tight = None
+
+    if streamer:
+        profile: dict = {"auto_detected": True}
+        if rect:
+            profile["facecam"] = rect
+            if tight:
+                profile["facecam_tight"] = tight
+            profile["facecam_enabled"] = True
+            profile["facecam_fill_width"] = True  # use fill-width rendering (no blur bars)
+            # Apply game-specific tuning defaults from config
+            fill_cfg = (config.get("shorts", {}) or {}).get("fill", {}) or {}
+            auto_tuning = fill_cfg.get("auto_detect_tuning_defaults") or {}
+            game_tuning = auto_tuning.get(game) or auto_tuning.get(game.lower()) or {}
+            profile.update(game_tuning)
+        else:
+            profile["facecam_enabled"] = False  # mark as checked — skip next time
+        save_facecam_profile(config, streamer, profile)
+
+    return rect
+
+
 def _build_fill_filter(
     *,
     w: int,
@@ -223,6 +293,7 @@ def _build_fill_filter(
     facecam_h: int,
     clip: dict | None,
     config: dict,
+    auto_facecam_rect: dict | None = None,
 ) -> str:
     """Build a filter_complex that fills 9:16 with two stacked crops: facecam + gameplay."""
     fill_cfg = (config.get("shorts", {}) or {}).get("fill", {}) or {}
@@ -246,16 +317,25 @@ def _build_fill_filter(
         content_h = h
 
     # Determine per-streamer enabled flags.
-    facecam_enabled = True
+    # Facecam requires an explicit calibrated profile — random default crops
+    # look worse than no facecam. If there's no profile at all, skip the band.
+    facecam_enabled = (isinstance(prof, dict) and prof.get("facecam_enabled", True)) or auto_facecam_rect is not None
     hud_enabled = bool(hud_cfg.get("enabled", True))
     if isinstance(prof, dict):
-        if prof.get("facecam_enabled") is False:
-            facecam_enabled = False
         if prof.get("hud_enabled") is False:
             hud_enabled = False
 
-    face_rect = _get_facecam_rect(clip, config, prof)
+    face_rect = auto_facecam_rect if auto_facecam_rect is not None else _get_facecam_rect(clip, config, prof)
     hud_rect = _get_hud_rect(clip, config, prof)
+
+    # Fill-width mode: scale face to fill full band width, center-crop height.
+    # Always use fill-width when any face rect exists (auto or calibrated).
+    use_fill_width = face_rect is not None
+    # When fill_width, use tight face rect (head only) if available — avoids body in frame.
+    face_rect_for_crop = face_rect
+    if use_fill_width and isinstance(prof, dict) and prof.get("facecam_tight"):
+        face_rect_for_crop = prof["facecam_tight"]
+    use_hud_fill_width = isinstance(prof, dict) and prof.get("hud_fill_width")
 
     # Gameplay source crop. Keep this explicit-only:
     # we do not auto-derive crop bounds from HUD/facecam rects because that
@@ -265,10 +345,21 @@ def _build_fill_filter(
     top_crop = float(gameplay_cfg.get("top_crop", 0.0) or 0.0)
     top_crop = max(0.0, min(0.45, top_crop))
 
-    hud_rect_configured = isinstance(prof, dict) and isinstance((prof or {}).get("hud"), dict)
+    # HUD is "configured" if: per-streamer profile has a hud rect, OR there's a game-level default
+    _game_name = str((clip or {}).get("game", "") or "").strip()
+    _fill_cfg_local = (config.get("shorts", {}) or {}).get("fill", {}) or {}
+    _game_hud_defaults = _fill_cfg_local.get("game_hud_defaults", {}) or {}
+    _game_hud = (isinstance(_game_hud_defaults, dict) and (
+        isinstance(_game_hud_defaults.get(_game_name), dict) or
+        isinstance(_game_hud_defaults.get(_game_name.lower()), dict)
+    ))
+    hud_rect_configured = (
+        (isinstance(prof, dict) and isinstance((prof or {}).get("hud"), dict))
+        or _game_hud
+    )
     if hud_enabled and not hud_rect_configured:
         # Safety net: don't crop the gameplay or attempt a HUD overlay if the HUD
-        # rect was never calibrated for this streamer.
+        # rect was never calibrated for this streamer or game.
         hud_enabled = False
         bottom_crop = 0.0
 
@@ -319,33 +410,54 @@ def _build_fill_filter(
     facecam_x_bias = float(tuning.get("facecam_x_bias", 0.0))
     facecam_zoom = float(tuning.get("facecam_zoom", 1.0))
     facecam_zoom = max(0.5, min(2.0, facecam_zoom))
-    face_w_base = max(0.05, float(face_rect.get("w", 0.30) or 0.30))
-    face_h_base = max(0.05, float(face_rect.get("h", 0.34) or 0.34))
-    face_x_base = max(0.0, min(1.0 - face_w_base, float(face_rect.get("x", 0.0) or 0.0)))
-    face_y_base = max(0.0, min(1.0 - face_h_base, float(face_rect.get("y", 0.18) or 0.18)))
+    def _fval(v, default):
+        # Safe float: don't treat 0.0 as falsy (Python `v or default` bug)
+        return float(v if v is not None else default)
+
+    face_w_base = max(0.05, _fval(face_rect_for_crop.get("w"), 0.30))
+    face_h_base = max(0.05, _fval(face_rect_for_crop.get("h"), 0.34))
+    face_x_base = max(0.0, min(1.0 - face_w_base, _fval(face_rect_for_crop.get("x"), 0.0)))
+    face_y_base = max(0.0, min(1.0 - face_h_base, _fval(face_rect_for_crop.get("y"), 0.18)))
 
     zoom_inv = 1.0 / max(0.01, facecam_zoom)
     face_w = max(0.05, min(1.0, face_w_base * zoom_inv))
     face_h_ratio = max(0.05, min(1.0, face_h_base * zoom_inv))
 
-    # Keep the calibrated rect center stable as zoom changes.
-    base_center_x = face_x_base + (face_w_base / 2.0)
-    base_center_y = face_y_base + (face_h_base / 2.0)
-    face_x_centered = max(0.0, min(1.0 - face_w, base_center_x - (face_w / 2.0)))
-    face_y_ratio = max(0.0, min(1.0 - face_h_ratio, base_center_y - (face_h_ratio / 2.0)))
+    # ── Facecam crop strategy ─────────────────────────────────────────────
+    # Fill-width (auto-detected): crop tight_rect → scale to fill 1080px wide → center-crop height.
+    # Fit-height (calibrated): crop face_rect → scale to fit facecam_h → blur fills sides.
 
-    face_span = max(1e-6, 1.0 - face_w)
-    face_base_n = max(0.0, min(1.0, face_x_centered / face_span))
-    # Bias nudges the sampled source window relative to the calibrated base rect.
-    face_src_x_n = max(0.0, min(1.0, face_base_n + facecam_x_bias))
     if facecam_enabled:
-        face_src_x = f"max(0,min(iw-(iw*{face_w:.4f}),(iw-(iw*{face_w:.4f}))*{face_src_x_n:.4f}))"
+        # Tight crop centered on the face rect.
+        crop_x = max(0.0, min(1.0 - face_w, face_x_base + (face_w_base - face_w) / 2.0))
+        crop_y = max(0.0, min(1.0 - face_h_ratio, face_y_base + (face_h_base - face_h_ratio) / 2.0))
+
+        face_src_x = f"max(0,min(iw-(iw*{face_w:.4f}),(iw*{crop_x:.4f})))"
+
+        if use_fill_width:
+            # Fill full band width — no blur bars. Scale to fill 1080px wide,
+            # then center-crop height to facecam_h. Face fills edge-to-edge.
+            face_scale_crop = (
+                f"scale={w}:-2,"
+                f"crop={w}:{facecam_h}:0:(ih-{facecam_h})/2,"
+            )
+        else:
+            # Fit height — face fully visible, blur fills sides (calibrated streamers).
+            face_scale_crop = f"scale=-2:{facecam_h},"
+
         face = (
+            # Blur background: full source frame scaled to band, blurred
+            # Colorful gameplay background is far better than the dark webcam corner
+            f"[face_bg_src]scale={w}:{facecam_h}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{facecam_h},boxblur=30:5[face_blur];"
+            # Face: crop rect, then scale/crop per chosen strategy
             f"[face_src]crop="
             f"w=iw*{face_w:.4f}:h=ih*{face_h_ratio:.4f}:"
-            f"x='{face_src_x}':y=ih*{face_y_ratio:.4f},"
-            f"scale={w}:{facecam_h}:force_original_aspect_ratio=increase,setsar=1,"
-            f"crop={w}:{facecam_h}:x=(iw-ow)/2:y=(ih-oh)/2"
+            f"x='{face_src_x}':y=ih*{crop_y:.4f},"
+            f"{face_scale_crop}"
+            f"setsar=1[face_fit];"
+            # Overlay face centered on blur background
+            f"[face_blur][face_fit]overlay=x=(W-w)/2:y=0"
             f"[face]"
         )
 
@@ -364,6 +476,39 @@ def _build_fill_filter(
     game_overlay_x_expr = f"if(gte(W,w),(W-w)*{pan_x_n:.4f},-(w-W)*{pan_x_n:.4f})"
     # Center gameplay relative to the gameplay band height, then apply plane Y.
     game_overlay_y_center_expr = f"({game_h}-h)/2"
+
+    # When facecam is enabled, bias the gameplay pan AWAY from the webcam
+    # corner to prevent it showing twice. The 16:9→9:16 aspect ratio change
+    # with force_original_aspect_ratio=increase already hides ~47% of the
+    # source width (corner webcams are usually cropped out at center pan).
+    # This bias handles edge cases where the webcam is wide or pan is off-center.
+    if facecam_enabled:
+        fx = float(face_rect.get("x", 0))
+        fw = float(face_rect.get("w", 0))
+        if fw > 0.01:
+            webcam_right = fx + fw
+            webcam_left = fx
+            # Estimate visible fraction: output_w / scaled_game_w.
+            # scaled_game_w ≈ scale_target_h * (16/9) for typical 16:9 sources.
+            est_scaled_w = max(w + 1, scale_target_h * 16 / 9)
+            visible_frac = min(0.99, w / est_scaled_w)
+            hidden_each_side = (1.0 - visible_frac) / 2.0
+            margin = 0.02  # 2% safety margin
+
+            if webcam_right > 0.01 and fx < 0.5:
+                # Left-side webcam: need visible_start > webcam_right + margin
+                # visible_start = pan_x_n * (1 - visible_frac)
+                min_pan = (webcam_right + margin) / max(0.01, 1.0 - visible_frac)
+                pan_x_n = max(pan_x_n, min(0.85, min_pan))
+            elif webcam_left > 0.5:
+                # Right-side webcam: need visible_end < webcam_left - margin
+                # visible_end = pan_x_n * (1 - visible_frac) + visible_frac
+                max_pan = (webcam_left - margin - visible_frac) / max(0.01, 1.0 - visible_frac)
+                pan_x_n = min(pan_x_n, max(0.15, max_pan))
+
+            # Rebuild overlay expression with adjusted pan
+            game_overlay_x_expr = f"if(gte(W,w),(W-w)*{pan_x_n:.4f},-(w-W)*{pan_x_n:.4f})"
+
     game = (
         f"[game_src]crop=w=iw:h=ih*(1-{top_crop}-{bottom_crop}):x=0:y=ih*{top_crop},"
         f"scale={scale_target_w}:{scale_target_h}:force_original_aspect_ratio=increase,setsar=1"
@@ -391,32 +536,51 @@ def _build_fill_filter(
     hud_border_color = hud_border_color.replace(";", "").replace(",", "") or "white@0.95"
 
     if hud_enabled:
-        hud_filter = (
+        hud_crop = (
             f"crop=w=iw*{hud_rect['w']}:h=ih*{hud_rect['h']}:"
             f"x=iw*{hud_rect['x']}:y=ih*{hud_rect['y']},"
-            f"scale={hud_target_w}:{hud_target_h}:force_original_aspect_ratio=decrease,setsar=1"
         )
-        if hud_border_px > 0:
-            hud_filter += f",drawbox=x=0:y=0:w=iw:h=ih:color={hud_border_color}:t={hud_border_px}"
-        hud = f"[hud_src]{hud_filter}[hud]"
+        if use_hud_fill_width:
+            # Full-width strip: scale to 1080px wide, pad/crop to exact hud_h
+            hud_scale_filter = (
+                f"scale={w}:-2,"
+                f"pad={w}:{hud_h}:0:(oh-ih)/2,"
+                f"crop={w}:{hud_h}:0:(ih-{hud_h})/2,"
+                f"setsar=1"
+            )
+        else:
+            hud_scale_filter = (
+                f"scale={hud_target_w}:{hud_target_h}:"
+                f"force_original_aspect_ratio=decrease,setsar=1"
+            )
+            if hud_border_px > 0:
+                hud_scale_filter += f",drawbox=x=0:y=0:w=iw:h=ih:color={hud_border_color}:t={hud_border_px}"
+        hud = f"[hud_src]{hud_crop}{hud_scale_filter}[hud]"
 
     # Wider travel so gameplay Y behaves like a true layout-position control.
     gameplay_shift_limit = int(round(h * 0.35))
     gameplay_shift = int(round(gameplay_shift_limit * max(-1.0, min(1.0, gameplay_y_bias))))
     facecam_y_bias = float(tuning.get("facecam_y_bias", 0.0))
     face_y = max(0, int(round(h * facecam_y_bias))) if facecam_enabled else 0
-    game_y_base = (face_y + facecam_h) if facecam_enabled else max(0, safe_top)
+    # Overlap the gameplay 4px into the facecam band to eliminate any visible seam
+    # between the two content areas (the zoom overscan hides this overlap).
+    seam_overlap = 4 if facecam_enabled else 0
+    game_y_base = (face_y + facecam_h - seam_overlap) if facecam_enabled else max(0, safe_top)
     game_y = game_y_base + gameplay_shift
 
     game_overlay_y_expr = f"{game_y}+{game_overlay_y_center_expr}"
 
     # Place HUD in user-controlled location (defaults near safe-bottom center).
-    hud_overlay_x_expr = f"max(0,min(W-w,(W-w)*{hud_x_ratio:.4f}))"
-    hud_overlay_y_expr = f"max(0,min(H-h,(H-h)*{hud_y_ratio:.4f}))"
+    if use_hud_fill_width:
+        hud_overlay_x_expr = "0"
+        hud_overlay_y_expr = f"H-{hud_h}"
+    else:
+        hud_overlay_x_expr = f"max(0,min(W-w,(W-w)*{hud_x_ratio:.4f}))"
+        hud_overlay_y_expr = f"max(0,min(H-h,(H-h)*{hud_y_ratio:.4f}))"
 
     if facecam_enabled and hud_enabled:
         return (
-            "[0:v]split=4[face_src][game_src][hud_src][bg_src];"
+            "[0:v]split=5[face_src][face_bg_src][game_src][hud_src][bg_src];"
             f"{face};"
             f"{game};"
             f"{hud};"
@@ -428,7 +592,7 @@ def _build_fill_filter(
 
     if facecam_enabled and not hud_enabled:
         return (
-            "[0:v]split=3[face_src][game_src][bg_src];"
+            "[0:v]split=4[face_src][face_bg_src][game_src][bg_src];"
             f"{face};"
             f"{game};"
             f"{bg};"
@@ -497,7 +661,22 @@ def format_for_shorts(video_path: Path, config: dict, clip: dict | None = None, 
 
             ratio = float(tuning.get("facecam_band_ratio", 0.20))
             facecam_h = int(round(h * ratio))
-            vf = _build_fill_filter(w=w, h=h, facecam_h=facecam_h, clip=clip, config=config)
+
+            auto_facecam_rect: dict | None = None
+            if clip:
+                streamer = str(clip.get("streamer", "") or "").lower()
+                game = str(clip.get("game", "") or "")
+                if streamer:
+                    auto_facecam_rect = _get_or_detect_facecam(video_path, streamer, config, game=game)
+                    if auto_facecam_rect is not None:
+                        # Profile just saved with game tuning defaults (e.g. facecam_band_ratio: 0.35).
+                        # Re-read tuning so facecam_h reflects the new profile.
+                        tuning = _get_layout_tuning(clip, config)
+                        ratio = float(tuning.get("facecam_band_ratio", 0.20))
+                        facecam_h = int(round(h * ratio))
+
+            vf = _build_fill_filter(w=w, h=h, facecam_h=facecam_h, clip=clip, config=config,
+                                    auto_facecam_rect=auto_facecam_rect)
             if verbose:
                 gameplay_h = max(0, h - facecam_h)
                 console.print(

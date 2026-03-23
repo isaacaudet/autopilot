@@ -90,6 +90,7 @@ def release(verbose):
 @click.option("--auto-upload/--no-auto-upload", default=None, help="Upload processed clips after processing.")
 @click.option("--privacy", type=click.Choice(["unlisted", "private", "public"]), default=None, help="Upload privacy.")
 @click.option("--daily-limit", type=int, default=None, help="Daily cap across repeated runs (defaults to autopilot.daily_count).")
+@click.option("--upload-channels", default=None, help="Comma-separated extra channels to cross-post to (overrides autopilot.upload_channels).")
 @click.option("--verbose", "-v", is_flag=True)
 def autopilot(
     count,
@@ -102,6 +103,7 @@ def autopilot(
     auto_upload,
     privacy,
     daily_limit,
+    upload_channels,
     verbose,
 ):
     """Run autopilot shorts workflow (learn + fetch + score + process [+ optional upload])."""
@@ -152,6 +154,11 @@ def autopilot(
         if resolved_channel not in channels:
             raise click.ClickException(f"Unknown channel: {resolved_channel}")
 
+    if upload_channels:
+        config.setdefault("autopilot", {})["upload_channels"] = [
+            c.strip() for c in upload_channels.split(",") if c.strip()
+        ]
+
     today = count_output_shorts_today(config, channel=resolved_channel)
     click.echo(
         f"Autopilot run: target={resolved_count} min_score={resolved_min_score:.0f} "
@@ -189,9 +196,14 @@ def autopilot(
 @click.option("--game", default=None, help="Game name (overrides config).")
 @click.option("--duration", type=int, default=None, help="Target compilation length in minutes.")
 @click.option("--privacy", type=click.Choice(["unlisted", "private", "public"]), default=None)
+@click.option("--layout", type=click.Choice(["fill", "blur"]), default=None, help="Shorts layout override.")
+@click.option("--scope", type=click.Choice(["gamewide", "configured"]), default=None, help="Fetch scope for Shorts autopilot.")
+@click.option("--min-score", type=float, default=None, help="Minimum score threshold (overrides config).")
+@click.option("--period", default=None, help="Fetch window override (e.g. 24h, 3d, 7d).")
 @click.option("--skip-shorts", is_flag=True, help="Skip the Shorts autopilot run (compilation only).")
+@click.option("--upload-channels", default=None, help="Comma-separated extra channels to cross-post to (overrides autopilot.upload_channels).")
 @click.option("--verbose", "-v", is_flag=True)
-def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
+def daily_compilation(channel, game, duration, privacy, layout, scope, min_score, period, skip_shorts, upload_channels, verbose):
     """Fetch the previous day's best clips and build + upload a daily compilation."""
     from clipper.workflow import run_compilation_workflow
 
@@ -208,7 +220,15 @@ def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
         resolved_privacy = "unlisted"
     resolved_duration = int(duration or (config.get("compilation") or {}).get("target_minutes", 10))
     resolved_shorts_count = int(autopilot_cfg.get("daily_count", 20))
-    resolved_min_score = float(autopilot_cfg.get("min_score", 45))
+    resolved_min_score = float(min_score if min_score is not None else autopilot_cfg.get("min_score", 45))
+    resolved_period = str(period or "24h").strip()
+    if layout:
+        config.setdefault("autopilot", {})["shorts_layout"] = layout
+
+    if upload_channels:
+        config.setdefault("autopilot", {})["upload_channels"] = [
+            c.strip() for c in upload_channels.split(",") if c.strip()
+        ]
 
     click.echo(
         f"Daily compilation: game={resolved_game} channel={resolved_channel or 'auto'} "
@@ -218,7 +238,10 @@ def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
 
     # Publish any scheduled releases that are due
     from clipper.schedule import execute_releases
-    execute_releases(config, verbose=verbose)
+    try:
+        execute_releases(config, verbose=verbose)
+    except Exception as e:
+        click.echo(f"[warning] execute_releases failed (non-fatal): {e}")
 
     # Refresh YouTube analytics + retrain weights before selecting clips
     try:
@@ -232,30 +255,7 @@ def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
         if verbose:
             click.echo(f"Learning refresh failed (non-fatal): {e}")
 
-    # 1. Shorts autopilot first — populates the clip pool before compilation picks from it
-    if not skip_shorts:
-        from clipper.workflow import run_autopilot_workflow
-        click.echo(f"\nRunning Shorts autopilot ({resolved_shorts_count} clips)...")
-        result = run_autopilot_workflow(
-            config,
-            count=resolved_shorts_count,
-            min_score=resolved_min_score,
-            channel=resolved_channel,
-            game=resolved_game,
-            period="24h",
-            scope="configured",
-            auto_upload=True,
-            privacy=resolved_privacy,
-            verbose=verbose,
-            state=None,
-        )
-        click.echo(
-            f"Shorts complete: approved={result.get('approved', 0)} "
-            f"processed={result.get('processed', 0)} "
-            f"uploaded={result.get('uploaded', 0)}"
-        )
-
-    # 2. Compilation — runs after autopilot so it has a full clip pool to choose from
+    # 1. Compilation first — gets first pick of fresh gamewide clips before shorts narrows the pool
     run_compilation_workflow(
         config,
         game=resolved_game,
@@ -265,6 +265,30 @@ def daily_compilation(channel, game, duration, privacy, skip_shorts, verbose):
         privacy=resolved_privacy,
         verbose=verbose,
     )
+
+    # 2. Shorts autopilot — fetches configured-streamer clips (separate pool from gamewide compilation)
+    if not skip_shorts:
+        from clipper.workflow import run_autopilot_workflow
+        click.echo(f"\nRunning Shorts autopilot ({resolved_shorts_count} clips)...")
+        result = run_autopilot_workflow(
+            config,
+            count=resolved_shorts_count,
+            min_score=resolved_min_score,
+            channel=resolved_channel,
+            game=resolved_game,
+            period=resolved_period,
+            scope=scope or "configured",
+            auto_upload=True,
+            privacy=resolved_privacy,
+            daily_limit=resolved_shorts_count,
+            verbose=verbose,
+            state=None,
+        )
+        click.echo(
+            f"Shorts complete: approved={result.get('approved', 0)} "
+            f"processed={result.get('processed', 0)} "
+            f"uploaded={result.get('uploaded', 0)}"
+        )
 
 
 @cli.command("autopilot-cron")
@@ -316,6 +340,145 @@ def auth(channel):
         setup_meta_auth(channel, config, platform=platform)
     else:
         raise click.ClickException(f"Unknown platform: {platform}")
+
+
+@cli.command()
+@click.option("--verbose", "-v", is_flag=True)
+def crosspost(verbose):
+    """Cross-post top YouTube clips to Instagram/Facebook."""
+    from clipper.crosspost import run_crosspost
+
+    result = run_crosspost(load_config(), verbose=verbose)
+    if result.get("clip"):
+        click.echo(f"Cross-posted: {result['clip'][:50]}")
+        if result.get("instagram"):
+            click.echo(f"  Instagram: {result['instagram']}")
+        if result.get("facebook"):
+            click.echo(f"  Facebook: {result['facebook']}")
+    else:
+        click.echo("Nothing to cross-post.")
+
+
+@cli.command()
+def calendar():
+    """Show the upcoming release schedule."""
+    from clipper.schedule import show_calendar
+
+    show_calendar(load_config())
+
+
+@cli.command()
+@click.option("--channel", "-c", default=None, help="Filter by channel.")
+def status(channel):
+    """Show pipeline health: tokens, release queue, recent uploads, cron status."""
+    from datetime import datetime
+    from rich.console import Console
+    from rich.table import Table
+    from clipper.db import get_db
+    from clipper.cron import get_status
+    from clipper.upload.auth import validate_token
+    from clipper.config import get_project_root
+
+    console = Console()
+    config = load_config()
+    conn = get_db(config)
+    root = get_project_root()
+
+    # Token health
+    console.print("[bold]Tokens:[/bold]")
+    for ch_key, ch_conf in config.get("channels", {}).items():
+        token_file = ch_conf.get("token_file", "")
+        if token_file:
+            valid, msg = validate_token(str(root / token_file))
+            icon = "[green]OK[/green]" if valid else "[red]FAIL[/red]"
+            console.print(f"  {ch_key}: {icon} — {msg}")
+    console.print()
+
+    # Shorts processed today
+    from clipper.workflow import count_output_shorts_today
+    shorts_today = count_output_shorts_today(config, channel=channel)
+    daily_count = (config.get("autopilot", {}) or {}).get("daily_count", 7)
+    console.print(f"[bold]Shorts today:[/bold] {shorts_today}/{daily_count}")
+    console.print()
+
+    # Cron health
+    cron = get_status()
+    console.print("[bold]Cron jobs:[/bold]")
+    for job in ("autopilot", "marathon", "release", "crosspost"):
+        key = f"{job}_installed"
+        installed = cron.get(key, False)
+        console.print(f"  {job}: {'[green]active[/green]' if installed else '[red]not installed[/red]'}")
+    console.print()
+
+    # Release queue summary
+    ch_filter = "AND r.channel = ?" if channel else ""
+    params = [channel] if channel else []
+
+    pending = conn.execute(
+        f"SELECT COUNT(*) as n FROM releases r WHERE status IN ('pending','executing') {ch_filter}",
+        params,
+    ).fetchone()["n"]
+    failed_24h = conn.execute(
+        f"SELECT COUNT(*) as n FROM releases r WHERE status='failed' AND datetime(scheduled_at) > datetime('now','-24 hours') {ch_filter}",
+        params,
+    ).fetchone()["n"]
+    published_24h = conn.execute(
+        f"SELECT COUNT(*) as n FROM releases r WHERE status IN ('published','uploaded') AND datetime(scheduled_at) > datetime('now','-24 hours') {ch_filter}",
+        params,
+    ).fetchone()["n"]
+
+    console.print(
+        f"[bold]Releases (24h):[/bold] "
+        f"[green]{published_24h} published[/green]  "
+        f"[yellow]{pending} pending[/yellow]  "
+        f"[red]{failed_24h} failed[/red]"
+    )
+    console.print()
+
+    # Recent failures
+    failures = conn.execute(
+        f"SELECT r.id, r.clip_id, r.channel, r.last_error, r.scheduled_at "
+        f"FROM releases r WHERE r.status='failed' AND datetime(r.scheduled_at) > datetime('now','-24 hours') {ch_filter} "
+        f"ORDER BY r.scheduled_at DESC LIMIT 5",
+        params,
+    ).fetchall()
+    if failures:
+        table = Table(title="Recent failures")
+        table.add_column("ID", style="dim")
+        table.add_column("Channel")
+        table.add_column("Scheduled")
+        table.add_column("Error")
+        for f in failures:
+            f = dict(f)
+            table.add_row(
+                str(f["id"]),
+                f["channel"],
+                f["scheduled_at"][-11:-1] if f["scheduled_at"] else "?",
+                (f.get("last_error") or "")[:60],
+            )
+        console.print(table)
+        console.print()
+
+    # Upcoming releases
+    upcoming = conn.execute(
+        f"SELECT r.id, r.clip_id, r.channel, r.status, r.scheduled_at, c.streamer, c.title "
+        f"FROM releases r LEFT JOIN clips c ON r.clip_id = c.id "
+        f"WHERE r.status IN ('pending','uploaded','executing') {ch_filter} "
+        f"ORDER BY r.scheduled_at LIMIT 8",
+        params,
+    ).fetchall()
+    if upcoming:
+        table = Table(title="Upcoming releases")
+        table.add_column("Time")
+        table.add_column("Channel")
+        table.add_column("Status")
+        table.add_column("Clip")
+        for u in upcoming:
+            u = dict(u)
+            sched = u["scheduled_at"][-11:-1] if u["scheduled_at"] else "?"
+            label = f"{u.get('streamer', '?')} — {(u.get('title') or '?')[:30]}"
+            table.add_row(sched, u["channel"], u["status"], label)
+        console.print(table)
 
 
 def main():

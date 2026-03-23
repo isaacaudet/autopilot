@@ -1,5 +1,6 @@
 """Burn subtitles into video using FFmpeg."""
 
+import functools
 import hashlib
 import re
 import subprocess
@@ -354,6 +355,107 @@ def _get_subscribe_assets() -> tuple[Path | None, Path | None]:
     return None, None
 
 
+def _render_follow_cta_png(config: dict, clip: dict | None = None) -> Path | None:
+    """Render a 'FOLLOW FOR MORE' CTA overlay as RGBA PNG for Instagram.
+
+    Positioned at the bottom of the screen (similar placement to subscribe CTA).
+    Clean, minimal design: rounded pill shape with 'FOLLOW' text + profile icon.
+    """
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return None
+
+    shorts_cfg = config.get("shorts", {}) or {}
+    w = int(shorts_cfg.get("width", 1080) or 1080)
+    h = int(shorts_cfg.get("height", 1920) or 1920)
+
+    queue_dir = config.get("_queue_dir")
+    if not isinstance(queue_dir, Path):
+        queue_dir = Path("queue")
+    cache_dir = queue_dir / "hook_overlays"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_key = f"follow_cta_v2_{w}x{h}"
+    overlay_path = cache_dir / f"{cache_key}.png"
+    if overlay_path.exists():
+        return overlay_path
+
+    main_font_path = _first_existing_path(_HOOK_MAIN_FONT_CANDIDATES)
+    if not main_font_path:
+        return None
+
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    # Button dimensions and position
+    btn_text = "FOLLOW FOR MORE"
+    font_size = 52
+    font = _load_hook_font(main_font_path, font_size, emoji=False)
+    if not font:
+        return None
+
+    bbox = draw.textbbox((0, 0), btn_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pad_x, pad_y = 60, 28
+    btn_w = text_w + 2 * pad_x
+    btn_h = text_h + 2 * pad_y
+    btn_x = (w - btn_w) // 2
+    btn_y = h - 340  # above progress bar area
+
+    # Draw pill-shaped button background
+    radius = btn_h // 2
+    # Background pill (Instagram gradient: purple-pink-orange)
+    pill = Image.new("RGBA", (btn_w, btn_h), (0, 0, 0, 0))
+    pill_draw = ImageDraw.Draw(pill)
+    pill_draw.rounded_rectangle(
+        [(0, 0), (btn_w - 1, btn_h - 1)],
+        radius=radius,
+        fill=(225, 48, 108, 230),  # Instagram pink
+    )
+    # Gradient accent — left side more purple, right side more orange
+    for x in range(btn_w):
+        t = x / btn_w
+        r = int(131 + (253 - 131) * t)  # purple→orange
+        g = int(58 + (89 - 58) * t * 0.3)
+        b = int(180 + (0 - 180) * t)
+        alpha = 140
+        pill_draw.line([(x, 0), (x, btn_h - 1)], fill=(r, g, b, alpha))
+
+    # Re-draw rounded rect as a mask to clip the gradient
+    mask = Image.new("L", (btn_w, btn_h), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle(
+        [(0, 0), (btn_w - 1, btn_h - 1)],
+        radius=radius,
+        fill=255,
+    )
+    pill.putalpha(mask)
+
+    canvas.paste(pill, (btn_x, btn_y), pill)
+
+    # Draw "FOLLOW FOR MORE" text centered in button
+    draw = ImageDraw.Draw(canvas)  # re-create after paste
+    text_x = btn_x + (btn_w - text_w) // 2
+    text_y = btn_y + (btn_h - text_h) // 2 - 2
+    # Shadow
+    draw.text((text_x + 2, text_y + 2), btn_text, font=font, fill=(0, 0, 0, 120))
+    # Main text
+    draw.text((text_x, text_y), btn_text, font=font, fill=(255, 255, 255, 255))
+
+    # Small arrow/chevron indicator below button
+    arrow_y = btn_y + btn_h + 16
+    arrow_font = _load_hook_font(main_font_path, 32, emoji=False)
+    if arrow_font:
+        arrow_text = "▼"
+        abbox = draw.textbbox((0, 0), arrow_text, font=arrow_font)
+        aw = abbox[2] - abbox[0]
+        draw.text(((w - aw) // 2, arrow_y), arrow_text, font=arrow_font, fill=(255, 255, 255, 160))
+
+    canvas.save(overlay_path)
+    return overlay_path
+
+
 def _build_hook_filter(hook_text: str, config: dict, clip: dict | None = None, duration: float = 2.0) -> str:
     """Build FFmpeg drawtext filters for the first-frame hook overlay.
 
@@ -436,6 +538,19 @@ def _build_censor_audio_filter(censor_ranges: list[tuple[float, float]]) -> str:
     return f"volume='if({conditions},0,1)':eval=frame"
 
 
+@functools.lru_cache(maxsize=1)
+def _ffmpeg_filter_support() -> tuple[bool, bool]:
+    """Check FFmpeg subtitle filter support. Cached at module level."""
+    ffmpeg_bin = get_ffmpeg()
+    try:
+        check = subprocess.run(
+            [ffmpeg_bin, "-filters"], capture_output=True, text=True
+        )
+        return ("ass" in check.stdout, "subtitles" in check.stdout)
+    except FileNotFoundError:
+        return (False, False)
+
+
 def burn_subtitles(
     video_path: Path,
     subtitle_path: Path,
@@ -446,11 +561,18 @@ def burn_subtitles(
     verbose: bool = False,
     output_name: str | None = None,
     censor_ranges: list | None = None,
+    skip_subscribe_cta: bool = False,
+    encoder_preset: str | None = None,
+    follow_cta: bool = False,
 ) -> Path:
     """Burn subtitles (ASS or SRT) into a video file using FFmpeg.
 
     ASS files carry their own styling. SRT files get force_style applied.
     Returns the Path to the output video with burned-in subtitles.
+
+    encoder_preset: If set (e.g. "veryfast"), override the default encoder with
+    libx264 at this preset. Useful for cross-platform copies where the receiving
+    platform recompresses anyway.
     """
     video_path = Path(video_path)
     subtitle_path = Path(subtitle_path)
@@ -463,16 +585,8 @@ def burn_subtitles(
 
     ffmpeg_bin = get_ffmpeg()
 
-    # Check that the ffmpeg binary has subtitle support
-    try:
-        check = subprocess.run(
-            [ffmpeg_bin, "-filters"], capture_output=True, text=True
-        )
-        has_ass = "ass" in check.stdout
-        has_subtitles = "subtitles" in check.stdout
-    except FileNotFoundError:
-        console.print("[red]ffmpeg not found.[/red]")
-        return video_path
+    # Check that the ffmpeg binary has subtitle support (cached)
+    has_ass, has_subtitles = _ffmpeg_filter_support()
 
     if not has_ass and not has_subtitles:
         console.print(
@@ -517,22 +631,6 @@ def burn_subtitles(
         zoom_filter = _build_zoom_filter()
         vf = f"{zoom_filter},{vf}"
 
-    # Title card — first 1.5s of Shorts so it shows in feed previews.
-    if is_shorts and clip:
-        # Strip non-ASCII (emoji) and chars that break filter_complex quoting (' : ; [ ])
-        raw_title = "".join(
-            c for c in (clip.get("title") or "")
-            if ord(c) < 128 and c not in ("'", ":", ";", "[", "]", "\\")
-        )[:48].strip()
-        if raw_title:
-            title_esc = raw_title.replace("'", "\\'").replace(":", "\\:")
-            vf += (
-                f",drawtext=text='{title_esc}'"
-                f":font=Impact:fontsize=40"
-                f":fontcolor=white:borderw=3:bordercolor=black"
-                f":x=(w-text_w)/2:y=80"
-                f":enable='between(t,0,1.5)'"
-            )
 
     hook_overlay_path: Path | None = None
     hook_duration = float(clip.get("_hook_duration", 2.0)) if clip else 2.0
@@ -578,26 +676,41 @@ def burn_subtitles(
                 vf = f"{vf},{hook_filter}"
 
     # Subscribe CTA overlay — animated WebM with bell sound over the last 6s.
+    # Skipped for non-YouTube platforms (Instagram/TikTok get clean video).
     sub_anim_path: Path | None = None
     sub_bell_path: Path | None = None
-    if is_shorts:
+    if is_shorts and not skip_subscribe_cta and not follow_cta:
         shorts_cfg_inner = config.get("shorts", {}) or {}
         if shorts_cfg_inner.get("subscribe_cta", True):
             sub_anim_path, sub_bell_path = _get_subscribe_assets()
+
+    # Instagram Follow CTA — static PNG overlay in last ~4s of clip.
+    follow_overlay_path: Path | None = None
+    if is_shorts and follow_cta and vid_duration and vid_duration > 10.0:
+        follow_overlay_path = _render_follow_cta_png(config, clip=clip)
 
     audio_args = []
     if censor_ranges:
         audio_args.extend(["-af", _build_censor_audio_filter(censor_ranges)])
     audio_args.extend(["-c:a", "aac", "-b:a", "256k"])
 
-    # Build PNG overlay chain: hook (start) → subscribe CTA (end).
+    # Build PNG overlay chain: hook (start) → follow/subscribe CTA (end).
     png_overlays: list[dict] = []
     if hook_overlay_path is not None:
         png_overlays.append({
             "path": hook_overlay_path,
             "label": "hook",
             "fade": "",
-            "enable": f"between(t,0.1,{hook_duration:.2f})",
+            "enable": f"between(t,0,{hook_duration:.2f})",
+        })
+    if follow_overlay_path is not None:
+        follow_start = max(0.5, vid_duration - 4.0)
+        fade_in = ",fade=t=in:st=0:d=0.3:alpha=1"
+        png_overlays.append({
+            "path": follow_overlay_path,
+            "label": "follow",
+            "fade": fade_in,
+            "enable": f"between(t,{follow_start:.2f},{vid_duration:.2f})",
         })
     # Animated subscribe CTA — last ~6s of the clip.
     # Requires vid_duration > 10s to avoid dominating short clips.
@@ -614,6 +727,12 @@ def burn_subtitles(
 
     filter_complex: str | None = None
     use_bell_audio = use_anim_cta
+
+    # Resolve encoder args — use fast preset override if requested
+    if encoder_preset:
+        enc_args = ["-c:v", "libx264", "-preset", encoder_preset, "-crf", "20"]
+    else:
+        enc_args = list(get_encoder_args())
 
     if png_overlays or use_anim_cta:
         filter_parts = [f"[0:v]{vf}[base]"]
@@ -640,7 +759,7 @@ def burn_subtitles(
             if sub_start > 0.05:
                 filter_parts.append(
                     f"movie='{anim_escaped}',"
-                    f"crop=630:380:645:700,scale=560:-1,setsar=1,format=rgba[ani_raw]"
+                    f"crop=630:380:645:700,scale=560:-2,setsar=1,format=rgba[ani_raw]"
                 )
                 filter_parts.append(
                     f"color=s=560x338:d={sub_start:.3f}:r=30,"
@@ -650,10 +769,10 @@ def burn_subtitles(
             else:
                 filter_parts.append(
                     f"movie='{anim_escaped}',"
-                    f"crop=630:380:645:700,scale=560:-1,setsar=1,format=rgba[sub_anim]"
+                    f"crop=630:380:645:700,scale=560:-2,setsar=1,format=rgba[sub_anim]"
                 )
             filter_parts.append(
-                f"[{prev_label}][sub_anim]overlay=(W-w)/2:H-h-80:format=auto:eof_action=pass[v]"
+                f"[{prev_label}][sub_anim]overlay=(W-w)/2:H-h-280:eof_action=pass[v]"
             )
             prev_label = "v"
         else:
@@ -670,7 +789,7 @@ def burn_subtitles(
                 f"amovie='{bell_escaped}',adelay={bell_delay_ms}|{bell_delay_ms}[bell]"
             )
             filter_parts.append(
-                "[0:a][bell]amix=inputs=2:duration=first:weights=1 0.35[a]"
+                "[0:a][bell]amix=inputs=2:duration=first:weights='1 0.35'[a]"
             )
 
         if prev_label != "v" and png_overlays and not use_anim_cta:
@@ -687,7 +806,7 @@ def burn_subtitles(
             "-filter_complex", filter_complex,
             "-map", "[v]",
             "-map", audio_map,
-            *get_encoder_args(),
+            *enc_args,
             *(audio_args if not use_bell_audio else [a for a in audio_args if not a.startswith("-af")]),
             "-c:a", "aac", "-b:a", "256k",
             "-movflags", "+faststart",
@@ -699,7 +818,7 @@ def burn_subtitles(
             ffmpeg_bin,
             "-i", str(video_path),
             "-vf", vf,
-            *get_encoder_args(),
+            *enc_args,
             *audio_args,
             "-movflags", "+faststart",
             "-y",

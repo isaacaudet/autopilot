@@ -49,7 +49,7 @@ def _load_token(token_path: Path) -> dict:
 def _refresh_token_if_needed(token_data: dict, token_path: Path) -> str:
     """Return a valid access token, refreshing if expired."""
     expires_at = token_data.get("expires_at", 0)
-    if time.time() < expires_at - 300:  # 5 min buffer
+    if time.time() < expires_at - 300 and "access_token" in token_data:  # 5 min buffer
         return token_data["access_token"]
 
     refresh_token = token_data.get("refresh_token")
@@ -69,6 +69,8 @@ def _refresh_token_if_needed(token_data: dict, token_path: Path) -> str:
     resp.raise_for_status()
     data = resp.json()
 
+    if "access_token" not in data:
+        raise RuntimeError(f"TikTok token refresh failed: {data.get('error_description') or data}")
     token_data["access_token"] = data["access_token"]
     token_data["refresh_token"] = data.get("refresh_token", refresh_token)
     token_data["expires_at"] = time.time() + data.get("expires_in", 86400)
@@ -88,15 +90,62 @@ def _query_creator_info(access_token: str) -> dict:
     return resp.json()
 
 
+_TT_CAPTION_PROMPT = """\
+You write viral TikTok captions for gaming clips.
+
+Clip metadata:
+- Streamer: {streamer}
+- Game: {game}
+- Title: {title}
+- Duration: {duration}s
+- Views: {views}
+
+Write ONE short hook sentence (max 12 words) + 3-5 relevant hashtags on the same line.
+Focus on the action/emotion, NOT the streamer name or game title.
+Do NOT use quotation marks. Do NOT start with "Watch" or "Check out".
+Always include #gaming and #fyp. Add 1-2 game-specific tags.
+Example: "Nobody saw that coming 💀 #gaming #fyp #deadlock #clutch"
+
+Respond with ONLY the caption line, nothing else."""
+
+
+def _gemini_hook(clip: dict) -> str | None:
+    """Generate a TikTok caption via Gemini. Returns None on failure."""
+    try:
+        from clipper.process.analyze import _get_gemini_client, _get_gemini_model
+        client = _get_gemini_client()
+        if not client:
+            return None
+        title = (clip.get("_title_override") or clip.get("title", "")).replace(" #Shorts", "").strip()
+        prompt = _TT_CAPTION_PROMPT.format(
+            streamer=clip.get("streamer", "unknown"),
+            game=clip.get("game", "unknown"),
+            title=title,
+            duration=int(float(clip.get("duration", 0) or 0)),
+            views=clip.get("view_count", 0),
+        )
+        resp = client.models.generate_content(model=_get_gemini_model(), contents=prompt)
+        hook = (resp.text or "").strip().strip('"').strip("'")
+        return hook if hook else None
+    except Exception as e:
+        logger.warning("Gemini TikTok caption generation failed: %s", e)
+        return None
+
+
 def _build_caption(clip: dict, config: dict) -> str:
     """Build a TikTok caption from clip metadata (max 2200 chars)."""
     title = clip.get("_title_override") or clip.get("title", "")
-    # Strip YouTube-specific #Shorts suffix
     title = title.replace(" #Shorts", "").strip()
 
     streamer = clip.get("streamer", "")
     game = clip.get("game", "")
 
+    # Try Gemini-generated caption first (includes hashtags)
+    hook = _gemini_hook(clip)
+    if hook:
+        return hook[:2200]
+
+    # Fallback: manual construction
     hashtags = []
     if game:
         hashtags.append(f"#{game.replace(' ', '').lower()}")
@@ -122,13 +171,14 @@ def _poll_publish_status(access_token: str, publish_id: str, max_wait: int = 300
         data = resp.json().get("data", {})
         status = data.get("status")
 
-        if status == "PUBLISH_COMPLETE":
+        if status in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"):
             return True
         if status == "FAILED":
             logger.error("TikTok publish failed: %s", data.get("fail_reason"))
             return False
+        logger.debug("TikTok status: %s", status)
 
-        time.sleep(10)
+        time.sleep(5)
 
     logger.error("TikTok publish timed out after %ds", max_wait)
     return False
@@ -157,18 +207,13 @@ def upload_clip(clip, config, privacy="unlisted", verbose=False, channel=None) -
         # Step 1: Query creator info
         _query_creator_info(access_token)
 
-        # Step 2: Init upload
+        # Step 2: Init upload — inbox endpoint (works in sandbox).
+        # Videos appear in TikTok creator inbox for review/posting.
+        # To post directly as private: requires Direct Post API audit approval.
         init_resp = requests.post(
-            f"{API_BASE}/v2/post/publish/video/init/",
+            f"{API_BASE}/v2/post/publish/inbox/video/init/",
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json={
-                "post_info": {
-                    "title": caption,
-                    "privacy_level": tt_privacy,
-                    "disable_duet": False,
-                    "disable_comment": False,
-                    "disable_stitch": False,
-                },
                 "source_info": {
                     "source": "FILE_UPLOAD",
                     "video_size": file_size,

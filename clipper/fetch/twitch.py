@@ -28,7 +28,10 @@ def _get_app_access_token(client_id: str, client_secret: str) -> str:
         timeout=15,
     )
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    token = resp.json().get("access_token")
+    if not token:
+        raise RuntimeError(f"Twitch token response missing access_token: {resp.text[:200]}")
+    return token
 
 
 def _parse_period(period: str) -> datetime:
@@ -188,16 +191,16 @@ def _fetch_top_games(headers: dict, count: int = 20) -> dict[str, str]:
 def _standardize_clip(clip: dict) -> dict:
     """Convert a Twitch Helix clip object to our standardized format."""
     return {
-        "id": clip["id"],
-        "title": clip["title"],
-        "url": clip["url"],
-        "duration": clip["duration"],
-        "view_count": clip["view_count"],
-        "streamer": clip["broadcaster_name"],
+        "id": clip.get("id", ""),
+        "title": clip.get("title", ""),
+        "url": clip.get("url", ""),
+        "duration": clip.get("duration", 0),
+        "view_count": clip.get("view_count", 0),
+        "streamer": clip.get("broadcaster_name", ""),
         "game": clip.get("game_id", ""),
-        "thumbnail_url": clip["thumbnail_url"],
+        "thumbnail_url": clip.get("thumbnail_url", ""),
         "platform": "twitch",
-        "created_at": clip["created_at"],
+        "created_at": clip.get("created_at", ""),
         "language": clip.get("language", ""),
     }
 
@@ -317,12 +320,15 @@ def fetch_twitch_clips(
         else:
             sorted_games = list(top_games.items())
 
-        # Two sweeps: short window (3h) catches clips blowing up RIGHT NOW,
-        # long window (24h) catches proven performers. The velocity scoring
-        # will rank the fresh high-velocity clips above stale high-view clips.
+        # Three sweeps with decreasing freshness, increasing view requirements:
+        # 1h: ultra-fresh clips just starting to pop (very low bar)
+        # 3h: clips actively blowing up (low bar)
+        # 24h: proven performers (standard bar)
+        # The velocity scoring will rank fresh high-velocity clips above stale ones.
         sweeps = [
-            ("3h", _parse_period("3h"), max(20, min_views // 5)),  # lower bar for fresh clips
-            ("24h", _parse_period("24h"), min_views),
+            ("1h", _parse_period("1h"), max(10, min_views // 10)),  # ultra-fresh, minimal bar
+            ("3h", _parse_period("3h"), max(20, min_views // 5)),   # fresh clips
+            ("24h", _parse_period("24h"), min_views),                # proven performers
         ]
 
         for sweep_label, sweep_start, sweep_min_views in sweeps:
