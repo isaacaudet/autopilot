@@ -1,24 +1,11 @@
 targets:
   twitch:
-    streamers: [
-      # Tier 1 — highest viewership / proven performers
-      supertf, singsing, aimbotcalvin, deathydl,
-      # Big names (intermittent Deadlock)
-      xqc, shroud,
-      # Skilled / Deadlock-native
-      surefour, eido, draskyl, averagejonas, anathan, eskay,
-      # Personality / clip-friendly
-      boxaroni, fredthefinch, thes1tuation, cdnthe3rd, wayneradiotv,
-      # Proven on this channel
-      noxtism, goober70,
-      # Rising / gamewide performers
-      incon, evafps, metro, lacari,
-    ]
-    games: [Deadlock, ARC Raiders, Valorant, Marathon]
+    streamers: []  # Add Twitch usernames to monitor
+    games: []      # Add game names (e.g. Deadlock, Valorant)
     clips_per_source: 100
     period: 24h
   kick:
-    streamers: [adin, n3on]
+    streamers: []
     clips_per_source: 100
   youtube:
     channels: []
@@ -33,7 +20,7 @@ settings:
 autopilot:
   daily_count: 7
   min_score: 65
-  game: Deadlock
+  game: ""
   scope: configured
   pre_llm_screen: true
   fallback_to_gamewide: false
@@ -48,32 +35,26 @@ autopilot:
   allow_uncalibrated_fallback: true
   profile_bonus_points: 8.0
   max_clips_per_streamer: 2
-  # Priority streamers: pushed to top of selection queue regardless of score
-  priority_streamers: [deathydl]
-  priority_streamer_bonus: 25.0   # added to rank_score — floats above any normal clip
-  priority_streamer_max_clips: 4  # deathydl can fill up to 4 slots per run
-  # Cross-post same clips to these channels after primary upload.
-  # Instagram/Facebook are intentionally excluded — crosspost.py handles them
-  # with a quality filter (min_views threshold) instead of queuing all 8 daily clips.
-  upload_channels:
-    - tiktok_main
+  priority_streamers: []
+  priority_streamer_bonus: 25.0
+  priority_streamer_max_clips: 4
+  upload_channels: []
 
 upload:
   title_template: "{title} | {streamer} {game}"
   description_template: |
-    {streamer} with an insane {game} moment 🎮
+    {streamer} with an insane {game} moment
 
     Watch {streamer} live: {url}
 
-    Subscribe for daily highlights from Deadlock's best players ↑
+    Subscribe for daily highlights ↑
 
     {tags_as_hashtags}
 
-    #shorts #{game_tag} #{streamer_tag} #clips #twitch #gaming #funny #viral
+    #shorts #{game_tag} #{streamer_tag} #clips #twitch #gaming
   default_privacy: unlisted
-  max_uploads_per_day: 50    # API costs 100 units per upload now (changed Dec 2025), 10k quota = 100 max
+  max_uploads_per_day: 50
 
-  # Extra tags appended to every upload (high-volume search terms)
   global_tags:
     - gaming
     - gaming highlights
@@ -81,132 +62,57 @@ upload:
     - best clips
     - twitch clips
     - stream highlights
-    - streamer clips
-    - viral clips
-    - highlight
 
-  # Set a custom thumbnail from the clip (scene detection + saturation boost)
   extract_thumbnail: true
 
 subtitles:
-  whisper_model: large-v3    # better accuracy for gaming audio with loud SFX
-  font_size: 52              # large Impact text — fills screen width, readable on mobile
-  outline_width: 5           # thick outline for contrast on any background
-  words_per_phrase: 3        # 2-3 words per subtitle line
+  whisper_model: large-v3
+  font_size: 52
+  outline_width: 5
+  words_per_phrase: 3
 
 shorts:
   width: 1080
   height: 1920
-  layout: fill              # fill = facecam+gameplay stack with HUD overlay; blur = blurred background
-  game_layout_defaults:     # per-game overrides — applied when _shorts_layout is not explicitly set
-    Marathon: blur          # Marathon has no calibrated facecam profiles
-  subtitle_margin_v: 450    # bumped from 80 — places text in lower-center safe zone
+  layout: fill
+  game_layout_defaults: {}
+  subtitle_margin_v: 450
   fill:
     gameplay:
-      zoom: 1.0             # 1.0 = show full source height (no bottom crop); >1.0 clips HP bars
-      zoom_no_facecam: 1.08 # slightly tighter when no facecam, still leaves breathing room
+      zoom: 1.0
+      zoom_no_facecam: 1.08
     hud:
       border_px: 4
       border_color: "white@0.95"
-    # Tuning defaults applied when auto-detection finds a facecam (no manual profile).
-    # These match calibrated Deadlock profiles (eido/supertf) so auto-detected streamers
-    # get the same layout without manual calibration.
-    auto_detect_tuning_defaults:
-      Deadlock:
-        facecam_band_ratio: 0.22     # ~22% band — just head, not full body
-        facecam_zoom: 1.0
-        gameplay_zoom: 0.8           # zoom out gameplay so it doesn't cover bottom
-        gameplay_y_bias: -0.25       # shift gameplay up, exposing HUD band at bottom
-        hud_enabled: true
-        hud_fill_width: true         # render HUD as full-width strip at bottom
-        hud_height_ratio: 0.10       # 10% of 1920 = 192px strip at bottom
-        hud_scale: 1.65
-        hud_x_ratio: 0.5
-        hud_y_ratio: 0.95
-        title_y_ratio: 0.24
-        subtitle_margin_ratio: 0.25
-    # Game-level HUD rects — enabled for all clips of matching game (no per-streamer calibration needed)
-    # Coordinates are 0..1 normalized to source frame (1920x1080)
-    game_hud_defaults:
-      Deadlock:
-        x: 0.0    # abilities + health bar starts at left edge
-        y: 0.84   # bottom ~16% of screen
-        w: 0.58   # covers left half where abilities/HP live
-        h: 0.16
+    auto_detect_tuning_defaults: {}
+    game_hud_defaults: {}
 
 compilation:
-  target_minutes: 10    # aim for ~10 minutes
-  min_minutes: 5        # refuse to upload if shorter than this
+  target_minutes: 10
+  min_minutes: 5
 
 crosspost:
-  min_yt_views: 10000    # only clips with 10k+ YouTube views go to Instagram/Facebook
-  min_age_hours: 12      # reserved for future use (min hours since YouTube upload)
+  min_yt_views: 10000
+  min_age_hours: 12
 
 instagram:
-  # Binary upload is now used — no public URL required. This field is ignored.
   video_base_url: ""
 
 channels:
   default:
     name: "Main Channel"
     platform: youtube
-    game: Deadlock
     token_file: ".clipper_token.json"
     default_privacy: public
     schedule:
       shorts_per_day: 7
       release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00", "22:00"]
-  class_instantiate:
-    name: "Pro Marathon YouTube"
-    platform: youtube
-    game: Marathon
-    token_file: ".clipper_token_class_instantiate.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 7
-      release_times: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00", "20:00", "22:00"]
-  tiktok_main:
-    name: "TikTok Main"
-    platform: tiktok
-    game: Deadlock
-    token_file: ".clipper_tiktok_main.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 3
-      release_times: ["08:00", "13:00", "19:00"]
-  instagram_main:
-    name: "Instagram Reels"
-    platform: instagram
-    game: Deadlock
-    token_file: ".clipper_instagram_main.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 2
-      release_times: ["11:00", "19:00"]
-  facebook_main:
-    name: "Facebook Reels"
-    platform: facebook
-    game: Deadlock
-    token_file: ".clipper_facebook_main.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 2
-      release_times: ["13:00", "19:00"]
-  instagram_marathon:
-    name: "Pro Marathon Instagram"
-    platform: instagram
-    game: Marathon
-    token_file: ".clipper_instagram_marathon.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 2
-      release_times: ["11:00", "19:00"]
-  tiktok_marathon:
-    name: "Pro Marathon TikTok"
-    platform: tiktok
-    game: Marathon
-    token_file: ".clipper_tiktok_marathon.json"
-    default_privacy: public
-    schedule:
-      shorts_per_day: 3
-      release_times: ["08:00", "13:00", "19:00"]
+  # Add more channels as needed:
+  # my_tiktok:
+  #   name: "TikTok"
+  #   platform: tiktok
+  #   token_file: ".clipper_tiktok.json"
+  #   default_privacy: public
+  #   schedule:
+  #     shorts_per_day: 3
+  #     release_times: ["08:00", "13:00", "19:00"]

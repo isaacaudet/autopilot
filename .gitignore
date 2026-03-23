@@ -30,6 +30,9 @@ output/*.png
 .agents/
 .claude/scheduled_tasks.lock
 
+# Local config (real streamer lists, channel names, etc.)
+config.local.yaml
+
 # Temporary
 cleanup.py
 
