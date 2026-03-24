@@ -27,6 +27,16 @@ Twitch clips in. YouTube Shorts, Instagram Reels, TikTok, and Facebook Reels out
 
 ---
 
+## Screenshots
+
+<img src="docs/screenshots/dashboard.png" alt="Dashboard — pipeline controls, autopilot, best clip picks" width="100%">
+
+<img src="docs/screenshots/studio.png" alt="Studio — clip grid with thumbnails, scores, and actions" width="100%">
+
+<img src="docs/screenshots/analytics.png" alt="Analytics — 1.3M views, posting windows, top videos" width="100%">
+
+---
+
 ## Pipeline
 
 ```
