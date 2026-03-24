@@ -2,16 +2,21 @@
 
 # AUTOPILOT
 
-**Automated short-form content pipeline**
+**Fully automated short-form content pipeline**
 
-Twitch clips in. YouTube Shorts, Instagram Reels, TikTok, and Facebook Reels out.
-<br>Zero manual input. Every day.
+Discovers top Twitch clips, scores and ranks them, reformats for vertical video,
+<br>adds subtitles and overlays, and publishes across 4 platforms — every day, zero manual input.
 
 <br>
 
-| 1M+ YouTube views | 700K Instagram views | 7 Shorts/day | 4 platforms |
-|:---:|:---:|:---:|:---:|
-| first month | first 3 days | fully automated | simultaneous cross-post |
+<table>
+<tr>
+<td align="center"><h2>1.3M+</h2>YouTube views<br><sub>first 30 days</sub></td>
+<td align="center"><h2>700K</h2>Instagram views<br><sub>first 3 days</sub></td>
+<td align="center"><h2>538</h2>videos uploaded<br><sub>fully automated</sub></td>
+<td align="center"><h2>4</h2>platforms<br><sub>simultaneous cross-post</sub></td>
+</tr>
+</table>
 
 <br>
 
@@ -27,131 +32,66 @@ Twitch clips in. YouTube Shorts, Instagram Reels, TikTok, and Facebook Reels out
 
 ---
 
-## Screenshots
+### Dashboard
 
-<img src="docs/screenshots/dashboard.png" alt="Dashboard — pipeline controls, autopilot, best clip picks" width="100%">
+Pipeline controls, autopilot triggers, and real-time clip recommendations.
 
-<img src="docs/screenshots/studio.png" alt="Studio — clip grid with thumbnails, scores, and actions" width="100%">
+<img src="docs/screenshots/dashboard.png" alt="Dashboard" width="100%">
 
-<img src="docs/screenshots/analytics.png" alt="Analytics — 1.3M views, posting windows, top videos" width="100%">
+### Studio
+
+Review, approve, and edit clips before they go out. Each card shows the thumbnail, score, streamer, and platform targets.
+
+<img src="docs/screenshots/studio.png" alt="Studio" width="100%">
+
+### Analytics
+
+Track total views, best posting windows, and per-video performance. Scoring weights retrain automatically based on what actually gets views.
+
+<img src="docs/screenshots/analytics.png" alt="Analytics" width="100%">
 
 ---
 
-## Pipeline
+## How it works
 
-```
-                    ┌─────────────────────────────────────────────────────────┐
-                    │                                                         │
-  Twitch Helix API  │   Score ─→ Screen ─→ Format ─→ Subtitle ─→ Burn       │
-  ───────────────→  │     │                   │                    │          │
-  clips by streamer │   velocity           16:9→9:16            overlays     │
-  or game-wide      │   duration           facecam crop         hook text    │
-                    │   audio quality      gameplay zoom        progress bar │
-                    │   title keywords     HUD reposition       CTAs         │
-                    │   learned weights    layout profiles      transitions  │
-                    │                                                         │
-                    └──────────────────────────┬──────────────────────────────┘
-                                               │
-                    ┌──────────────────────────┴──────────────────────────────┐
-                    │                                                         │
-                    │   Thumbnail ─→ Schedule ─→ Upload ─→ Cross-Post        │
-                    │                                                         │
-                    │   YouTube (publishAt)          Instagram (binary)       │
-                    │   TikTok (direct post)         Facebook Reels           │
-                    │                                                         │
-                    │   ◆ Per-platform time-slot optimization                 │
-                    │   ◆ Daily caps + posting gap enforcement                │
-                    │   ◆ Platform-specific CTA overlays                      │
-                    │                                                         │
-                    └──────────────────────────┬──────────────────────────────┘
-                                               │
-                                               ▼
-                                        Learn + Retrain
-                                     (scoring weights adapt
-                                      from upload performance)
-```
+Every morning at 7am, the pipeline runs unattended:
 
-## What each stage does
+**Discover** — Pulls hundreds of clips from the Twitch Helix API, filtered by game and streamer. Deduplicates against a history of 14K+ previously seen clips.
 
-| Stage | What happens |
+**Score + Screen** — Each clip is ranked by view velocity, duration, audio quality, and title keywords. Scoring weights are trained from actual upload performance — the system learns what gets views on each channel. Top candidates are then screened by Gemini for content quality.
+
+**Process** — Clips are converted from 16:9 → 9:16 vertical format. The facecam is auto-detected and cropped to fill the top band. Gameplay is zoomed and repositioned with the HUD overlaid at the bottom. Each streamer has a calibrated layout profile (55+ profiles stored). Whisper generates word-level subtitles with karaoke-style highlighting. FFmpeg composites everything: subtitles, hook text, progress bar, and platform-specific CTA animations.
+
+**Publish** — Clips are uploaded to YouTube with `publishAt` scheduling across peak hours, then cross-posted to Instagram, TikTok, and Facebook with per-platform throttling. Daily highlight compilations are assembled automatically with transition cards between clips.
+
+**Learn** — After upload, the system tracks views and engagement. Scoring weights are periodically retrained so clip selection improves over time. The analytics dashboard surfaces best posting windows and top-performing streamer segments.
+
+## Daily schedule
+
+| Time | What happens |
 |:---|:---|
-| **Fetch** | Pulls clips from Twitch Helix API — by configured streamer list or game-wide sweep. Deduplicates against SQLite history table. |
-| **Score** | Ranks clips by view velocity, duration, title keywords, audio levels. Weights are trained from actual channel performance data. |
-| **Screen** | Gemini evaluates content quality and generates optimized titles and descriptions per clip. |
-| **Format** | Converts 16:9 source → 9:16 vertical. Facecam is auto-detected and cropped to fill the top band. Gameplay is zoomed and repositioned. Each streamer has a calibrated layout profile. |
-| **Subtitle** | Whisper (medium) transcription with word-level timing. Outputs ASS format with Impact font, cyan karaoke highlight, and pop-in animation. |
-| **Burn** | FFmpeg composites all layers: subtitles, hook text overlay, progress bar, subscribe/follow CTA animations. Compilations get transition cards with streamer branding. |
-| **Thumbnail** | Per-clip branded thumbnails — full video frame, gradient overlay, game-specific color palette, streamer name + title text. |
-| **Schedule** | Allocates upload time slots per platform. YouTube targets peak hours, Instagram is throttled to 2-3/day, cross-posts are staggered. |
-| **Upload** | YouTube via Data API v3 with `publishAt` scheduling. Instagram and Facebook via binary upload. TikTok via direct post API. |
-| **Learn** | Tracks views and engagement per upload. Periodically retrains scoring weights so clip selection improves over time. |
+| 7:00 AM | Fetch clips from Twitch, score and approve top candidates |
+| 7:05 AM | Format, subtitle, and burn overlays (3 clips processed in parallel) |
+| 7:35 AM | Upload 7 Shorts to YouTube, scheduled across peak hours |
+| 7:40 AM | Build and upload daily highlight compilation |
+| 8:00 AM | Marathon channel runs the same pipeline independently |
+| 9:00 AM | Cross-post top performers to Instagram, TikTok, Facebook |
+| Every 5 min | Release executor publishes any uploads whose scheduled time has arrived |
 
-## Architecture
-
-```
-clipper/
-├── workflow.py                  pipeline orchestration
-├── api.py                       FastAPI + SSE streaming
-├── db.py                        SQLite (WAL mode, auto-migration)
-├── schedule.py                  time-slot allocation
-├── crosspost.py                 cross-platform scheduling
-├── learn.py                     performance tracking + weight training
-│
-├── fetch/
-│   └── twitch.py                Twitch Helix API client
-│
-├── process/
-│   ├── score.py                 multi-factor clip scoring
-│   ├── analyze.py               Gemini content analysis
-│   ├── format.py                16:9 → 9:16 (fill / blur modes)
-│   ├── detect_facecam.py        facecam detection + layout calibration
-│   ├── subtitles.py             Whisper → ASS, word-level timing
-│   ├── burn.py                  FFmpeg compositing
-│   ├── compile.py               daily compilation builder
-│   ├── thumbnail.py             branded thumbnail generator
-│   └── titles.py                Gemini title / description generation
-│
-└── upload/
-    ├── youtube.py               YouTube Data API v3
-    ├── instagram.py             Instagram Graph API (binary upload)
-    ├── facebook.py              Facebook Reels (binary upload)
-    ├── tiktok.py                TikTok direct post
-    ├── auth.py                  OAuth flows (Google, Meta, TikTok)
-    └── dispatcher.py            multi-channel upload routing
-
-web/                             React + TypeScript + shadcn/ui
-├── StudioPage.tsx               clip review + approval
-├── EditPage.tsx                 layout + subtitle editor
-└── AnalyticsPage.tsx            performance dashboard
-```
-
-## Daily output
-
-```
-07:00   Fetch fresh clips from Twitch
-07:02   Score, screen, approve top candidates
-07:05   Format → subtitle → burn (parallel processing)
-07:30   Generate thumbnails
-07:35   Upload 7 Shorts to YouTube (scheduled across peak hours)
-07:40   Build + upload daily highlight compilation
-09:00   Cross-post top clips to Instagram, TikTok, Facebook
-17:00   Release executor publishes scheduled YouTube uploads
-```
-
-Runs unattended via launchd cron. The web dashboard is for reviewing clips and monitoring performance — not required for daily operation.
+Runs via launchd cron on macOS. The web dashboard is for reviewing clips and monitoring performance — not required for daily operation.
 
 ## Stack
 
-| Component | Technology |
+| | |
 |:---|:---|
-| Pipeline + API | Python 3.11+, FastAPI |
-| Video processing | FFmpeg via `imageio-ffmpeg` (libass, loudnorm) |
-| Speech-to-text | Whisper (medium), word-level alignment |
-| Content analysis | Gemini (screening, titles, descriptions) |
-| Database | SQLite with WAL mode |
-| Frontend | React, TypeScript, shadcn/ui |
-| Clip download | yt-dlp |
-| Scheduling | macOS launchd |
+| **Pipeline + API** | Python, FastAPI, SSE streaming |
+| **Video** | FFmpeg via imageio-ffmpeg (libass, loudnorm, concat demuxer) |
+| **Speech-to-text** | Whisper with word-level alignment |
+| **Content AI** | Gemini for screening, titles, descriptions, captions |
+| **Database** | SQLite in WAL mode with auto-migration |
+| **Frontend** | React, TypeScript, shadcn/ui, Vite |
+| **Downloads** | yt-dlp |
+| **Platforms** | YouTube Data API v3, Instagram Graph API, TikTok, Facebook Reels |
 
 ## Setup
 
@@ -162,4 +102,4 @@ python -m clipper auth           # OAuth setup for each platform
 python -m clipper serve          # API + web UI → localhost:8420
 ```
 
-All pipeline behavior is driven by `config.yaml` — streamer lists, scoring thresholds, daily caps, posting schedules, layout preferences. No secrets in config; credentials come from `.env` and OAuth token files.
+All behavior is driven by `config.yaml` — streamer lists, scoring thresholds, daily caps, posting schedules, layout preferences. No secrets in config; credentials live in `.env` and OAuth token files.
