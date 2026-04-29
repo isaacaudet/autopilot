@@ -11,7 +11,7 @@ Discovers top Twitch clips, scores and ranks them, reformats for vertical video,
 
 <table>
 <tr>
-<td align="center"><h2>1.3M+</h2>YouTube views<br><sub>first 30 days</sub></td>
+<td align="center"><h2>2M+</h2>YouTube views<br><sub>first 30 days</sub></td>
 <td align="center"><h2>700K</h2>Instagram views<br><sub>first 3 days</sub></td>
 <td align="center"><h2>538</h2>videos uploaded<br><sub>fully automated</sub></td>
 <td align="center"><h2>4</h2>platforms<br><sub>simultaneous cross-post</sub></td>
